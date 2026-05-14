@@ -249,11 +249,23 @@ export {
   requestApprovalRevisionSchema,
   resubmitApprovalSchema,
   addApprovalCommentSchema,
+  hydratedApprovalDetailSchema,
+  hydratedApprovalRequestSchema,
+  hydratedApprovalContextSchema,
+  hydratedApprovalSideEffectSchema,
+  hydratedApprovalActivitySchema,
+  hydratedApprovalRequesterSchema,
   type CreateApproval,
   type ResolveApproval,
   type RequestApprovalRevision,
   type ResubmitApproval,
   type AddApprovalComment,
+  type HydratedApprovalDetail,
+  type HydratedApprovalRequest,
+  type HydratedApprovalContext,
+  type HydratedApprovalSideEffect,
+  type HydratedApprovalActivity,
+  type HydratedApprovalRequester,
 } from "./approval.js";
 
 export {

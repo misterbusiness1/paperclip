@@ -59,12 +59,18 @@ export function approvalRoutes(
 
   router.get("/approvals/:id", async (req, res) => {
     const id = req.params.id as string;
+    const version = req.query.v as string | undefined;
     const approval = await svc.getById(id);
     if (!approval) {
       res.status(404).json({ error: "Approval not found" });
       return;
     }
     assertCompanyAccess(req, approval.companyId);
+    if (version === "2") {
+      const detail = await svc.getHydratedDetail(id);
+      res.json(detail);
+      return;
+    }
     res.json(redactApprovalPayload(approval));
   });
 

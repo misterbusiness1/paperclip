@@ -196,7 +196,17 @@ export type {
   IssueTreePreviewWarning,
 } from "./issue-tree-control.js";
 export type { Goal } from "./goal.js";
-export type { Approval, ApprovalComment } from "./approval.js";
+export type {
+  Approval,
+  ApprovalComment,
+  HydratedApprovalDetail,
+  HydratedApprovalRequest,
+  HydratedApprovalContext,
+  HydratedApprovalSideEffect,
+  HydratedApprovalActivity,
+  HydratedApprovalRequester,
+  ApprovalActionType,
+} from "./approval.js";
 export type {
   BudgetPolicy,
   BudgetPolicySummary,

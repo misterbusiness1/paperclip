@@ -5,6 +5,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const mockApprovalService = vi.hoisted(() => ({
   list: vi.fn(),
   getById: vi.fn(),
+  getHydratedDetail: vi.fn(),
   create: vi.fn(),
   approve: vi.fn(),
   reject: vi.fn(),
@@ -95,6 +96,7 @@ describe("approval routes idempotent retries", () => {
     vi.clearAllMocks();
     mockApprovalService.list.mockReset();
     mockApprovalService.getById.mockReset();
+    mockApprovalService.getHydratedDetail.mockReset();
     mockApprovalService.create.mockReset();
     mockApprovalService.approve.mockReset();
     mockApprovalService.reject.mockReset();
@@ -335,5 +337,102 @@ describe("approval routes idempotent retries", () => {
         action: "approval.created",
       }),
     );
+  });
+
+  it("returns the flat hydrated detail contract for v2 approval detail requests", async () => {
+    mockApprovalService.getById.mockResolvedValue({
+      id: "approval-v2",
+      companyId: "company-1",
+      type: "request_board_approval",
+      status: "pending",
+      payload: { apiKey: "secret-token" },
+    });
+    mockApprovalService.getHydratedDetail.mockResolvedValue({
+      id: "approval-v2",
+      companyId: "company-1",
+      type: "request_board_approval",
+      status: "pending",
+      request: {
+        actionType: "refund_partial",
+        rationale: "Customer supplied photo evidence.",
+        model: "gpt-5",
+        runId: "run-123",
+        confidence: 0.82,
+        toolTrace: "[{\"id\":\"tool-1\",\"label\":\"Fetch order\"}]",
+      },
+      context: {
+        order: {
+          number: "1001",
+          status: null,
+          totalCents: null,
+          currency: null,
+        },
+        customer: {
+          name: "Ada Lovelace",
+          email: null,
+          ltvCents: null,
+          priorRefundCount: null,
+        },
+        gateway: {
+          name: null,
+          cardLast4: null,
+        },
+        thread: {
+          channel: null,
+          subject: null,
+        },
+      },
+      requester: {
+        agentId: "agent-1",
+        agentName: "Plugin Engineer",
+        userId: null,
+        userName: null,
+      },
+      sideEffects: [],
+      activity: [],
+      rawPayload: { apiKey: "***REDACTED***" },
+      decisionNote: null,
+      decidedByUserId: null,
+      decidedAt: null,
+      createdAt: "2026-05-14T00:00:00.000Z",
+      updatedAt: "2026-05-14T00:00:00.000Z",
+    });
+
+    const res = await request(await createApp()).get("/api/approvals/approval-v2?v=2");
+
+    expect(res.status).toBe(200);
+    expect(res.body.request.actionType).toBe("refund_partial");
+    expect(res.body.requester.agentId).toBe("agent-1");
+    expect(res.body.rawPayload.apiKey).toBe("***REDACTED***");
+    expect(res.body.approval).toBeUndefined();
+  });
+
+  it("keeps the legacy summary approval route on the redacted summary contract", async () => {
+    mockApprovalService.getById.mockResolvedValue({
+      id: "approval-summary",
+      companyId: "company-1",
+      type: "request_board_approval",
+      requestedByAgentId: "agent-1",
+      requestedByUserId: null,
+      status: "pending",
+      payload: { title: "Refund request", apiKey: "secret-token" },
+      decisionNote: null,
+      decidedByUserId: null,
+      decidedAt: null,
+      createdAt: "2026-05-14T00:00:00.000Z",
+      updatedAt: "2026-05-14T00:00:00.000Z",
+    });
+
+    const res = await request(await createApp()).get("/api/approvals/approval-summary");
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({
+      id: "approval-summary",
+      payload: {
+        title: "Refund request",
+        apiKey: "***REDACTED***",
+      },
+    });
+    expect(res.body.request).toBeUndefined();
   });
 });

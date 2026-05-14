@@ -1,5 +1,7 @@
-import type { Approval, ApprovalComment, Issue } from "@paperclipai/shared";
+import type { Approval, ApprovalComment, HydratedApprovalDetail, Issue } from "@paperclipai/shared";
 import { api } from "./client";
+
+export type ApprovalDetailResponse = Approval | HydratedApprovalDetail;
 
 export const approvalsApi = {
   list: (companyId: string, status?: string) =>
@@ -8,7 +10,8 @@ export const approvalsApi = {
     ),
   create: (companyId: string, data: Record<string, unknown>) =>
     api.post<Approval>(`/companies/${companyId}/approvals`, data),
-  get: (id: string) => api.get<Approval>(`/approvals/${id}`),
+  get: (id: string, options?: { version?: 2 }) =>
+    api.get<ApprovalDetailResponse>(`/approvals/${id}${options?.version === 2 ? "?v=2" : ""}`),
   approve: (id: string, decisionNote?: string) =>
     api.post<Approval>(`/approvals/${id}/approve`, { decisionNote }),
   reject: (id: string, decisionNote?: string) =>
