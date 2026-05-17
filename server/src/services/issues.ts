@@ -91,6 +91,9 @@ import { redactSensitiveText } from "../redaction.js";
 import { resolveIssueGoalId, resolveNextIssueGoalId } from "./issue-goal-fallback.js";
 import { getRunLogStore } from "./run-log-store.js";
 import { getDefaultCompanyGoal } from "./goals.js";
+import {
+  assertIssueAssigneeExecutableState,
+} from "./issue-mutation-guards.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
 import {
   assertAgentCapacityForAssignment,
@@ -604,6 +607,7 @@ type IssueCreateInput = Omit<typeof issues.$inferInsert, "companyId"> & {
   labelIds?: string[];
   blockedByIssueIds?: string[];
   inheritExecutionWorkspaceFromIssueId?: string | null;
+  assignmentGuardBlockerComment?: string | null;
   skipExecutionWorkspaceInheritance?: boolean;
   watchdog?: { agentId: string; instructions?: string | null } | null;
   watchdogActorRunId?: string | null;
@@ -6193,6 +6197,7 @@ export function issueService(db: Db) {
         labelIds: inputLabelIds,
         blockedByIssueIds,
         inheritExecutionWorkspaceFromIssueId,
+        assignmentGuardBlockerComment,
         skipExecutionWorkspaceInheritance,
         watchdog,
         watchdogActorRunId,
@@ -6223,6 +6228,20 @@ export function issueService(db: Db) {
       if (data.status === "in_progress" && !data.assigneeAgentId && !data.assigneeUserId) {
         throw unprocessable("in_progress issues require an assignee");
       }
+      const nextStatus = issueData.status ?? "todo";
+      const nextAssigneeAgent = issueData.assigneeAgentId
+        ? await db
+          .select({ id: agents.id, status: agents.status })
+          .from(agents)
+          .where(eq(agents.id, issueData.assigneeAgentId))
+          .then((rows: Array<{ id: string; status: string }>) => rows[0] ?? null)
+        : null;
+      assertIssueAssigneeExecutableState({
+        status: nextStatus,
+        assigneeAgentId: issueData.assigneeAgentId ?? null,
+        assigneeStatus: nextAssigneeAgent?.status ?? null,
+        blockerComment: assignmentGuardBlockerComment,
+      });
       const created = await db.transaction(async (tx) => {
         const idempotencyKey = rawIdempotencyKey?.trim() || null;
         const normalizedTitle = normalizeCreateIssueTitle(issueData.title);
@@ -6554,6 +6573,7 @@ export function issueService(db: Db) {
         blockedByIssueIds?: string[];
         actorAgentId?: string | null;
         actorUserId?: string | null;
+        assignmentGuardBlockerComment?: string | null;
         actorRunId?: string | null;
         capacityOverride?: AgentCapacityOverride | null;
       },
@@ -6571,6 +6591,7 @@ export function issueService(db: Db) {
         blockedByIssueIds,
         actorAgentId,
         actorUserId,
+        assignmentGuardBlockerComment,
         actorRunId,
         capacityOverride,
         ...issueData
@@ -6624,6 +6645,20 @@ export function issueService(db: Db) {
       if (issueData.assigneeUserId) {
         await assertAssignableUser(existing.companyId, issueData.assigneeUserId);
       }
+      const nextStatus = issueData.status ?? existing.status;
+      const nextAssigneeAgent = nextAssigneeAgentId
+        ? await dbOrTx
+          .select({ id: agents.id, status: agents.status })
+          .from(agents)
+          .where(eq(agents.id, nextAssigneeAgentId))
+          .then((rows: Array<{ id: string; status: string }>) => rows[0] ?? null)
+        : null;
+      assertIssueAssigneeExecutableState({
+        status: nextStatus,
+        assigneeAgentId: nextAssigneeAgentId,
+        assigneeStatus: nextAssigneeAgent?.status ?? null,
+        blockerComment: assignmentGuardBlockerComment,
+      });
       let nextProjectId = issueData.projectId !== undefined ? issueData.projectId : existing.projectId;
       const nextProjectWorkspaceId =
         issueData.projectWorkspaceId !== undefined ? issueData.projectWorkspaceId : existing.projectWorkspaceId;

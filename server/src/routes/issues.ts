@@ -7946,6 +7946,7 @@ export function issueRoutes(
             id,
             {
               ...updateFields,
+              assignmentGuardBlockerComment: commentBody,
               actorAgentId: actor.agentId ?? null,
               actorUserId: actor.actorType === "user" ? actor.actorId : null,
             },
@@ -7971,6 +7972,7 @@ export function issueRoutes(
       } else {
         issue = await svc.update(id, {
           ...updateFields,
+          assignmentGuardBlockerComment: commentBody,
           actorAgentId: actor.agentId ?? null,
           actorUserId: actor.actorType === "user" ? actor.actorId : null,
         });
