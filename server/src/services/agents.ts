@@ -229,8 +229,24 @@ export function agentService(db: Db) {
   }
 
   function normalizeAgentRow(row: typeof agents.$inferSelect) {
+    const adapterConfig =
+      typeof row.adapterConfig === "object" && row.adapterConfig !== null && !Array.isArray(row.adapterConfig)
+        ? sanitizeRecord(row.adapterConfig as Record<string, unknown>)
+        : row.adapterConfig;
+    const runtimeConfig =
+      typeof row.runtimeConfig === "object" && row.runtimeConfig !== null && !Array.isArray(row.runtimeConfig)
+        ? sanitizeRecord(row.runtimeConfig as Record<string, unknown>)
+        : row.runtimeConfig;
+    const metadata =
+      typeof row.metadata === "object" && row.metadata !== null && !Array.isArray(row.metadata)
+        ? sanitizeRecord(row.metadata as Record<string, unknown>)
+        : row.metadata;
+
     return withUrlKey({
       ...row,
+      adapterConfig,
+      runtimeConfig,
+      metadata,
       permissions: normalizeAgentPermissions(row.permissions, row.role),
     });
   }
