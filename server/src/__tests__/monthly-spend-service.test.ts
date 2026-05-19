@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { companyService } from "../services/companies.ts";
 import { agentService } from "../services/agents.ts";
+import { REDACTED_EVENT_VALUE } from "../redaction.js";
 
 function createSelectSequenceDb(results: unknown[]) {
   const pending = [...results];
@@ -86,5 +87,75 @@ describe("monthly spend hydration", () => {
     const agent = await agents.getById("agent-1");
 
     expect(agent?.spentMonthlyCents).toBe(175);
+  });
+
+  it("keeps raw secret bindings on internal agent reads", async () => {
+    const dbStub = createSelectSequenceDb([
+      [{
+        id: "agent-1",
+        companyId: "company-1",
+        name: "Budget Agent",
+        role: "general",
+        title: null,
+        reportsTo: null,
+        capabilities: null,
+        adapterType: "codex_local",
+        adapterConfig: {
+          env: {
+            OPENAI_API_KEY: {
+              type: "secret_ref",
+              secretId: "secret-1",
+            },
+          },
+          apiKey: "sk-live-secret",
+        },
+        runtimeConfig: {
+          env: {
+            SESSION_TOKEN: "runtime-secret",
+          },
+        },
+        budgetMonthlyCents: 5000,
+        spentMonthlyCents: 999999,
+        metadata: {
+          credentials: {
+            password: "metadata-secret",
+          },
+        },
+        permissions: null,
+        status: "idle",
+        pauseReason: null,
+        pausedAt: null,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      }],
+      [{
+        agentId: "agent-1",
+        spentMonthlyCents: 175,
+      }],
+    ]);
+
+    const agents = agentService(dbStub.db as any);
+    const agent = await agents.getById("agent-1");
+
+    expect(agent?.adapterConfig).toEqual({
+      env: {
+        OPENAI_API_KEY: {
+          type: "secret_ref",
+          secretId: "secret-1",
+        },
+      },
+      apiKey: "sk-live-secret",
+    });
+    expect(agent?.runtimeConfig).toEqual({
+      env: {
+        SESSION_TOKEN: "runtime-secret",
+      },
+    });
+    expect(agent?.metadata).toEqual({
+      credentials: {
+        password: "metadata-secret",
+      },
+    });
+    expect(JSON.stringify(agent)).not.toContain(REDACTED_EVENT_VALUE);
   });
 });
