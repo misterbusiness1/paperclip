@@ -1,6 +1,7 @@
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { REDACTED_EVENT_VALUE } from "../redaction.js";
 
 const agentId = "11111111-1111-4111-8111-111111111111";
 const companyId = "22222222-2222-4222-8222-222222222222";
@@ -28,6 +29,35 @@ const baseAgent = {
   metadata: null,
   createdAt: new Date("2026-03-19T00:00:00.000Z"),
   updatedAt: new Date("2026-03-19T00:00:00.000Z"),
+};
+
+const sensitiveAgent = {
+  ...baseAgent,
+  adapterConfig: {
+    apiKey: "sk_live_super_secret",
+    nested: {
+      authToken: "token-123",
+    },
+    secretRef: {
+      type: "secret_ref",
+      secretId: "secret-1",
+    },
+  },
+  runtimeConfig: {
+    env: {
+      API_KEY: "env-secret",
+      SAFE_VALUE: "present",
+    },
+    heartbeat: {
+      maxConcurrentRuns: 5,
+    },
+  },
+  metadata: {
+    credentials: {
+      clientSecret: "metadata-secret",
+    },
+    label: "visible",
+  },
 };
 
 const mockAgentService = vi.hoisted(() => ({
@@ -413,6 +443,118 @@ describe.sequential("agent permission routes", () => {
         id: agentId,
         adapterConfig: {},
         runtimeConfig: {},
+      }),
+    ]);
+  });
+
+  it("redacts secret material from the self agent detail route", async () => {
+    mockAgentService.getById.mockResolvedValue(sensitiveAgent);
+
+    const app = await createApp({
+      type: "agent",
+      agentId,
+      companyId,
+      source: "agent_key",
+      runId: "run-1",
+    });
+
+    const res = await requestApp(app, (baseUrl) => request(baseUrl).get("/api/agents/me"));
+
+    expect(res.status).toBe(200);
+    expect(res.body.adapterConfig).toEqual({
+      apiKey: REDACTED_EVENT_VALUE,
+      nested: {
+        authToken: REDACTED_EVENT_VALUE,
+      },
+      secretRef: {
+        type: "secret_ref",
+        secretId: "secret-1",
+      },
+    });
+    expect(res.body.runtimeConfig).toEqual({
+      env: {
+        API_KEY: REDACTED_EVENT_VALUE,
+        SAFE_VALUE: "present",
+      },
+      heartbeat: {
+        maxConcurrentRuns: 5,
+      },
+    });
+    expect(res.body.metadata).toEqual({
+      credentials: REDACTED_EVENT_VALUE,
+      label: "visible",
+    });
+  });
+
+  it("redacts secret material from elevated agent detail reads", async () => {
+    mockAgentService.getById.mockResolvedValue(sensitiveAgent);
+    mockAccessService.canUser.mockResolvedValue(true);
+
+    const app = await createApp({
+      type: "board",
+      userId: "board-user",
+      source: "local_implicit",
+      isInstanceAdmin: true,
+      companyIds: [companyId],
+    });
+
+    const res = await requestApp(app, (baseUrl) => request(baseUrl).get(`/api/agents/${agentId}`));
+
+    expect(res.status).toBe(200);
+    expect(res.body.adapterConfig.apiKey).toBe(REDACTED_EVENT_VALUE);
+    expect(res.body.adapterConfig.nested.authToken).toBe(REDACTED_EVENT_VALUE);
+    expect(res.body.runtimeConfig.env.API_KEY).toBe(REDACTED_EVENT_VALUE);
+    expect(res.body.adapterConfig.secretRef).toEqual({
+      type: "secret_ref",
+      secretId: "secret-1",
+    });
+    expect(res.body.metadata).toEqual({
+      credentials: REDACTED_EVENT_VALUE,
+      label: "visible",
+    });
+  });
+
+  it("redacts secret material from elevated company agent list reads", async () => {
+    mockAgentService.list.mockResolvedValue([sensitiveAgent]);
+    mockAccessService.canUser.mockResolvedValue(true);
+
+    const app = await createApp({
+      type: "board",
+      userId: "board-user",
+      source: "local_implicit",
+      isInstanceAdmin: true,
+      companyIds: [companyId],
+    });
+
+    const res = await requestApp(app, (baseUrl) => request(baseUrl).get(`/api/companies/${companyId}/agents`));
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual([
+      expect.objectContaining({
+        id: agentId,
+        adapterConfig: {
+          apiKey: REDACTED_EVENT_VALUE,
+          nested: {
+            authToken: REDACTED_EVENT_VALUE,
+          },
+          secretRef: {
+            type: "secret_ref",
+            secretId: "secret-1",
+          },
+        },
+        runtimeConfig: {
+          env: {
+            API_KEY: REDACTED_EVENT_VALUE,
+            SAFE_VALUE: "present",
+          },
+          heartbeat: {
+            maxConcurrentRuns: 5,
+          },
+        },
+        metadata: {
+          credentials: REDACTED_EVENT_VALUE,
+          label: "visible",
+        },
       }),
     ]);
   });
@@ -991,6 +1133,70 @@ describe.sequential("agent permission routes", () => {
     expect(res.status).toBe(422);
     expect(res.body.error).toContain('Environment driver "ssh" is not allowed here');
     expect(mockAgentService.update).not.toHaveBeenCalled();
+  });
+
+  it("preserves existing secret_ref bindings during partial adapter config updates", async () => {
+    const persistedAdapterConfig = {
+      env: {
+        OPENAI_API_KEY: {
+          type: "secret_ref",
+          secretId: "secret-2",
+        },
+      },
+      model: "gpt-5",
+    };
+    mockAgentService.getById.mockResolvedValue({
+      ...baseAgent,
+      adapterType: "codex_local",
+      adapterConfig: persistedAdapterConfig,
+    });
+    mockSecretService.normalizeAdapterConfigForPersistence.mockImplementation(async (_companyId, config) => config);
+
+    const app = await createApp({
+      type: "board",
+      userId: "board-user",
+      source: "local_implicit",
+      isInstanceAdmin: true,
+      companyIds: [companyId],
+    });
+
+    const res = await requestApp(app, (baseUrl) => request(baseUrl)
+      .patch(`/api/agents/${agentId}`)
+      .send({
+        adapterConfig: {
+          model: "gpt-5.1",
+        },
+      }));
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockSecretService.normalizeAdapterConfigForPersistence).toHaveBeenCalledWith(
+      companyId,
+      expect.objectContaining({
+        env: {
+          OPENAI_API_KEY: {
+            type: "secret_ref",
+            secretId: "secret-2",
+          },
+        },
+        model: "gpt-5.1",
+      }),
+      expect.anything(),
+    );
+    expect(mockAgentService.update).toHaveBeenCalledWith(
+      agentId,
+      expect.objectContaining({
+        adapterConfig: expect.objectContaining({
+          env: {
+            OPENAI_API_KEY: {
+              type: "secret_ref",
+              secretId: "secret-2",
+            },
+          },
+          model: "gpt-5.1",
+        }),
+      }),
+      expect.anything(),
+    );
   });
 
   for (const adapterCase of sshCapableAdapterCases) {
