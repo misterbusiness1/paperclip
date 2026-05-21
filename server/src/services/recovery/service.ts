@@ -646,8 +646,28 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return row ?? null;
   }
 
+  async function latestContinueWatchdogDecision(companyId: string, runId: string) {
+    const [row] = await db
+      .select({
+        createdAt: heartbeatRunWatchdogDecisions.createdAt,
+        snoozedUntil: heartbeatRunWatchdogDecisions.snoozedUntil,
+      })
+      .from(heartbeatRunWatchdogDecisions)
+      .where(
+        and(
+          eq(heartbeatRunWatchdogDecisions.companyId, companyId),
+          eq(heartbeatRunWatchdogDecisions.runId, runId),
+          eq(heartbeatRunWatchdogDecisions.decision, "continue"),
+        ),
+      )
+      .orderBy(desc(heartbeatRunWatchdogDecisions.createdAt))
+      .limit(1);
+    return row ?? null;
+  }
+
   async function hasTerminalStaleRunSuppression(
     run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId" | "lastOutputAt" | "contextSnapshot">,
+    now = new Date(),
   ) {
     const terminalEvaluation = await latestTerminalStaleRunEvaluation(run.companyId, run.id);
     if (!terminalEvaluation) return false;
@@ -659,6 +679,14 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
 
     const terminalAt = terminalEvaluation.completedAt ?? terminalEvaluation.cancelledAt ?? terminalEvaluation.updatedAt;
     if (!terminalAt) return false;
+    const latestContinueDecision = await latestContinueWatchdogDecision(run.companyId, run.id);
+    const continueDecisionExpiredAfterTerminalCleanup = Boolean(
+      latestContinueDecision?.createdAt &&
+        latestContinueDecision.createdAt.getTime() >= terminalAt.getTime() &&
+        latestContinueDecision.snoozedUntil &&
+        latestContinueDecision.snoozedUntil.getTime() <= now.getTime(),
+    );
+    if (continueDecisionExpiredAfterTerminalCleanup) return false;
     if (!run.lastOutputAt) return true;
     return run.lastOutputAt.getTime() <= terminalAt.getTime();
   }
@@ -1121,7 +1149,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         result.snoozed += 1;
         continue;
       }
-      if (await hasTerminalStaleRunSuppression(run)) {
+      if (await hasTerminalStaleRunSuppression(run, now)) {
         result.skipped += 1;
         continue;
       }
