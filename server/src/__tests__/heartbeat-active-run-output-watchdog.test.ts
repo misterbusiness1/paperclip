@@ -397,6 +397,7 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
       companyId,
     });
     expect(afterRearm.created).toBe(1);
+    expect(afterRearm.skipped).toBe(0);
     expect(afterRearm.evaluationIssueIds[0]).not.toBe(evaluationIssueId);
 
     const evaluations = await db
