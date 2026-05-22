@@ -371,6 +371,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       .then((rows) => Boolean(rows[0]));
   }
 
+  async function isRecoveryAgentInvokable(agentId: string) {
+    return isAgentInvokable(await getAgent(agentId));
+  }
+
   async function enqueueStrandedIssueRecovery(input: {
     issueId: string;
     agentId: string;
@@ -379,6 +383,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     source: string;
     retryOfRunId?: string | null;
   }) {
+    if (!(await isRecoveryAgentInvokable(input.agentId))) {
+      return null;
+    }
+
     const queued = await deps.enqueueWakeup(input.agentId, {
       source: "automation",
       triggerDetail: "system",
@@ -415,6 +423,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   }
 
   async function enqueueInitialAssignedTodoDispatch(issue: typeof issues.$inferSelect, agentId: string) {
+    if (!(await isRecoveryAgentInvokable(agentId))) {
+      return null;
+    }
+
     return deps.enqueueWakeup(agentId, {
       source: "assignment",
       triggerDetail: "system",
