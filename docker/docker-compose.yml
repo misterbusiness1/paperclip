@@ -1,6 +1,6 @@
 services:
   db:
-    image: postgres:17-alpine
+    image: pgvector/pgvector:pg17
     environment:
       POSTGRES_USER: paperclip
       POSTGRES_PASSWORD: paperclip
@@ -11,22 +11,29 @@ services:
       timeout: 5s
       retries: 30
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
 
   server:
-    image: ghcr.io/misterbusiness1/paperclip-prod:latest-pwfix
+    image: paperclip-prod:v2026.525.0-company-docs.final
+    init: true
+    restart: unless-stopped
     ports:
-      - "3100:3100"
+      - "127.0.0.1:3100:3100"
     environment:
       DATABASE_URL: postgres://paperclip:paperclip@db:5432/paperclip
+      CODEX_HOME: ${CODEX_HOME:-/paperclip/.codex}
+      # OPENAI_API_KEY removed for Codex Pro/device-auth mode
+      MINIMAX_API_KEY: "${MINIMAX_API_KEY:-}"
       PORT: "3100"
       SERVE_UI: "true"
       PAPERCLIP_DEPLOYMENT_MODE: "authenticated"
       PAPERCLIP_DEPLOYMENT_EXPOSURE: "private"
       PAPERCLIP_PUBLIC_URL: "${PAPERCLIP_PUBLIC_URL:-http://localhost:3100}"
       BETTER_AUTH_SECRET: "${BETTER_AUTH_SECRET:?BETTER_AUTH_SECRET must be set}"
+      PAPERCLIP_SECRETS_PROVIDER: "local-encrypted"
+      PAPERCLIP_SECRETS_MASTER_KEY_FILE: "/paperclip/instances/default/secrets/master.key"
     volumes:
       - paperclip-data:/paperclip
     depends_on:

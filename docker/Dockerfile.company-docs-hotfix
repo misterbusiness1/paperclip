@@ -1,0 +1,4 @@
+FROM ghcr.io/misterbusiness1/paperclip-prod:v2026.525.0-local
+
+COPY server/dist/app.js /app/server/dist/app.js
+COPY server/dist/routes/company-docs.js /app/server/dist/routes/company-docs.js
