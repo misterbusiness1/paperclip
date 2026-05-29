@@ -25,7 +25,15 @@ if [[ -z "$source_config_path" && ( -e "$base_cwd/.paperclip/config.json" || -L 
   source_config_path="$base_cwd/.paperclip/config.json"
 fi
 if [[ -z "$source_config_path" ]]; then
-  source_config_path="$paperclip_home/instances/$paperclip_instance_id/config.json"
+  default_source_config_path="$paperclip_home/instances/$paperclip_instance_id/config.json"
+  if [[ -e "$default_source_config_path" || -L "$default_source_config_path" ]]; then
+    source_config_path="$default_source_config_path"
+  fi
+fi
+
+init_seed_args=(--no-seed)
+if [[ -n "$source_config_path" && ( -e "$source_config_path" || -L "$source_config_path" ) ]]; then
+  init_seed_args=(--seed-mode minimal --from-config "$source_config_path")
 fi
 source_env_path="$(dirname "$source_config_path")/.env"
 
@@ -38,23 +46,23 @@ run_isolated_worktree_init() {
   if [[ -f "$base_cli_runner" && -f "$base_cli_entry" ]]; then
     (
       cd "$worktree_cwd"
-      node "$base_cli_runner" "$base_cli_entry" worktree init --force --seed-mode minimal --name "$worktree_name" --from-config "$source_config_path"
+      node "$base_cli_runner" "$base_cli_entry" worktree init --force --name "$worktree_name" "${init_seed_args[@]}"
     )
     return 0
   fi
 
-  if command -v pnpm >/dev/null 2>&1 && pnpm paperclipai --help >/dev/null 2>&1; then
+  if command -v pnpm >/dev/null 2>&1 && ( cd "$worktree_cwd" && pnpm paperclipai --help >/dev/null 2>&1 ); then
     (
       cd "$worktree_cwd"
-      pnpm paperclipai worktree init --force --seed-mode minimal --name "$worktree_name" --from-config "$source_config_path"
+      pnpm paperclipai worktree init --force --name "$worktree_name" "${init_seed_args[@]}"
     )
     return 0
   fi
 
-  if command -v paperclipai >/dev/null 2>&1; then
+  if [[ "${PAPERCLIP_ALLOW_GLOBAL_CLI:-}" == "1" ]] && command -v paperclipai >/dev/null 2>&1; then
     (
       cd "$worktree_cwd"
-      paperclipai worktree init --force --seed-mode minimal --name "$worktree_name" --from-config "$source_config_path"
+      paperclipai worktree init --force --name "$worktree_name" "${init_seed_args[@]}"
     )
     return 0
   fi
@@ -63,7 +71,7 @@ run_isolated_worktree_init() {
 }
 
 paperclipai_command_available() {
-  if command -v pnpm >/dev/null 2>&1 && pnpm paperclipai --help >/dev/null 2>&1; then
+  if command -v pnpm >/dev/null 2>&1 && ( cd "$worktree_cwd" && pnpm paperclipai --help >/dev/null 2>&1 ); then
     return 0
   fi
 
@@ -73,7 +81,7 @@ paperclipai_command_available() {
     return 0
   fi
 
-  if command -v paperclipai >/dev/null 2>&1; then
+  if [[ "${PAPERCLIP_ALLOW_GLOBAL_CLI:-}" == "1" ]] && command -v paperclipai >/dev/null 2>&1; then
     return 0
   fi
 
@@ -337,6 +345,10 @@ if [[ -e "$worktree_config_path" && -e "$worktree_env_path" ]]; then
 else
   if paperclipai_command_available; then
     run_isolated_worktree_init
+    if [[ ! -e "$worktree_config_path" || ! -e "$worktree_env_path" ]]; then
+      echo "paperclipai worktree init completed without writing isolated config; writing fallback config without DB seeding." >&2
+      write_fallback_worktree_config
+    fi
   else
     echo "paperclipai CLI not available in this workspace; writing isolated fallback config without DB seeding." >&2
     write_fallback_worktree_config
