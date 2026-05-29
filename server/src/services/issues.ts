@@ -3086,9 +3086,6 @@ export function issueService(db: Db) {
       }),
 
     checkout: async (id: string, agentId: string, expectedStatuses: string[], checkoutRunId: string | null) => {
-      if (checkoutRunId && (await isTerminalOrMissingHeartbeatRun(checkoutRunId))) {
-        throw Object.assign(new Error("checkout_run_terminated"), { statusCode: 409, code: "checkout_run_terminated" });
-      }
       const issueCompany = await db
         .select({ companyId: issues.companyId })
         .from(issues)
@@ -3103,12 +3100,37 @@ export function issueService(db: Db) {
         activePauseHold &&
         !(await isTreeHoldInteractionCheckoutAllowed(issueCompany.companyId, checkoutRunId, activePauseHold))
       ) {
-        throw conflict("Issue checkout blocked by active subtree pause hold", {
+        const details = {
           issueId: id,
           holdId: activePauseHold.holdId,
           rootIssueId: activePauseHold.rootIssueId,
           mode: activePauseHold.mode,
           securityPrinciples: ["Complete Mediation", "Fail Securely", "Secure Defaults"],
+        };
+        throw Object.assign(
+          conflict("Issue checkout blocked by active subtree pause hold", details),
+          {
+            status: 409,
+            details,
+          },
+        );
+      }
+
+      if (checkoutRunId && (await isTerminalOrMissingHeartbeatRun(checkoutRunId))) {
+        const details = activePauseHold
+          ? {
+              issueId: id,
+              holdId: activePauseHold.holdId,
+              rootIssueId: activePauseHold.rootIssueId,
+              mode: activePauseHold.mode,
+              securityPrinciples: ["Complete Mediation", "Fail Securely", "Secure Defaults"],
+            }
+          : undefined;
+        throw Object.assign(new Error("checkout_run_terminated"), {
+          status: 409,
+          statusCode: 409,
+          code: "checkout_run_terminated",
+          ...(details ? { details } : {}),
         });
       }
 
