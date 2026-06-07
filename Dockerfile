@@ -59,6 +59,8 @@ RUN npm install --global --omit=dev @anthropic-ai/claude-code@latest @openai/cod
     libglib2.0-0t64 libnspr4 libnss3 libatk1.0-0t64 libatk-bridge2.0-0t64 libcups2t64 \
     libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 libpango-1.0-0 \
     libcairo2 libasound2t64 libgtk-3-0t64 \
+  && PLAYWRIGHT_BROWSERS_PATH=/ms-playwright npx playwright install chromium --only-shell \
+  && chmod -R 755 /ms-playwright \
   && rm -rf /var/lib/apt/lists/* \
   && mkdir -p /paperclip \
   && chown node:node /paperclip
@@ -78,6 +80,7 @@ ENV NODE_ENV=production \
   PAPERCLIP_CONFIG=/paperclip/instances/default/config.json \
   PAPERCLIP_DEPLOYMENT_MODE=authenticated \
   PAPERCLIP_DEPLOYMENT_EXPOSURE=private \
+  PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
   OPENCODE_ALLOW_ALL_MODELS=true
 
 VOLUME ["/paperclip"]
