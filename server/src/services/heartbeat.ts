@@ -1766,6 +1766,27 @@ function isTrackedLocalChildProcessAdapter(adapterType: string) {
   return SESSIONED_LOCAL_ADAPTERS.has(adapterType);
 }
 
+function runUsesSshExecutionTransport(
+  run: Pick<typeof heartbeatRuns.$inferSelect, "contextSnapshot">,
+): boolean {
+  const snapshot = parseObject(run.contextSnapshot);
+  if (!snapshot) return false;
+
+  const paperclipEnvironment = parseObject(snapshot.paperclipEnvironment);
+  const envDriver = readNonEmptyString(paperclipEnvironment?.driver);
+  if (envDriver === "ssh") return true;
+
+  const paperclipWorkspace = parseObject(snapshot.paperclipWorkspace);
+  const workspaceRealization = parseObject(paperclipWorkspace?.realization);
+  const workspaceTransport = readNonEmptyString(workspaceRealization?.transport);
+  if (workspaceTransport === "ssh") return true;
+
+  const executionTransport = parseObject(snapshot.executionTransport);
+  const remoteExecution = parseObject(executionTransport?.remoteExecution);
+  const remoteTransport = readNonEmptyString(remoteExecution?.transport);
+  return remoteTransport === "ssh";
+}
+
 function isHeartbeatRunTerminalStatus(
   status: string | null | undefined,
 ): status is (typeof HEARTBEAT_RUN_TERMINAL_STATUSES)[number] {
@@ -4425,7 +4446,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         if (now.getTime() - refTime < staleThresholdMs) continue;
       }
 
-      const tracksLocalChild = isTrackedLocalChildProcessAdapter(adapterType);
+      const tracksLocalChild =
+        isTrackedLocalChildProcessAdapter(adapterType) &&
+        !runUsesSshExecutionTransport(run);
       const processPidAlive = tracksLocalChild && run.processPid && isProcessAlive(run.processPid);
       const processGroupAlive = tracksLocalChild && run.processGroupId && isProcessGroupAlive(run.processGroupId);
       if (processPidAlive) {
