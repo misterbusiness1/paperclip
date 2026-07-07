@@ -134,17 +134,17 @@ vi.mock("../services/execution-workspaces.js", () => ({
   executionWorkspaceService: () => mockExecutionWorkspaceService,
 }));
 
-function createApp() {
+function createApp(actor: Record<string, unknown> = {
+  type: "board",
+  userId: "local-board",
+  companyIds: ["company-1"],
+  source: "local_implicit",
+  isInstanceAdmin: false,
+}) {
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
-    (req as any).actor = {
-      type: "board",
-      userId: "local-board",
-      companyIds: ["company-1"],
-      source: "local_implicit",
-      isInstanceAdmin: false,
-    };
+    (req as any).actor = actor;
     next();
   });
   app.use("/api", issueRoutes(mockDb as any, {} as any));
@@ -531,5 +531,121 @@ describe.sequential("issue goal context routes", () => {
         }),
       ],
     }));
+  });
+
+  it("returns presence-only env metadata for agent issue and heartbeat-context reads", async () => {
+    const rawSecretValue = "agent-facing-env-value-must-not-escape";
+    const rawPlainValue = "plain-env-value-must-not-escape";
+    const agentActor = {
+      type: "agent",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      companyId: "company-1",
+      source: "agent_key",
+    };
+    mockIssueService.getById.mockResolvedValue({
+      ...legacyProjectLinkedIssue,
+      executionWorkspaceId: "55555555-5555-4555-8555-555555555555",
+    });
+    mockProjectService.getById.mockResolvedValue({
+      id: legacyProjectLinkedIssue.projectId,
+      companyId: "company-1",
+      urlKey: "onboarding",
+      goalId: projectGoal.id,
+      goalIds: [projectGoal.id],
+      goals: [{ id: projectGoal.id, title: projectGoal.title }],
+      name: "Onboarding",
+      description: null,
+      status: "in_progress",
+      leadAgentId: null,
+      targetDate: null,
+      color: null,
+      pauseReason: null,
+      pausedAt: null,
+      executionWorkspacePolicy: null,
+      env: {
+        PLAIN_TOKEN: { type: "plain", value: rawPlainValue },
+        SERVICE_URL: rawSecretValue,
+      },
+      codebase: {
+        workspaceId: null,
+        repoUrl: null,
+        repoRef: null,
+        defaultRef: null,
+        repoName: null,
+        localFolder: null,
+        managedFolder: "/tmp/company-1/project-1",
+        effectiveLocalFolder: "/tmp/company-1/project-1",
+        origin: "managed_checkout",
+      },
+      workspaces: [
+        {
+          id: "workspace-1",
+          metadata: {
+            runtimeConfig: {
+              workspaceRuntime: {
+                jobs: [
+                  {
+                    id: "secret-presence-check",
+                    env: {
+                      API_KEY: { type: "plain", value: rawSecretValue },
+                    },
+                  },
+                ],
+              },
+            },
+          },
+        },
+      ],
+      primaryWorkspace: null,
+      archivedAt: null,
+      createdAt: new Date("2026-03-20T00:00:00Z"),
+      updatedAt: new Date("2026-03-20T00:00:00Z"),
+    });
+    mockExecutionWorkspaceService.getById.mockResolvedValue({
+      id: "55555555-5555-4555-8555-555555555555",
+      name: "PAP-581 workspace",
+      mode: "isolated_workspace",
+      status: "active",
+      cwd: "/tmp/pap-581",
+      config: {
+        workspaceRuntime: {
+          jobs: [
+            {
+              id: "run",
+              env: {
+                API_KEY: { type: "plain", value: rawSecretValue },
+                PUBLIC_FLAG: "enabled",
+              },
+            },
+          ],
+        },
+      },
+      runtimeServices: [],
+    });
+
+    const app = createApp(agentActor);
+    const issueRes = await request(app).get("/api/issues/11111111-1111-4111-8111-111111111111");
+    const contextRes = await request(app).get(
+      "/api/issues/11111111-1111-4111-8111-111111111111/heartbeat-context",
+    );
+
+    expect(issueRes.status, JSON.stringify(issueRes.body)).toBe(200);
+    expect(contextRes.status, JSON.stringify(contextRes.body)).toBe(200);
+    const issueJson = JSON.stringify(issueRes.body);
+    const contextJson = JSON.stringify(contextRes.body);
+    expect(issueJson).not.toContain(rawSecretValue);
+    expect(issueJson).not.toContain(rawPlainValue);
+    expect(contextJson).not.toContain(rawSecretValue);
+    expect(contextJson).not.toContain(rawPlainValue);
+    expect(issueJson).not.toContain('"value"');
+    expect(contextJson).not.toContain('"value"');
+    expect(issueRes.body.project.env.PLAIN_TOKEN).toEqual({
+      configured: true,
+      source: "plain",
+    });
+    expect(contextRes.body.currentExecutionWorkspace.config.workspaceRuntime.jobs[0].env.API_KEY).toEqual({
+      configured: true,
+      source: "plain",
+    });
   });
 });

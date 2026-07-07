@@ -2805,6 +2805,67 @@ export function issueRoutes(
     return req.actor.type === "agent" && req.actor.source === "agent_key" && req.actor.keyScope?.kind === "task_bridge";
   }
 
+  function isPlainRecord(value: unknown): value is Record<string, unknown> {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+    const proto = Object.getPrototypeOf(value);
+    return proto === Object.prototype || proto === null;
+  }
+
+  function isAgentEnvMapKey(key: string) {
+    return /^(env|envVars|environmentVariables)$/i.test(key);
+  }
+
+  function isAgentSecretLikeKey(key: string) {
+    return /(?:api[-_]?key|access[-_]?token|auth(?:_?token)?|token|authorization|bearer|secret|passwd|password|credential|jwt|private[-_]?key|cookie|connectionstring)/i.test(key);
+  }
+
+  function summarizeEnvBinding(value: unknown): Record<string, unknown> {
+    if (value === null || value === undefined || value === "") {
+      return { configured: false, source: "missing" };
+    }
+    if (isPlainRecord(value)) {
+      const type = typeof value.type === "string" && value.type.trim() ? value.type.trim() : "object";
+      return {
+        configured: true,
+        source: type,
+        ...(typeof value.required === "boolean" ? { required: value.required } : {}),
+        ...(typeof value.version === "string" && value.version.trim() ? { version: value.version.trim() } : {}),
+      };
+    }
+    return { configured: true, source: "plain" };
+  }
+
+  function summarizeEnvMap(value: unknown): unknown {
+    if (!isPlainRecord(value)) return sanitizeAgentVisibleValue(value);
+    return Object.fromEntries(
+      Object.entries(value).map(([key, entry]) => [key, summarizeEnvBinding(entry)]),
+    );
+  }
+
+  function sanitizeAgentVisibleValue<T>(value: T): T {
+    if (Array.isArray(value)) return value.map((entry) => sanitizeAgentVisibleValue(entry)) as T;
+    if (typeof value === "string") return redactSensitiveText(value) as T;
+    if (!isPlainRecord(value)) return value;
+
+    const sanitized: Record<string, unknown> = {};
+    for (const [key, entry] of Object.entries(value)) {
+      if (isAgentEnvMapKey(key)) {
+        sanitized[key] = summarizeEnvMap(entry);
+        continue;
+      }
+      if (isAgentSecretLikeKey(key)) {
+        sanitized[key] = summarizeEnvBinding(entry);
+        continue;
+      }
+      sanitized[key] = sanitizeAgentVisibleValue(entry);
+    }
+    return sanitized as T;
+  }
+
+  function sanitizeAgentIssueRead<T>(req: Request, payload: T): T {
+    return req.actor.type === "agent" ? sanitizeAgentVisibleValue(payload) : payload;
+  }
+
   function taskBridgeOriginForActor(req: Request) {
     return isTaskBridgeKeyActor(req) && req.actor.keyId
       ? { originKind: "task_bridge", originId: req.actor.keyId }
@@ -4417,7 +4478,7 @@ export function issueRoutes(
       includeForIssueComment: wakeCommentId !== null,
     });
 
-    res.json({
+    res.json(sanitizeAgentIssueRead(req, {
       issue: {
         id: issue.id,
         identifier: issue.identifier,
@@ -4488,7 +4549,7 @@ export function issueRoutes(
         : null,
       planReviewContext,
       currentExecutionWorkspace,
-    });
+    }));
   });
 
   router.get("/issues/:id/diagnostics/blockers", async (req, res) => {
@@ -4687,7 +4748,7 @@ export function issueRoutes(
       ? await executionWorkspacesSvc.getById(issue.executionWorkspaceId)
       : null;
     const workProducts = await workProductsSvc.listForIssue(issue.id);
-    res.json({
+    res.json(sanitizeAgentIssueRead(req, {
       ...issue,
       goalId: goal?.id ?? issue.goalId,
       ancestors,
@@ -4707,7 +4768,7 @@ export function issueRoutes(
       currentExecutionWorkspace: compactIssueExecutionWorkspace(currentExecutionWorkspace),
       workProducts,
       linkedCases,
-    });
+    }));
   });
 
   router.get("/issues/:id/watchdog", async (req, res) => {
