@@ -639,10 +639,7 @@ describe.sequential("issue goal context routes", () => {
     expect(contextJson).not.toContain(rawPlainValue);
     expect(issueJson).not.toContain('"value"');
     expect(contextJson).not.toContain('"value"');
-    expect(issueRes.body.project.env.PLAIN_TOKEN).toEqual({
-      configured: true,
-      source: "plain",
-    });
+    expect(issueRes.body.project.env).toBeNull();
     expect(contextRes.body.currentExecutionWorkspace.config.workspaceRuntime.jobs[0].env.API_KEY).toEqual({
       configured: true,
       source: "plain",
