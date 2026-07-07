@@ -1,0 +1,38 @@
+name: OXFA 20271 env redaction publisher
+
+on:
+  push:
+    branches:
+      - oxfa-20273-env-redaction-publisher
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout publisher branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: oxfa-20273-env-redaction-publisher
+
+      - name: Apply prepared patch and publish target branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp .github/oxfa-20271-env-redaction.patch /tmp/oxfa-20271-env-redaction.patch
+          git checkout -B oxfa-20271-env-redaction 390627b46eb333309d357004384b220ecf8a65af
+          GIT_COMMITTER_NAME="Paperclip Engineering Director" \
+          GIT_COMMITTER_EMAIL="lucasdasilva@me.com" \
+          GIT_COMMITTER_DATE="Tue, 7 Jul 2026 14:58:55 +0000" \
+            git am /tmp/oxfa-20271-env-redaction.patch
+          actual="$(git rev-parse HEAD)"
+          expected="af0f1dc31f195e5441150dc3a94e480b11c26960"
+          if [[ "$actual" != "$expected" ]]; then
+            echo "expected $expected but produced $actual" >&2
+            exit 1
+          fi
+          git push --force origin HEAD:oxfa-20271-env-redaction
