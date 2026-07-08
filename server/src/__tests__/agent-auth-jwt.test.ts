@@ -55,6 +55,26 @@ describe("agent local JWT", () => {
     });
   });
 
+  it("defaults tokens to a six-hour ttl when no override is set", () => {
+    delete process.env[ttlEnv];
+    vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+    const token = createLocalAgentJwt("agent-1", "company-1", "claude_local", "run-1");
+
+    const claims = verifyLocalAgentJwt(token!);
+    expect(claims).not.toBeNull();
+    expect(claims!.exp - claims!.iat).toBe(21_600);
+  });
+
+  it("uses an explicit ttl override when configured", () => {
+    process.env[ttlEnv] = "3600";
+    vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+    const token = createLocalAgentJwt("agent-1", "company-1", "claude_local", "run-1");
+
+    const claims = verifyLocalAgentJwt(token!);
+    expect(claims).not.toBeNull();
+    expect(claims!.exp - claims!.iat).toBe(3_600);
+  });
+
   it("returns null when secret is missing", () => {
     process.env[secretEnv] = "";
     const token = createLocalAgentJwt("agent-1", "company-1", "claude_local", "run-1");
