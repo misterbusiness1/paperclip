@@ -5,6 +5,7 @@ import {
   prepareWorkspaceForSshExecution,
   restoreWorkspaceFromSshExecution,
   syncDirectoryToSsh,
+  WORKSPACE_LOCAL_ONLY_EXCLUDES,
 } from "./ssh.js";
 import { captureDirectorySnapshot } from "./workspace-restore-merge.js";
 import type { RuntimeProgressSink } from "./runtime-progress.js";
@@ -91,7 +92,9 @@ export async function prepareRemoteManagedRuntime(input: {
     remoteDir: workspaceRemoteDir,
     onProgress: input.onProgress,
   });
-  const restoreExclude = preparedWorkspace.gitBacked ? [...GIT_ARCHIVE_EXCLUDES, ".paperclip-runtime"] : [".paperclip-runtime"];
+  const restoreExclude = preparedWorkspace.gitBacked
+    ? [...GIT_ARCHIVE_EXCLUDES, ...WORKSPACE_LOCAL_ONLY_EXCLUDES]
+    : [...WORKSPACE_LOCAL_ONLY_EXCLUDES];
   const baselineSnapshot = await captureDirectorySnapshot(input.workspaceLocalDir, {
     exclude: restoreExclude,
   });
