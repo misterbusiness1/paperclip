@@ -16,6 +16,11 @@ import {
   type RuntimeProgressSink,
 } from "./runtime-progress.js";
 
+export const WORKSPACE_LOCAL_ONLY_EXCLUDES = [
+  ".paperclip-runtime",
+  ".security-quarantine",
+] as const;
+
 export interface SshConnectionConfig {
   host: string;
   port: number;
@@ -1510,7 +1515,7 @@ export async function prepareWorkspaceForSshExecution(input: {
       spec: input.spec,
       localDir: input.localDir,
       remoteDir,
-      exclude: [".git", ".paperclip-runtime"],
+      exclude: [".git", ...WORKSPACE_LOCAL_ONLY_EXCLUDES],
       onProgress: input.onProgress,
       progressLabel: "workspace",
     });
@@ -1531,7 +1536,7 @@ export async function prepareWorkspaceForSshExecution(input: {
     spec: input.spec,
     localDir: input.localDir,
     remoteDir,
-    exclude: [".paperclip-runtime"],
+    exclude: [...WORKSPACE_LOCAL_ONLY_EXCLUDES],
     onProgress: input.onProgress,
     progressLabel: "workspace",
   });
@@ -1610,8 +1615,8 @@ export async function restoreWorkspaceFromSshExecution(input: {
       spec: input.spec,
       remoteDir,
       localDir: input.localDir,
-      exclude: [".git", ".paperclip-runtime"],
-      preserveLocalEntries: [".git"],
+      exclude: [".git", ...WORKSPACE_LOCAL_ONLY_EXCLUDES],
+      preserveLocalEntries: [".git", ...WORKSPACE_LOCAL_ONLY_EXCLUDES],
       onProgress: input.onProgress,
       progressLabel: "workspace",
     });
@@ -1622,7 +1627,8 @@ export async function restoreWorkspaceFromSshExecution(input: {
     spec: input.spec,
     remoteDir,
     localDir: input.localDir,
-    exclude: [".paperclip-runtime"],
+    exclude: [...WORKSPACE_LOCAL_ONLY_EXCLUDES],
+    preserveLocalEntries: [...WORKSPACE_LOCAL_ONLY_EXCLUDES],
     onProgress: input.onProgress,
     progressLabel: "workspace",
   });
