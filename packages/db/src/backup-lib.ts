@@ -889,6 +889,7 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
         SELECT column_name, data_type
         FROM information_schema.columns
         WHERE table_schema = ${schema_name} AND table_name = ${tablename}
+          AND is_generated = 'NEVER'
         ORDER BY ordinal_position
       `;
       const colNames = cols.map((c) => `"${c.column_name}"`).join(", ");

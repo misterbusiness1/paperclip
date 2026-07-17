@@ -452,13 +452,17 @@ export function accessService(db: Db) {
     const existing = await listUserCompanyAccess(userId);
     const existingByCompany = new Map(existing.map((row) => [row.companyId, row]));
     const target = new Set(companyIds);
+    // Resolve instance-admin status BEFORE the transaction: it reads immutable role state
+    // (needs no tx isolation), and doing it inside the tx would acquire a second pool
+    // connection while the tx holds one (the nested-acquire deadlock class).
+    const callerIsInstanceAdmin = await isInstanceAdmin(userId);
 
     await db.transaction(async (tx) => {
       const toArchive = existing.filter((row) => !target.has(row.companyId) && row.status !== "archived");
       if (toArchive.length > 0 && options.actorUserId && options.actorUserId === userId) {
         throw conflict("You cannot remove yourself");
       }
-      if (toArchive.length > 0 && (await isInstanceAdmin(userId))) {
+      if (toArchive.length > 0 && callerIsInstanceAdmin) {
         throw conflict("Instance admins cannot be removed from company access");
       }
       const protectedArchives = toArchive.filter((row) => row.membershipRole === "owner" || row.membershipRole === "admin");

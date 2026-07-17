@@ -568,8 +568,9 @@ export function issueTreeControlService(db: Db) {
   async function getActivePauseHoldGate(
     companyId: string,
     issueId: string,
+    executor: Pick<Db, "select"> = db,
   ): Promise<ActiveIssueTreePauseHoldGate | null> {
-    const activePauseHolds = await db
+    const activePauseHolds = await executor
       .select({
         id: issueTreeHolds.id,
         rootIssueId: issueTreeHolds.rootIssueId,
@@ -610,7 +611,7 @@ export function issueTreeControlService(db: Db) {
         };
       }
 
-      const parent: { parentId: string | null } | null = await db
+      const parent: { parentId: string | null } | null = await executor
         .select({ parentId: issues.parentId })
         .from(issues)
         .where(and(eq(issues.id, currentIssueId), eq(issues.companyId, companyId)))
