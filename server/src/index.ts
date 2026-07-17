@@ -1190,6 +1190,15 @@ function isMainModule(metaUrl: string): boolean {
 }
 
 if (isMainModule(import.meta.url)) {
+  // Last-resort process-level guards: a transient rejection in a detached async path
+  // (e.g. the issue-update/comment wakeup fan-out) must be logged, not crash the control
+  // plane. Node's default action on an unhandled rejection is to terminate the process.
+  process.on("unhandledRejection", (reason) => {
+    logger.error({ err: reason }, "Unhandled promise rejection (process kept alive)");
+  });
+  process.on("uncaughtException", (err) => {
+    logger.error({ err }, "Uncaught exception (process kept alive)");
+  });
   void startServer().catch((err) => {
     logger.error({ err }, "Paperclip server failed to start");
     process.exit(1);
