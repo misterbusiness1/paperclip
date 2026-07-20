@@ -15733,6 +15733,49 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
 
         if (!activeExecutionRun && dependencyReadiness && !dependencyReadiness.isDependencyReady && !blockedInteractionWake) {
+          // Bug B fix: coalesce blocked-dependency skips instead of writing a
+          // fresh terminal `skipped` row every heartbeat. Only record a new skip
+          // when the unresolved-blocker set has CHANGED since the last one for
+          // this issue; otherwise bump coalescedCount on the prior row. This stops
+          // the ~115K/day re-enqueue flood that starved real dispatch. The
+          // legitimate issue_blockers_resolved wake is a separate path (fires on
+          // isDependencyReady === true) and is unaffected.
+          const blockerSnapshot = [...dependencyReadiness.unresolvedBlockerIssueIds].sort();
+          const priorSkip = await tx
+            .select({ id: agentWakeupRequests.id, payload: agentWakeupRequests.payload })
+            .from(agentWakeupRequests)
+            .where(
+              and(
+                eq(agentWakeupRequests.companyId, agent.companyId),
+                eq(agentWakeupRequests.agentId, agentId),
+                eq(agentWakeupRequests.reason, "issue_dependencies_blocked"),
+                eq(agentWakeupRequests.status, "skipped"),
+                sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
+              ),
+            )
+            .orderBy(desc(agentWakeupRequests.requestedAt))
+            .limit(1)
+            .then((rows) => rows[0] ?? null);
+          const priorBlockerIds = (
+            priorSkip?.payload as { unresolvedBlockerIssueIds?: unknown } | null | undefined
+          )?.unresolvedBlockerIssueIds;
+          const priorSnapshot = Array.isArray(priorBlockerIds)
+            ? [...(priorBlockerIds as string[])].sort()
+            : null;
+          const blockerSetUnchanged =
+            priorSnapshot !== null &&
+            priorSnapshot.length === blockerSnapshot.length &&
+            priorSnapshot.every((id, index) => id === blockerSnapshot[index]);
+          if (blockerSetUnchanged && priorSkip) {
+            await tx
+              .update(agentWakeupRequests)
+              .set({
+                coalescedCount: sql`${agentWakeupRequests.coalescedCount} + 1`,
+                updatedAt: new Date(),
+              })
+              .where(eq(agentWakeupRequests.id, priorSkip.id));
+            return { kind: "skipped" as const };
+          }
           await tx.insert(agentWakeupRequests).values({
             companyId: agent.companyId,
             agentId,
