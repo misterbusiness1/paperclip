@@ -4449,6 +4449,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const tracksLocalChild =
         isTrackedLocalChildProcessAdapter(adapterType) &&
         !runUsesSshExecutionTransport(run);
+      if (!tracksLocalChild) continue;
+
       const processPidAlive = tracksLocalChild && run.processPid && isProcessAlive(run.processPid);
       const processGroupAlive = tracksLocalChild && run.processGroupId && isProcessGroupAlive(run.processGroupId);
       if (processPidAlive) {
