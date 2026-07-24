@@ -16,6 +16,11 @@ import {
   type RuntimeProgressSink,
 } from "./runtime-progress.js";
 
+export const WORKSPACE_LOCAL_ONLY_EXCLUDES = [
+  ".paperclip-runtime",
+  ".security-quarantine",
+] as const;
+
 export interface SshConnectionConfig {
   host: string;
   port: number;
@@ -1293,6 +1298,8 @@ export async function syncDirectoryToSsh(input: {
       "-C",
       input.localDir,
       ...tarExcludeArgs(input.exclude),
+      "--warning=no-file-changed",
+      "--warning=no-file-removed",
       "-cf",
       "-",
       ".",
@@ -1318,7 +1325,10 @@ export async function syncDirectoryToSsh(input: {
         return;
       }
       settled = true;
-      if ((tarExitCode ?? 0) !== 0) {
+      // tar exits 1 on "file changed/removed as we read it" — benign for a live
+      // agent workspace; only exit >= 2 is a fatal tar error. The archive bytes
+      // are already streamed to ssh before the exit code is read.
+      if ((tarExitCode ?? 0) > 1) {
         reject(new Error(tarStderr.trim() || `tar exited with code ${tarExitCode ?? -1}`));
         return;
       }
@@ -1385,7 +1395,10 @@ export async function syncDirectoryFromSsh(input: {
   const stagingDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-sync-back-"));
   const remoteTarScript = [
     `cd ${shellQuote(input.remoteDir)}`,
-    `tar ${[...tarExcludeArgs(input.exclude).map(shellQuote), "-cf", "-", "."].join(" ")}`,
+    // tar exits 1 on "file changed/removed as we read it" — benign for a live
+    // agent workspace; tolerate <=1 on the remote so ssh returns success. Only
+    // exit >= 2 is a fatal tar error.
+    `{ tar ${[...tarExcludeArgs(input.exclude).map(shellQuote), "--warning=no-file-changed", "--warning=no-file-removed", "-cf", "-", "."].join(" ")}; ec=$?; [ "$ec" -le 1 ] && exit 0 || exit "$ec"; }`,
   ].join(" && ");
   const sshArgs = [
     ...auth.args,
@@ -1510,7 +1523,7 @@ export async function prepareWorkspaceForSshExecution(input: {
       spec: input.spec,
       localDir: input.localDir,
       remoteDir,
-      exclude: [".git", ".paperclip-runtime"],
+      exclude: [".git", ...WORKSPACE_LOCAL_ONLY_EXCLUDES],
       onProgress: input.onProgress,
       progressLabel: "workspace",
     });
@@ -1531,7 +1544,7 @@ export async function prepareWorkspaceForSshExecution(input: {
     spec: input.spec,
     localDir: input.localDir,
     remoteDir,
-    exclude: [".paperclip-runtime"],
+    exclude: [...WORKSPACE_LOCAL_ONLY_EXCLUDES],
     onProgress: input.onProgress,
     progressLabel: "workspace",
   });
@@ -1610,8 +1623,8 @@ export async function restoreWorkspaceFromSshExecution(input: {
       spec: input.spec,
       remoteDir,
       localDir: input.localDir,
-      exclude: [".git", ".paperclip-runtime"],
-      preserveLocalEntries: [".git"],
+      exclude: [".git", ...WORKSPACE_LOCAL_ONLY_EXCLUDES],
+      preserveLocalEntries: [".git", ...WORKSPACE_LOCAL_ONLY_EXCLUDES],
       onProgress: input.onProgress,
       progressLabel: "workspace",
     });
@@ -1622,7 +1635,8 @@ export async function restoreWorkspaceFromSshExecution(input: {
     spec: input.spec,
     remoteDir,
     localDir: input.localDir,
-    exclude: [".paperclip-runtime"],
+    exclude: [...WORKSPACE_LOCAL_ONLY_EXCLUDES],
+    preserveLocalEntries: [...WORKSPACE_LOCAL_ONLY_EXCLUDES],
     onProgress: input.onProgress,
     progressLabel: "workspace",
   });

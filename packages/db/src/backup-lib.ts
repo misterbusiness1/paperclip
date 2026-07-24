@@ -698,9 +698,12 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
         character_maximum_length: number | null;
         numeric_precision: number | null;
         numeric_scale: number | null;
+        is_generated: string;
+        generation_expression: string | null;
       }[]>`
         SELECT column_name, data_type, udt_schema, udt_name, is_nullable, column_default,
-               character_maximum_length, numeric_precision, numeric_scale
+               character_maximum_length, numeric_precision, numeric_scale,
+               is_generated, generation_expression
         FROM information_schema.columns
         WHERE table_schema = ${schema_name} AND table_name = ${tablename}
         ORDER BY ordinal_position
@@ -733,7 +736,14 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
         }
 
         let def = `  "${col.column_name}" ${typeStr}`;
-        if (col.column_default != null) def += ` DEFAULT ${col.column_default}`;
+        if (col.is_generated === "ALWAYS" && col.generation_expression != null) {
+          // Generated columns must be recreated with their generation clause (their data is
+          // excluded from the COPY, since generated columns can't be written on restore and
+          // are recomputed from the source columns).
+          def += ` GENERATED ALWAYS AS (${col.generation_expression}) STORED`;
+        } else if (col.column_default != null) {
+          def += ` DEFAULT ${col.column_default}`;
+        }
         if (col.is_nullable === "NO") def += " NOT NULL";
         colDefs.push(def);
       }
@@ -889,6 +899,7 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
         SELECT column_name, data_type
         FROM information_schema.columns
         WHERE table_schema = ${schema_name} AND table_name = ${tablename}
+          AND is_generated = 'NEVER'
         ORDER BY ordinal_position
       `;
       const colNames = cols.map((c) => `"${c.column_name}"`).join(", ");
@@ -980,6 +991,12 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
     throw error;
   } finally {
     await closeSql();
+    // The uncompressed .sql is only an intermediate: on success it is already removed by the
+    // gzip step above; on failure this guarantees the multi-GB file is cleaned even if the
+    // catch's writer.abort() throws before its own unlink runs.
+    if (existsSync(sqlFile)) {
+      try { unlinkSync(sqlFile); } catch { /* ignore */ }
+    }
   }
 }
 

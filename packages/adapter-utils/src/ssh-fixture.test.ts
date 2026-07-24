@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -735,4 +735,164 @@ describe("ssh env-lab fixture", () => {
     expect(recentSubjects).toContain("remote update a");
     expect(recentSubjects).toContain("remote update b");
   }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+  async function assertSecurityQuarantineIsLocalOnly(
+    gitBacked: boolean,
+  ): Promise<void> {
+    const rootDir = await mkdtemp(
+      path.join(os.tmpdir(), "paperclip-ssh-quarantine-"),
+    );
+    cleanupDirs.push(rootDir);
+
+    const statePath = path.join(rootDir, "state.json");
+    const localDir = path.join(rootDir, "local-workspace");
+    const quarantineDir = path.join(localDir, ".security-quarantine");
+    const quarantineFile = path.join(quarantineDir, "local-only.ndjson");
+    const workspaceFile = path.join(localDir, "workspace.txt");
+
+    await mkdir(quarantineDir, { recursive: true });
+    await writeFile(quarantineFile, "must remain local\n", "utf8");
+    await chmod(quarantineFile, 0o000);
+    const quarantineBefore = await stat(quarantineFile);
+
+    await writeFile(workspaceFile, "local value\n", "utf8");
+
+    if (gitBacked) {
+      await git(localDir, ["init"]);
+      await git(localDir, ["checkout", "-b", "main"]);
+      await git(localDir, ["config", "user.name", "Paperclip Test"]);
+      await git(localDir, ["config", "user.email", "test@paperclip.dev"]);
+      await git(localDir, ["add", "workspace.txt"]);
+      await git(localDir, ["commit", "-m", "initial"]);
+    }
+
+    const started = await startSshEnvLabFixtureOrSkip(
+      statePath,
+      `${gitBacked ? "git" : "non-git"} security quarantine test`,
+    );
+    if (!started) return;
+
+    const config = await buildSshEnvLabFixtureConfig(started);
+    const spec = {
+      ...config,
+      remoteCwd: started.workspaceDir,
+    } as const;
+
+    const prepared = await prepareRemoteManagedRuntime({
+      spec,
+      runId: gitBacked ? "quarantine-git" : "quarantine-non-git",
+      adapterKey: "test-adapter",
+      workspaceLocalDir: localDir,
+    });
+
+    const remoteWorkspaceFile = path.posix.join(
+      prepared.workspaceRemoteDir,
+      "workspace.txt",
+    );
+    const remoteQuarantineDir = path.posix.join(
+      prepared.workspaceRemoteDir,
+      ".security-quarantine",
+    );
+
+    const uploadCheck = await runSshCommand(
+      config,
+      [
+        `test -f ${JSON.stringify(remoteWorkspaceFile)}`,
+        `test ! -e ${JSON.stringify(remoteQuarantineDir)}`,
+        'printf "workspace-upload-clean\\n"',
+      ].join(" && "),
+    );
+
+    expect(uploadCheck.stdout).toContain("workspace-upload-clean");
+
+    await runSshCommand(
+      config,
+      [
+        `mkdir -p ${JSON.stringify(remoteQuarantineDir)}`,
+        `printf "must not restore\\n" > ${JSON.stringify(
+          path.posix.join(remoteQuarantineDir, "remote-only.ndjson"),
+        )}`,
+        `printf "remote value\\n" > ${JSON.stringify(remoteWorkspaceFile)}`,
+      ].join(" && "),
+    );
+
+    await prepared.restoreWorkspace();
+
+    await expect(readFile(workspaceFile, "utf8")).resolves.toBe(
+      "remote value\n",
+    );
+
+    const quarantineAfter = await stat(quarantineFile);
+    expect(quarantineAfter.ino).toBe(quarantineBefore.ino);
+    expect(quarantineAfter.mode & 0o777).toBe(0);
+
+    await expect(
+      stat(path.join(quarantineDir, "remote-only.ndjson")),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+  }
+
+  it(
+    "keeps security quarantine local-only for non-git managed workspaces",
+    async () => {
+      await assertSecurityQuarantineIsLocalOnly(false);
+    },
+    SSH_FIXTURE_TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "keeps security quarantine local-only for git-backed managed workspaces",
+    async () => {
+      await assertSecurityQuarantineIsLocalOnly(true);
+    },
+    SSH_FIXTURE_TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "still rejects unreadable ordinary workspace files",
+    async () => {
+      if (
+        typeof process.getuid === "function" &&
+        process.getuid() === 0
+      ) {
+        console.warn(
+          "Skipping unreadable ordinary workspace test while running as root",
+        );
+        return;
+      }
+
+      const rootDir = await mkdtemp(
+        path.join(os.tmpdir(), "paperclip-ssh-unreadable-"),
+      );
+      cleanupDirs.push(rootDir);
+
+      const statePath = path.join(rootDir, "state.json");
+      const localDir = path.join(rootDir, "local-workspace");
+      const blockedFile = path.join(localDir, "blocked.txt");
+
+      await mkdir(localDir, { recursive: true });
+      await writeFile(blockedFile, "must fail\n", "utf8");
+      await chmod(blockedFile, 0o000);
+
+      const started = await startSshEnvLabFixtureOrSkip(
+        statePath,
+        "unreadable ordinary workspace test",
+      );
+      if (!started) return;
+
+      const config = await buildSshEnvLabFixtureConfig(started);
+
+      await expect(
+        prepareRemoteManagedRuntime({
+          spec: {
+            ...config,
+            remoteCwd: started.workspaceDir,
+          },
+          runId: "unreadable-ordinary",
+          adapterKey: "test-adapter",
+          workspaceLocalDir: localDir,
+        }),
+      ).rejects.toThrow(/Permission denied|Cannot open/i);
+    },
+    SSH_FIXTURE_TEST_TIMEOUT_MS,
+  );
+
 });

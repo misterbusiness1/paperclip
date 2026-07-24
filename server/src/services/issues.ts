@@ -7556,7 +7556,7 @@ export function issueService(db: Db) {
       const currentUserRedactionOptions = {
         enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
       };
-      const redactedBody = redactCurrentUserText(body, currentUserRedactionOptions);
+      const redactedBody = redactSensitiveText(redactCurrentUserText(body, currentUserRedactionOptions));
       const authorType = issueCommentAuthorTypeSchema.parse(
         options?.authorType ?? (actor.agentId ? "agent" : actor.userId ? "user" : "system"),
       );
