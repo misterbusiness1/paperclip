@@ -1,10 +1,12 @@
 import path from "node:path";
 import fs from "node:fs";
 import pino from "pino";
-import { pinoHttp } from "pino-http";
+import { pinoHttp, stdSerializers } from "pino-http";
 import { readConfigFile } from "../config-file.js";
 import { resolveDefaultLogsDir, resolveHomeAwarePath } from "../home-paths.js";
+import { redactHttpHeaders } from "./http-log-redaction.js";
 import { shouldSilenceHttpSuccessLog } from "./http-log-policy.js";
+import { redactSensitive } from "./redact-sensitive.js";
 
 function resolveServerLogDir(): string {
   const envOverride = process.env.PAPERCLIP_LOG_DIR?.trim();
@@ -29,7 +31,19 @@ const sharedOpts = {
 
 export const logger = pino({
   level: "debug",
-  redact: ["req.headers.authorization"],
+  redact: [
+    "req.headers.authorization",
+    "req.headers.cookie",
+    "req.headers.proxy-authorization",
+    "req.headers.set-cookie",
+    "req.headers.x-api-key",
+    "req.headers.x-auth-token",
+    "req.headers.x-csrf-token",
+    "req.headers.x-paperclip-api-key",
+    "req.headers.x-paperclip-cloud-tenant-token",
+    "req.headers.x-xsrf-token",
+    "res.headers.set-cookie",
+  ],
 }, pino.transport({
   targets: [
     {
@@ -47,6 +61,18 @@ export const logger = pino({
 
 export const httpLogger = pinoHttp({
   logger,
+  serializers: {
+    req(req) {
+      const serialized = stdSerializers.req(req);
+      serialized.headers = redactHttpHeaders(serialized.headers);
+      return serialized;
+    },
+    res(res) {
+      const serialized = stdSerializers.res(res);
+      serialized.headers = redactHttpHeaders(serialized.headers);
+      return serialized;
+    },
+  },
   customLogLevel(_req, res, err) {
     if (shouldSilenceHttpSuccessLog(_req.method, _req.url, res.statusCode)) {
       return "silent";
@@ -69,21 +95,21 @@ export const httpLogger = pinoHttp({
       if (ctx) {
         return {
           errorContext: ctx.error,
-          reqBody: ctx.reqBody,
-          reqParams: ctx.reqParams,
-          reqQuery: ctx.reqQuery,
+          reqBody: redactSensitive(ctx.reqBody),
+          reqParams: redactSensitive(ctx.reqParams),
+          reqQuery: redactSensitive(ctx.reqQuery),
         };
       }
       const props: Record<string, unknown> = {};
       const { body, params, query } = req as any;
       if (body && typeof body === "object" && Object.keys(body).length > 0) {
-        props.reqBody = body;
+        props.reqBody = redactSensitive(body);
       }
       if (params && typeof params === "object" && Object.keys(params).length > 0) {
-        props.reqParams = params;
+        props.reqParams = redactSensitive(params);
       }
       if (query && typeof query === "object" && Object.keys(query).length > 0) {
-        props.reqQuery = query;
+        props.reqQuery = redactSensitive(query);
       }
       if ((req as any).route?.path) {
         props.routePath = (req as any).route.path;
