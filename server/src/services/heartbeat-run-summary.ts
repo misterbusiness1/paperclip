@@ -1,10 +1,13 @@
+import { redactEventPayload, redactSensitiveText } from "../redaction.js";
+
 export const HEARTBEAT_RUN_RESULT_SUMMARY_MAX_CHARS = 500;
 export const HEARTBEAT_RUN_RESULT_OUTPUT_MAX_CHARS = 4_096;
 export const HEARTBEAT_RUN_SAFE_RESULT_JSON_MAX_BYTES = 64 * 1024;
 
 function truncateSummaryText(value: unknown, maxLength = HEARTBEAT_RUN_RESULT_SUMMARY_MAX_CHARS) {
   if (typeof value !== "string") return null;
-  return value.length > maxLength ? value.slice(0, maxLength) : value;
+  const redacted = redactSensitiveText(value);
+  return redacted.length > maxLength ? redacted.slice(0, maxLength) : redacted;
 }
 
 function readNumericField(record: Record<string, unknown>, key: string) {
@@ -13,7 +16,7 @@ function readNumericField(record: Record<string, unknown>, key: string) {
 
 function readCommentText(value: unknown) {
   if (typeof value !== "string") return null;
-  const trimmed = value.trim();
+  const trimmed = redactSensitiveText(value).trim();
   return trimmed.length > 0 ? trimmed : null;
 }
 
@@ -32,17 +35,17 @@ export function mergeHeartbeatRunResultJson(
   }
 
   if (!normalizedSummary) {
-    return baseResult;
+    return redactEventPayload(baseResult);
   }
 
   if (readCommentText(baseResult.summary)) {
-    return baseResult;
+    return redactEventPayload(baseResult);
   }
 
-  return {
+  return redactEventPayload({
     ...baseResult,
     summary: normalizedSummary,
-  };
+  });
 }
 
 export function summarizeHeartbeatRunResultJson(
