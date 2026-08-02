@@ -17,6 +17,8 @@ const ESCAPED_JSON_SECRET_FIELD_TEXT_RE = new RegExp(
   String.raw`((?:\\")?${SECRET_FIELD_NAME_PATTERN}(?:\\")?\s*:\s*(?:\\"))[^\\\r\n]+((?:\\"))`,
   "gi",
 );
+const GITHUB_HTTPS_REMOTE_USERINFO_RE =
+  /\b(https:\/\/)[^@\s"'`/]+@github\.com(?=[:/?#\s"'`]|$)/gi;
 const SECRET_TEXT_HINTS = [
   "api",
   "key",
@@ -56,6 +58,7 @@ function sanitizeValue(value: unknown): unknown {
   if (isSecretRefBinding(value)) return value;
   if (isUserSecretRefBinding(value)) return value;
   if (isPlainBinding(value)) return { type: "plain", value: sanitizeValue(value.value) };
+  if (typeof value === "string") return redactSensitiveText(value);
   if (!isPlainObject(value)) return value;
   return sanitizeRecord(value);
 }
@@ -137,6 +140,7 @@ export function redactSensitiveText(input: string): string {
   if (!maybeContainsSecretText(input)) return input;
   return redactCommandText(
     input
+      .replace(GITHUB_HTTPS_REMOTE_USERINFO_RE, `$1${REDACTED_EVENT_VALUE}@github.com`)
       .replace(JSON_SECRET_FIELD_TEXT_RE, `$1${REDACTED_EVENT_VALUE}$2`)
       .replace(ESCAPED_JSON_SECRET_FIELD_TEXT_RE, `$1${REDACTED_EVENT_VALUE}$2`),
     REDACTED_EVENT_VALUE,
