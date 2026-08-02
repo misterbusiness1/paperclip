@@ -3,6 +3,7 @@ import type { Db } from "@paperclipai/db";
 import { documents, issueDocuments, issues } from "@paperclipai/db";
 import { ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY, type SourceTrustMetadata } from "@paperclipai/shared";
 import { documentService } from "./documents.js";
+import { redactSensitiveText } from "../redaction.js";
 
 export { ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY };
 export const ISSUE_CONTINUATION_SUMMARY_TITLE = "Continuation Summary";
@@ -49,7 +50,7 @@ export type IssueContinuationSummaryDocument = {
 };
 
 function truncateText(value: string, maxChars: number) {
-  const trimmed = value.trim();
+  const trimmed = redactSensitiveText(value).trim();
   if (trimmed.length <= maxChars) return trimmed;
   return `${trimmed.slice(0, Math.max(0, maxChars - 20)).trimEnd()}\n[truncated]`;
 }
@@ -224,7 +225,7 @@ export async function getIssueContinuationSummaryDocument(
     })
     .from(issueDocuments)
     .innerJoin(documents, eq(issueDocuments.documentId, documents.id))
-    .where(and(eq(issueDocuments.issueId, issueId), eq(issueDocuments.key, ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY)))
+    .where(and(eq(issues.id, issueId), eq(issueDocuments.key, ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY)))
     .then((rows) => rows[0] ?? null);
 
   if (!row) return null;
