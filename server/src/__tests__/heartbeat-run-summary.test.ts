@@ -42,6 +42,16 @@ describe("summarizeHeartbeatRunResultJson", () => {
     expect(summarizeHeartbeatRunResultJson(["nope"] as unknown as Record<string, unknown>)).toBeNull();
     expect(summarizeHeartbeatRunResultJson({ nested: { only: "ignored" } })).toBeNull();
   });
+
+  it("redacts credential-bearing GitHub HTTPS remote URLs from summarized result fields", () => {
+    const summary = summarizeHeartbeatRunResultJson({
+      summary: "remote https://synthetic-user:synthetic-pass@github.com/paperclipai/paperclip.git",
+    });
+
+    expect(summary?.summary).toBe("remote https://***REDACTED***@github.com/paperclipai/paperclip.git");
+    expect(JSON.stringify(summary)).not.toContain("synthetic-user");
+    expect(JSON.stringify(summary)).not.toContain("synthetic-pass");
+  });
 });
 
 describe("buildHeartbeatRunIssueComment", () => {
@@ -63,6 +73,16 @@ describe("buildHeartbeatRunIssueComment", () => {
   it("returns null when there is no usable final text", () => {
     expect(buildHeartbeatRunIssueComment({ costUsd: 1.2 })).toBeNull();
   });
+
+  it("redacts credential-bearing GitHub HTTPS remote URLs from issue comments", () => {
+    const comment = buildHeartbeatRunIssueComment({
+      summary: "pushed https://synthetic-user:synthetic-pass@github.com/paperclipai/paperclip.git",
+    });
+
+    expect(comment).toBe("pushed https://***REDACTED***@github.com/paperclipai/paperclip.git");
+    expect(comment).not.toContain("synthetic-user");
+    expect(comment).not.toContain("synthetic-pass");
+  });
 });
 
 describe("mergeHeartbeatRunResultJson", () => {
@@ -82,6 +102,23 @@ describe("mergeHeartbeatRunResultJson", () => {
 
   it("creates a result payload when only a summary exists", () => {
     expect(mergeHeartbeatRunResultJson(null, "done")).toEqual({ summary: "done" });
+  });
+
+  it("redacts credential-bearing GitHub HTTPS remote URLs before run result persistence", () => {
+    const merged = mergeHeartbeatRunResultJson(
+      {
+        result: "clone https://synthetic-user:synthetic-pass@github.com/paperclipai/paperclip.git",
+        nested: {
+          message: "mirror https://synthetic-token@github.com/paperclipai/private-repo",
+        },
+      },
+      null,
+    );
+
+    expect(merged?.result).toBe("clone https://***REDACTED***@github.com/paperclipai/paperclip.git");
+    expect(JSON.stringify(merged)).not.toContain("synthetic-user");
+    expect(JSON.stringify(merged)).not.toContain("synthetic-pass");
+    expect(JSON.stringify(merged)).not.toContain("synthetic-token");
   });
 
   it("does not overwrite an explicit summary already returned by the adapter", () => {
