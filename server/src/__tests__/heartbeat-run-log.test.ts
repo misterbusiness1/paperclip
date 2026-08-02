@@ -40,4 +40,18 @@ describe("compactRunLogChunk", () => {
     expect(compacted).not.toContain("paperclip-json-secret");
     expect(compacted).not.toContain("paperclip-flag-secret");
   });
+
+  it("redacts credential-bearing GitHub HTTPS remote URLs before run-log storage", () => {
+    const chunk = [
+      "origin https://synthetic-user:synthetic-pass@github.com/paperclipai/paperclip.git",
+      "public https://github.com/paperclipai/paperclip.git",
+    ].join("\n");
+
+    const compacted = compactRunLogChunk(chunk);
+
+    expect(compacted).toContain("https://***REDACTED***@github.com/paperclipai/paperclip.git");
+    expect(compacted).toContain("https://github.com/paperclipai/paperclip.git");
+    expect(compacted).not.toContain("synthetic-user");
+    expect(compacted).not.toContain("synthetic-pass");
+  });
 });
