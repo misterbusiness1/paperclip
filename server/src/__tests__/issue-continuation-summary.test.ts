@@ -86,6 +86,41 @@ describe("issue continuation summaries", () => {
     expect(body).toContain("Inspect the failed run, fix the cause");
   });
 
+  it("redacts credential-bearing GitHub HTTPS remote URLs from run-derived summary text", () => {
+    const body = buildContinuationSummaryMarkdown({
+      issue: {
+        id: "issue-1",
+        identifier: "PAP-1579",
+        title: "Redact remote URLs",
+        description: null,
+        status: "in_progress",
+        priority: "critical",
+      },
+      run: {
+        id: "run-3",
+        status: "failed",
+        error: "fatal https://synthetic-user:synthetic-pass@github.com/paperclipai/paperclip.git",
+        errorCode: "adapter_failed",
+        resultJson: {
+          summary: "origin https://synthetic-token@github.com/paperclipai/private-repo",
+        },
+        stdoutExcerpt: null,
+        stderrExcerpt: null,
+      },
+      agent: {
+        id: "agent-1",
+        name: "CodexCoder",
+        adapterType: "codex_local",
+      },
+    });
+
+    expect(body).toContain("https://***REDACTED***@github.com/paperclipai/paperclip.git");
+    expect(body).toContain("https://***REDACTED***@github.com/paperclipai/private-repo");
+    expect(body).not.toContain("synthetic-user");
+    expect(body).not.toContain("synthetic-pass");
+    expect(body).not.toContain("synthetic-token");
+  });
+
   it("detects continuation summaries that explicitly park executor work for review", () => {
     const body = [
       "# Continuation Summary",
