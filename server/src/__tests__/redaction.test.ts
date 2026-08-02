@@ -89,6 +89,35 @@ describe("redaction", () => {
     expect(result).not.toContain(jwt);
   });
 
+  it("redacts credential-bearing GitHub HTTPS remote URLs from text and structured payloads", () => {
+    const url = "https://synthetic-user:synthetic-pass@github.com/paperclipai/paperclip.git";
+    const tokenUrl = "https://synthetic-token@github.com/paperclipai/private-repo";
+    const safeUrl = "https://github.com/paperclipai/paperclip.git";
+
+    const text = redactSensitiveText(`origin ${url}\nmirror ${tokenUrl}\npublic ${safeUrl}`);
+    const payload = redactEventPayload({
+      stdout: `remote: ${url}`,
+      nested: {
+        message: `clone ${tokenUrl}`,
+        safeUrl,
+      },
+    });
+
+    expect(text).toContain(`https://${REDACTED_EVENT_VALUE}@github.com/paperclipai/paperclip.git`);
+    expect(text).toContain(`https://${REDACTED_EVENT_VALUE}@github.com/paperclipai/private-repo`);
+    expect(text).toContain(safeUrl);
+    expect(text).not.toContain("synthetic-user");
+    expect(text).not.toContain("synthetic-pass");
+    expect(text).not.toContain("synthetic-token");
+    expect(JSON.stringify(payload)).not.toContain("synthetic-user");
+    expect(JSON.stringify(payload)).not.toContain("synthetic-pass");
+    expect(JSON.stringify(payload)).not.toContain("synthetic-token");
+    expect(payload?.nested).toEqual({
+      message: `clone https://${REDACTED_EVENT_VALUE}@github.com/paperclipai/private-repo`,
+      safeUrl,
+    });
+  });
+
   it("redacts inline secrets from command metadata without hiding safe command text", () => {
     const input = {
       command: "custom-acp --token ghp_example_secret env OPENAI_API_KEY=sk-live-example custom-acp",
