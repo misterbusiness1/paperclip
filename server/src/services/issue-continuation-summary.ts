@@ -225,7 +225,7 @@ export async function getIssueContinuationSummaryDocument(
     })
     .from(issueDocuments)
     .innerJoin(documents, eq(issueDocuments.documentId, documents.id))
-    .where(and(eq(issues.id, issueId), eq(issueDocuments.key, ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY)))
+    .where(and(eq(issueDocuments.issueId, issueId), eq(issueDocuments.key, ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY)))
     .then((rows) => rows[0] ?? null);
 
   if (!row) return null;
