@@ -1,7 +1,8 @@
+import { createHash } from "node:crypto";
 import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { approvalComments, approvals } from "@paperclipai/db";
-import { notFound, unprocessable } from "../errors.js";
+import { conflict, notFound, unprocessable } from "../errors.js";
 import { redactCurrentUserText } from "../log-redaction.js";
 import { redactSensitiveText } from "../redaction.js";
 import { agentService } from "./agents.js";
@@ -17,6 +18,7 @@ export function approvalService(db: Db) {
   const resolvableStatuses = Array.from(canResolveStatuses);
   type ApprovalRecord = typeof approvals.$inferSelect;
   type ResolutionResult = { approval: ApprovalRecord; applied: boolean };
+  type CreationResult = { approval: ApprovalRecord; replayed: boolean };
 
   function redactApprovalComment<T extends { body: string }>(comment: T, censorUsernameInLogs: boolean): T {
     return {
@@ -40,6 +42,39 @@ export function approvalService(db: Db) {
       .then((rows) => rows[0] ?? null);
     if (!existing) throw notFound("Approval not found");
     return existing;
+  }
+
+  function stableJson(value: unknown): string {
+    if (Array.isArray(value)) {
+      return `[${value.map((item) => stableJson(item)).join(",")}]`;
+    }
+    if (value && typeof value === "object") {
+      const entries = Object.entries(value as Record<string, unknown>)
+        .filter(([, entryValue]) => entryValue !== undefined)
+        .sort(([left], [right]) => left.localeCompare(right));
+      return `{${entries.map(([key, entryValue]) => `${JSON.stringify(key)}:${stableJson(entryValue)}`).join(",")}}`;
+    }
+    return JSON.stringify(value);
+  }
+
+  function hashApprovalCreateRequest(companyId: string, data: Omit<typeof approvals.$inferInsert, "companyId">): string {
+    const request = {
+      companyId,
+      type: data.type,
+      requestedByAgentId: data.requestedByAgentId ?? null,
+      requestedByUserId: data.requestedByUserId ?? null,
+      payload: data.payload,
+      status: data.status ?? "pending",
+    };
+    return createHash("sha256").update(stableJson(request)).digest("hex");
+  }
+
+  async function findByIdempotencyKey(companyId: string, idempotencyKey: string) {
+    return db
+      .select()
+      .from(approvals)
+      .where(and(eq(approvals.companyId, companyId), eq(approvals.idempotencyKey, idempotencyKey)))
+      .then((rows) => rows[0] ?? null);
   }
 
   async function resolveApproval(
@@ -121,6 +156,31 @@ export function approvalService(db: Db) {
         .values({ ...data, companyId })
         .returning()
         .then((rows) => rows[0]),
+
+    createWithIdempotency: async (
+      companyId: string,
+      data: Omit<typeof approvals.$inferInsert, "companyId" | "idempotencyKey" | "idempotencyRequestHash">,
+      idempotencyKey: string,
+    ): Promise<CreationResult> => {
+      const requestHash = hashApprovalCreateRequest(companyId, data);
+      const existing = await findByIdempotencyKey(companyId, idempotencyKey);
+      if (existing) {
+        if (existing.idempotencyRequestHash !== requestHash) {
+          throw conflict("Approval idempotency key already exists for a different request", {
+            idempotencyKey,
+          });
+        }
+        return { approval: existing, replayed: true };
+      }
+
+      const inserted = await db
+        .insert(approvals)
+        .values({ ...data, companyId, idempotencyKey, idempotencyRequestHash: requestHash })
+        .returning()
+        .then((rows) => rows[0]);
+
+      return { approval: inserted, replayed: false };
+    },
 
     approve: async (id: string, decidedByUserId: string, decisionNote?: string | null) => {
       const { approval: updated, applied } = await resolveApproval(

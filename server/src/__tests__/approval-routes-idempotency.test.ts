@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -6,6 +7,7 @@ const mockApprovalService = vi.hoisted(() => ({
   list: vi.fn(),
   getById: vi.fn(),
   create: vi.fn(),
+  createWithIdempotency: vi.fn(),
   approve: vi.fn(),
   reject: vi.fn(),
   requestRevision: vi.fn(),
@@ -121,6 +123,7 @@ describe("approval routes idempotent retries", () => {
     mockApprovalService.list.mockReset();
     mockApprovalService.getById.mockReset();
     mockApprovalService.create.mockReset();
+    mockApprovalService.createWithIdempotency.mockReset();
     mockApprovalService.approve.mockReset();
     mockApprovalService.reject.mockReset();
     mockApprovalService.requestRevision.mockReset();
@@ -322,7 +325,7 @@ describe("approval routes idempotent retries", () => {
     );
   });
 
-  it("lets agents create generic issue-linked board approval requests", async () => {
+  it("lets agents create Gate A issue-linked board approval requests", async () => {
     mockApprovalService.create.mockResolvedValue({
       id: "approval-1",
       companyId: "company-1",
@@ -330,7 +333,17 @@ describe("approval routes idempotent retries", () => {
       requestedByAgentId: "agent-1",
       requestedByUserId: null,
       status: "pending",
-      payload: { title: "Approve hosting spend" },
+      payload: {
+        gate: "gate_a",
+        actionType: "refund_full",
+        currency: "USD",
+        wooCommerceTransactionRef: "wc-order-1001:txn-2002",
+        reason: {
+          code: "customer_request",
+          description: "Customer requested a full refund before fulfillment.",
+        },
+        requestedByAgentId: "agent-1",
+      },
       decisionNote: null,
       decidedByUserId: null,
       decidedAt: null,
@@ -343,7 +356,16 @@ describe("approval routes idempotent retries", () => {
       .send({
         type: "request_board_approval",
         issueIds: ["00000000-0000-0000-0000-000000000001"],
-        payload: { title: "Approve hosting spend" },
+        payload: {
+          gate: "gate_a",
+          actionType: "refund_full",
+          currency: "USD",
+          wooCommerceTransactionRef: "wc-order-1001:txn-2002",
+          reason: {
+            code: "customer_request",
+            description: "Customer requested a full refund before fulfillment.",
+          },
+        },
       });
 
     expect([200, 201], JSON.stringify(res.body)).toContain(res.status);
@@ -355,6 +377,13 @@ describe("approval routes idempotent retries", () => {
       status: "pending",
     });
     expect(mockSecretService.normalizeHireApprovalPayloadForPersistence).not.toHaveBeenCalled();
+    expect(mockApprovalService.create).toHaveBeenCalledWith(
+      "company-1",
+      expect.objectContaining({
+        payload: expect.objectContaining({ requestedByAgentId: "agent-1" }),
+        requestedByAgentId: "agent-1",
+      }),
+    );
     expect(mockIssueApprovalService.linkManyForApproval).toHaveBeenCalledWith(
       "approval-1",
       ["00000000-0000-0000-0000-000000000001"],
@@ -445,5 +474,168 @@ describe("approval routes idempotent retries", () => {
     expect(res.status, JSON.stringify(res.body)).toBe(403);
     expect(res.body.error).toContain("Cheap status-only recovery runs cannot create or modify approvals");
     expect(mockApprovalService.addComment).not.toHaveBeenCalled();
+  it("rejects malformed Gate A creation with field-specific 4xx errors", async () => {
+    const res = await request(await createAgentApp())
+      .post("/api/companies/company-1/approvals")
+      .send({
+        type: "request_board_approval",
+        payload: {
+          gate: "gate_a",
+          actionType: "invalid_action",
+          currency: "usd",
+          wooCommerceTransactionRef: "",
+          reason: { code: "unknown", description: "" },
+        },
+      });
+
+    expect(res.status).toBe(400);
+    expect(res.body.details).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ path: ["payload", "actionType"] }),
+        expect.objectContaining({ path: ["payload", "currency"] }),
+        expect.objectContaining({ path: ["payload", "wooCommerceTransactionRef"] }),
+        expect.objectContaining({ path: ["payload", "reason", "code"] }),
+      ]),
+    );
+    expect(mockApprovalService.create).not.toHaveBeenCalled();
+  });
+
+  it("lets agents create Gate B approval requests when bodyHash matches body", async () => {
+    const body = "Send the customer this approved response.";
+    const bodyHash = `sha256:${createHash("sha256").update(body, "utf8").digest("hex")}`;
+    mockApprovalService.create.mockResolvedValue({
+      id: "approval-gate-b",
+      companyId: "company-1",
+      type: "request_board_approval",
+      requestedByAgentId: "agent-1",
+      requestedByUserId: null,
+      status: "pending",
+      payload: {
+        gate: "gate_b",
+        channel: "email",
+        contentType: "text/plain",
+        body,
+        bodyHash,
+        threadRef: { ticketId: "gmail-thread-1", orderRef: "order-1001" },
+        priority: "high",
+        slaDeadline: "2026-08-04T12:00:00.000Z",
+        contextPulled: { at: "2026-08-03T12:00:00.000Z", sources: ["gmail:thread-1001"] },
+        risks: [{ code: "customer_confusion", description: "Customer may need clarification." }],
+        requestedByAgentId: "agent-1",
+      },
+      decisionNote: null,
+      decidedByUserId: null,
+      decidedAt: null,
+      createdAt: new Date("2026-04-06T00:00:00.000Z"),
+      updatedAt: new Date("2026-04-06T00:00:00.000Z"),
+    });
+
+    const res = await request(await createAgentApp())
+      .post("/api/companies/company-1/approvals")
+      .send({
+        type: "request_board_approval",
+        payload: {
+          gate: "gate_b",
+          channel: "email",
+          contentType: "text/plain",
+          body,
+          bodyHash,
+          threadRef: { ticketId: "gmail-thread-1", orderRef: "order-1001" },
+          priority: "high",
+          slaDeadline: "2026-08-04T12:00:00.000Z",
+          contextPulled: { at: "2026-08-03T12:00:00.000Z", sources: ["gmail:thread-1001"] },
+          risks: [{ code: "customer_confusion", description: "Customer may need clarification." }],
+        },
+      });
+
+    expect(res.status).toBe(201);
+    expect(mockApprovalService.create).toHaveBeenCalledWith(
+      "company-1",
+      expect.objectContaining({ payload: expect.objectContaining({ bodyHash }) }),
+    );
+  });
+
+  it("rejects Gate B approval requests when bodyHash does not match body", async () => {
+    const res = await request(await createAgentApp())
+      .post("/api/companies/company-1/approvals")
+      .send({
+        type: "request_board_approval",
+        payload: {
+          gate: "gate_b",
+          channel: "email",
+          contentType: "text/plain",
+          body: "Send one response.",
+          bodyHash: "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+          threadRef: { ticketId: "gmail-thread-1", orderRef: "order-1001" },
+          priority: "high",
+          slaDeadline: "2026-08-04T12:00:00.000Z",
+          contextPulled: { at: "2026-08-03T12:00:00.000Z", sources: ["gmail:thread-1001"] },
+          risks: [{ code: "customer_confusion", description: "Customer may need clarification." }],
+        },
+      });
+
+    expect(res.status).toBe(400);
+    expect(res.body.details).toEqual(
+      expect.arrayContaining([expect.objectContaining({ path: ["payload", "bodyHash"] })]),
+    );
+    expect(mockApprovalService.create).not.toHaveBeenCalled();
+  });
+
+  it("returns the first approval without duplicate side effects on exact idempotent replay", async () => {
+    mockApprovalService.createWithIdempotency.mockResolvedValue({
+      replayed: true,
+      approval: {
+        id: "approval-replay",
+        companyId: "company-1",
+        type: "request_board_approval",
+        requestedByAgentId: "agent-1",
+        requestedByUserId: null,
+        status: "pending",
+        payload: {
+          gate: "gate_a",
+          actionType: "refund_full",
+          currency: "USD",
+          wooCommerceTransactionRef: "wc-order-1001:txn-2002",
+          reason: {
+            code: "customer_request",
+            description: "Customer requested a full refund before fulfillment.",
+          },
+          requestedByAgentId: "agent-1",
+        },
+        decisionNote: null,
+        decidedByUserId: null,
+        decidedAt: null,
+        createdAt: new Date("2026-04-06T00:00:00.000Z"),
+        updatedAt: new Date("2026-04-06T00:00:00.000Z"),
+      },
+    });
+
+    const res = await request(await createAgentApp())
+      .post("/api/companies/company-1/approvals")
+      .set("Idempotency-Key", "approval:OXFA-2794")
+      .send({
+        type: "request_board_approval",
+        issueIds: ["00000000-0000-0000-0000-000000000001"],
+        payload: {
+          gate: "gate_a",
+          actionType: "refund_full",
+          currency: "USD",
+          wooCommerceTransactionRef: "wc-order-1001:txn-2002",
+          reason: {
+            code: "customer_request",
+            description: "Customer requested a full refund before fulfillment.",
+          },
+        },
+      });
+
+    expect(res.status).toBe(200);
+    expect(res.body.id).toBe("approval-replay");
+    expect(mockApprovalService.createWithIdempotency).toHaveBeenCalledWith(
+      "company-1",
+      expect.objectContaining({ type: "request_board_approval" }),
+      "approval:OXFA-2794",
+    );
+    expect(mockIssueApprovalService.linkManyForApproval).not.toHaveBeenCalled();
+    expect(mockLogActivity).not.toHaveBeenCalled();
   });
 });

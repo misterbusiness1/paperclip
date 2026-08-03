@@ -37,6 +37,24 @@ function createApproval(status: string): ApprovalRecord {
   };
 }
 
+
+
+function createApprovalCreateDbStub(selectResults: ApprovalRecord[][], insertResults: ApprovalRecord[]) {
+  const pendingSelectResults = [...selectResults];
+  const selectWhere = vi.fn(async () => pendingSelectResults.shift() ?? []);
+  const from = vi.fn(() => ({ where: selectWhere }));
+  const select = vi.fn(() => ({ from }));
+
+  const insertReturning = vi.fn(async () => insertResults);
+  const values = vi.fn(() => ({ returning: insertReturning }));
+  const insert = vi.fn(() => ({ values }));
+
+  return {
+    db: { select, insert },
+    values,
+  };
+}
+
 function createDbStub(selectResults: ApprovalRecord[][], updateResults: ApprovalRecord[]) {
   const pendingSelectResults = [...selectResults];
   const selectWhere = vi.fn(async () => pendingSelectResults.shift() ?? []);
@@ -165,5 +183,115 @@ describe("approvalService.findOpenHireApprovalForAgent", () => {
     const result = await svc.findOpenHireApprovalForAgent("company-1", "agent-1");
 
     expect(result).toBeNull();
+  });
+});
+
+
+describe("approvalService creation idempotency", () => {
+  it("persists first-class idempotency state on first submit", async () => {
+    const inserted = {
+      ...createApproval("pending"),
+      idempotencyKey: "approval:OXFA-2794",
+      idempotencyRequestHash: "stored-hash",
+    } as ApprovalRecord & { idempotencyKey: string; idempotencyRequestHash: string };
+    const dbStub = createApprovalCreateDbStub([[]], [inserted]);
+
+    const svc = approvalService(dbStub.db as any);
+    const result = await svc.createWithIdempotency(
+      "company-1",
+      {
+        type: "request_board_approval",
+        requestedByAgentId: "requester-1",
+        requestedByUserId: null,
+        status: "pending",
+        payload: {
+          gate: "gate_a",
+          actionType: "deploy_code",
+          subject: "Approve production rollout",
+          body: "Deploy release 2026.08.03.1.",
+          threadOrOrderRef: "OXFA-2794",
+        },
+        decisionNote: null,
+        decidedByUserId: null,
+        decidedAt: null,
+        updatedAt: new Date("2026-08-03T00:00:00.000Z"),
+      } as any,
+      "approval:OXFA-2794",
+    );
+
+    expect(result.replayed).toBe(false);
+    expect(dbStub.values).toHaveBeenCalledWith(
+      expect.objectContaining({
+        companyId: "company-1",
+        idempotencyKey: "approval:OXFA-2794",
+        idempotencyRequestHash: expect.any(String),
+      }),
+    );
+  });
+
+  it("returns the original approval on exact idempotent replay", async () => {
+    const existing = {
+      ...createApproval("pending"),
+      type: "request_board_approval",
+      idempotencyKey: "approval:OXFA-2794",
+      idempotencyRequestHash: "15f41d20f7b43bf35deb57a5974dfbb7e4400b97d16f45c52f6accd99a5bbdbb",
+    } as ApprovalRecord & { idempotencyKey: string; idempotencyRequestHash: string };
+    const data = {
+      type: "request_board_approval",
+      requestedByAgentId: "requester-1",
+      requestedByUserId: null,
+      status: "pending",
+      payload: { agentId: "agent-1" },
+      decisionNote: null,
+      decidedByUserId: null,
+      decidedAt: null,
+      updatedAt: new Date("2026-08-03T00:00:00.000Z"),
+    } as any;
+    const firstDbStub = createApprovalCreateDbStub([[]], [existing]);
+    const first = await approvalService(firstDbStub.db as any).createWithIdempotency(
+      "company-1",
+      data,
+      "approval:OXFA-2794",
+    );
+    const persistedHash = (firstDbStub.values.mock.calls[0]?.[0] as any).idempotencyRequestHash;
+    const replayDbStub = createApprovalCreateDbStub([[{ ...existing, idempotencyRequestHash: persistedHash }]], []);
+
+    const replay = await approvalService(replayDbStub.db as any).createWithIdempotency(
+      "company-1",
+      data,
+      "approval:OXFA-2794",
+    );
+
+    expect(first.replayed).toBe(false);
+    expect(replay.replayed).toBe(true);
+    expect(replay.approval.id).toBe("approval-1");
+    expect(replayDbStub.values).not.toHaveBeenCalled();
+  });
+
+  it("rejects idempotency key reuse with a different request", async () => {
+    const existing = {
+      ...createApproval("pending"),
+      idempotencyKey: "approval:OXFA-2794",
+      idempotencyRequestHash: "different-hash",
+    } as ApprovalRecord & { idempotencyKey: string; idempotencyRequestHash: string };
+    const dbStub = createApprovalCreateDbStub([[existing]], []);
+
+    await expect(
+      approvalService(dbStub.db as any).createWithIdempotency(
+        "company-1",
+        {
+          type: "request_board_approval",
+          requestedByAgentId: "requester-1",
+          requestedByUserId: null,
+          status: "pending",
+          payload: { subject: "Different" },
+          decisionNote: null,
+          decidedByUserId: null,
+          decidedAt: null,
+          updatedAt: new Date("2026-08-03T00:00:00.000Z"),
+        } as any,
+        "approval:OXFA-2794",
+      ),
+    ).rejects.toMatchObject({ status: 409 });
   });
 });

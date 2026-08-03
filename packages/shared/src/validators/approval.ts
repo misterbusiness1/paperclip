@@ -1,13 +1,100 @@
 import { z } from "zod";
-import { APPROVAL_TYPES } from "../constants.js";
 import { multilineTextSchema } from "./text.js";
 
-export const createApprovalSchema = z.object({
-  type: z.enum(APPROVAL_TYPES),
+export const gateABoardApprovalActionTypes = [
+  "refund_full",
+  "refund_partial",
+  "store_credit",
+  "gift_card",
+  "void_auth",
+  "capture_auth",
+  "adjustment",
+] as const;
+
+export const gateABoardApprovalReasonCodes = [
+  "customer_request",
+  "fraud_suspected",
+  "fulfillment_issue",
+  "order_adjustment",
+  "tax_fee_correction",
+  "goodwill",
+] as const;
+
+export const gateBBoardApprovalChannels = [
+  "email",
+  "helpdesk",
+  "klaviyo",
+  "sms",
+  "whatsapp",
+  "ig_dm",
+  "fb_dm",
+  "marketplace",
+] as const;
+
+export const gateBBoardApprovalPriorities = ["normal", "high", "urgent"] as const;
+
+const requestedByAgentPayloadField = z.object({
+  requestedByAgentId: z.string().uuid().optional(),
+});
+
+export const gateABoardApprovalPayloadSchema = requestedByAgentPayloadField.extend({
+  gate: z.literal("gate_a"),
+  actionType: z.enum(gateABoardApprovalActionTypes),
+  currency: z.string().regex(/^[A-Z]{3}$/),
+  wooCommerceTransactionRef: z.string().trim().min(1),
+  reason: z.object({
+    code: z.enum(gateABoardApprovalReasonCodes),
+    description: multilineTextSchema.pipe(z.string().min(1)),
+  }).strict(),
+});
+
+export const gateBBoardApprovalPayloadSchema = requestedByAgentPayloadField.extend({
+  gate: z.literal("gate_b"),
+  channel: z.enum(gateBBoardApprovalChannels),
+  contentType: z.enum(["text/plain", "text/html"]),
+  body: multilineTextSchema.pipe(z.string().min(1)),
+  bodyHash: z.string().regex(/^sha256:[a-f0-9]{64}$/),
+  threadRef: z.object({
+    ticketId: z.string().trim().min(1),
+    orderRef: z.string().trim().min(1),
+  }).strict(),
+  priority: z.enum(gateBBoardApprovalPriorities),
+  slaDeadline: z.string().datetime({ offset: true }),
+  contextPulled: z.object({
+    at: z.string().datetime({ offset: true }),
+    sources: z.array(z.string().trim().min(1)).min(1),
+  }).strict(),
+  risks: z.array(z.object({
+    code: z.string().trim().min(1),
+    description: multilineTextSchema.pipe(z.string().min(1)),
+  }).strict()).min(1),
+});
+
+export const requestBoardApprovalPayloadSchema = z.discriminatedUnion("gate", [
+  gateABoardApprovalPayloadSchema.strict(),
+  gateBBoardApprovalPayloadSchema.strict(),
+]);
+
+const requestBoardApprovalSchema = z.object({
+  type: z.literal("request_board_approval"),
+  requestedByAgentId: z.string().uuid().optional().nullable(),
+  payload: requestBoardApprovalPayloadSchema,
+  issueIds: z.array(z.string().uuid()).optional(),
+  idempotencyKey: z.string().trim().min(1).max(255).optional(),
+});
+
+const passthroughApprovalSchema = z.object({
   requestedByAgentId: z.string().uuid().optional().nullable(),
   payload: z.record(z.string(), z.unknown()),
   issueIds: z.array(z.string().uuid()).optional(),
 });
+
+export const createApprovalSchema = z.discriminatedUnion("type", [
+  requestBoardApprovalSchema,
+  passthroughApprovalSchema.extend({ type: z.literal("hire_agent") }),
+  passthroughApprovalSchema.extend({ type: z.literal("approve_ceo_strategy") }),
+  passthroughApprovalSchema.extend({ type: z.literal("budget_override_required") }),
+]);
 
 export type CreateApproval = z.infer<typeof createApprovalSchema>;
 
