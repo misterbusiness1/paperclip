@@ -8,7 +8,11 @@ import {
   buildLocalProcessSandboxSpawnTarget,
   type LocalProcessSandboxOptions,
 } from "./local-process-sandbox.js";
-import { buildSshSpawnTarget, type SshRemoteExecutionSpec } from "./ssh.js";
+import {
+  buildSshSpawnTarget,
+  type SshProcessGroupTerminationEvidence,
+  type SshRemoteExecutionSpec,
+} from "./ssh.js";
 import { redactCommandText } from "./command-redaction.js";
 import type {
   AdapterSkillEntry,
@@ -45,10 +49,105 @@ export interface TerminalResultCleanupEvidence {
   forceKilled: boolean;
 }
 
-interface RunningProcess {
+export interface LocalProcessTerminationEvidence {
+  kind: "process_group_termination";
+  scope: "local";
+  target: "group" | "pid";
+  suspendSent: boolean;
+  termSent: boolean;
+  forceKilled: boolean;
+  confirmedExited: boolean;
+  outcome: "already_exited" | "terminated" | "force_killed" | "unconfirmed";
+}
+
+/**
+ * A local child (or one of its same-group descendants) remained alive after
+ * the complete TERM/KILL confirmation window. Heartbeat callers must retain a
+ * cancellation fence instead of translating the direct child's close event
+ * into a terminal run.
+ */
+export class UnconfirmedLocalProcessTerminationError extends Error {
+  readonly code = "local_process_termination_unconfirmed";
+  readonly runId: string;
+  readonly evidence: LocalProcessTerminationEvidence;
+  readonly processPid!: number | null;
+  readonly processGroupId!: number | null;
+  readonly terminationCause!: unknown;
+
+  constructor(input: {
+    runId: string;
+    evidence: LocalProcessTerminationEvidence;
+    processPid?: number | null;
+    processGroupId?: number | null;
+    cause?: unknown;
+  }) {
+    super(`Local process-group termination could not be confirmed for run ${input.runId}`);
+    this.name = "UnconfirmedLocalProcessTerminationError";
+    this.runId = input.runId;
+    this.evidence = input.evidence;
+    const processPid =
+      typeof input.processPid === "number" && Number.isInteger(input.processPid) && input.processPid > 1
+        ? input.processPid
+        : null;
+    const processGroupId =
+      typeof input.processGroupId === "number" && Number.isInteger(input.processGroupId) && input.processGroupId > 1
+        ? input.processGroupId
+        : null;
+    // Retry identifiers and raw causes are control-plane state, not log/event
+    // evidence. Keep them available to the heartbeat fence without exposing
+    // them through ordinary error serialization.
+    Object.defineProperties(this, {
+      processPid: { value: processPid, enumerable: false },
+      processGroupId: { value: processGroupId, enumerable: false },
+      terminationCause: { value: input.cause, enumerable: false },
+    });
+  }
+}
+
+/**
+ * A remote execution stop was requested, but the SSH process group could not
+ * be proven absent. Callers must treat this as a fail-closed, non-terminal
+ * outcome until a later termination attempt produces confirmed evidence.
+ */
+export class UnconfirmedSshProcessTerminationError extends Error {
+  readonly code = "ssh_process_termination_unconfirmed";
+  readonly runId: string;
+  readonly evidence: SshProcessGroupTerminationEvidence | null;
+  readonly terminationCause: unknown;
+
+  constructor(input: {
+    runId: string;
+    evidence?: SshProcessGroupTerminationEvidence | null;
+    cause?: unknown;
+  }) {
+    super(`SSH process-group termination could not be confirmed for run ${input.runId}`);
+    this.name = "UnconfirmedSshProcessTerminationError";
+    this.runId = input.runId;
+    this.evidence = input.evidence ?? null;
+    this.terminationCause = input.cause;
+  }
+}
+
+export interface RunningProcessTransportStopOptions {
+  confirmationTimeoutMs?: number;
+  localForceAfterMs?: number;
+}
+
+export interface RunningProcessTransportStopEvidence {
+  kind: "process_transport_stop";
+  handled: boolean;
+  scope: "local" | "ssh" | null;
+  remote: SshProcessGroupTerminationEvidence | null;
+}
+
+export interface RunningProcess {
   child: ChildProcess;
   graceSec: number;
   processGroupId: number | null;
+  terminateRemote?: (options?: { confirmationTimeoutMs?: number }) => Promise<SshProcessGroupTerminationEvidence>;
+  stopTransport?: (
+    options?: RunningProcessTransportStopOptions,
+  ) => Promise<RunningProcessTransportStopEvidence>;
 }
 
 interface SpawnTarget {
@@ -57,6 +156,7 @@ interface SpawnTarget {
   cwd?: string;
   env?: Record<string, string | undefined>;
   cleanup?: () => Promise<void>;
+  terminateRemote?: RunningProcess["terminateRemote"];
 }
 
 type RemoteExecutionSpec = SshRemoteExecutionSpec;
@@ -99,7 +199,234 @@ export function signalRunningProcess(
   }
 }
 
+function localProcessTarget(
+  running: Pick<RunningProcess, "child" | "processGroupId">,
+) {
+  const processGroupId =
+    process.platform !== "win32"
+    && typeof running.processGroupId === "number"
+    && Number.isInteger(running.processGroupId)
+    && running.processGroupId > 1
+      ? running.processGroupId
+      : null;
+  const processPid =
+    typeof running.child.pid === "number"
+    && Number.isInteger(running.child.pid)
+    && running.child.pid > 1
+      ? running.child.pid
+      : null;
+  return {
+    processPid,
+    processGroupId,
+    target: processGroupId !== null ? "group" as const : "pid" as const,
+    signalTarget: processGroupId !== null ? -processGroupId : processPid,
+  };
+}
+
+async function terminateAndConfirmLocalProcess(
+  runId: string,
+  running: Pick<RunningProcess, "child" | "processGroupId">,
+  options: RunningProcessTransportStopOptions & { forceAfterMs: number },
+): Promise<LocalProcessTerminationEvidence> {
+  const target = localProcessTarget(running);
+  const evidence: LocalProcessTerminationEvidence = {
+    kind: "process_group_termination",
+    scope: "local",
+    target: target.target,
+    suspendSent: false,
+    termSent: false,
+    forceKilled: false,
+    confirmedExited: false,
+    outcome: "unconfirmed",
+  };
+  const unconfirmed = (cause?: unknown) => new UnconfirmedLocalProcessTerminationError({
+    runId,
+    evidence: { ...evidence },
+    processPid: target.processPid,
+    processGroupId: target.processGroupId,
+    cause,
+  });
+
+  // A spawn error can reach settlement without ever receiving a usable PID.
+  // In that case there is no local process tree to confirm.
+  if (target.signalTarget === null) {
+    return {
+      ...evidence,
+      confirmedExited: true,
+      outcome: "already_exited",
+    };
+  }
+  if (process.platform !== "win32" && target.processGroupId === null) {
+    // A direct-PID check cannot prove that a detached POSIX workload's
+    // descendants are gone. Fail closed instead of reporting tree cleanup.
+    throw unconfirmed();
+  }
+
+  const targetIsAlive = () => {
+    try {
+      process.kill(target.signalTarget!, 0);
+      return true;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException | undefined)?.code;
+      if (code === "ESRCH") return false;
+      if (code === "EPERM") return true;
+      throw unconfirmed(error);
+    }
+  };
+  const sendSignal = (signal: NodeJS.Signals) => {
+    try {
+      process.kill(target.signalTarget!, signal);
+      return true;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException | undefined)?.code;
+      if (code === "ESRCH") return false;
+      throw unconfirmed(error);
+    }
+  };
+  const confirmExit = async (timeoutMs: number) => {
+    const deadline = Date.now() + Math.max(0, timeoutMs);
+    while (Date.now() < deadline) {
+      if (!targetIsAlive()) return true;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    return !targetIsAlive();
+  };
+
+  if (!targetIsAlive()) {
+    return {
+      ...evidence,
+      confirmedExited: true,
+      outcome: "already_exited",
+    };
+  }
+
+  if (process.platform !== "win32") {
+    // Freeze the whole group before asking it to terminate. Without this
+    // barrier, a TERM-ignoring descendant can continue external side effects
+    // during the grace window after the direct child has already closed.
+    evidence.suspendSent = sendSignal("SIGSTOP");
+    if (!targetIsAlive()) {
+      return {
+        ...evidence,
+        confirmedExited: true,
+        outcome: "terminated",
+      };
+    }
+    evidence.termSent = sendSignal("SIGTERM");
+    if (!targetIsAlive()) {
+      return {
+        ...evidence,
+        confirmedExited: true,
+        outcome: "terminated",
+      };
+    }
+    evidence.forceKilled = sendSignal("SIGKILL");
+    if (await confirmExit(options.confirmationTimeoutMs ?? 5_000)) {
+      return {
+        ...evidence,
+        confirmedExited: true,
+        outcome: "force_killed",
+      };
+    }
+    throw unconfirmed();
+  }
+
+  evidence.termSent = sendSignal("SIGTERM");
+  if (await confirmExit(options.forceAfterMs)) {
+    return {
+      ...evidence,
+      confirmedExited: true,
+      outcome: "terminated",
+    };
+  }
+
+  evidence.forceKilled = sendSignal("SIGKILL");
+  if (await confirmExit(options.confirmationTimeoutMs ?? 5_000)) {
+    return {
+      ...evidence,
+      confirmedExited: true,
+      outcome: "force_killed",
+    };
+  }
+
+  throw unconfirmed();
+}
+
 export const runningProcesses = new Map<string, RunningProcess>();
+const pendingProcessStarts = new Map<string, AbortController>();
+const processCancellationRequests = new Set<string>();
+const remoteProcessTerminationControls = new Map<string, NonNullable<RunningProcess["terminateRemote"]>>();
+
+export function requestProcessCancellation(runId: string): { pendingStartCancelled: boolean } {
+  processCancellationRequests.add(runId);
+  const pending = pendingProcessStarts.get(runId);
+  pending?.abort();
+  return { pendingStartCancelled: Boolean(pending) };
+}
+
+export function clearProcessCancellation(runId: string) {
+  processCancellationRequests.delete(runId);
+  clearRemoteProcessTerminationControl(runId);
+}
+
+export function getRemoteProcessTerminationControl(runId: string) {
+  return remoteProcessTerminationControls.get(runId) ?? null;
+}
+
+export function clearRemoteProcessTerminationControl(runId: string) {
+  remoteProcessTerminationControls.delete(runId);
+}
+
+/**
+ * Stops the active execution transport for a run. `runChildProcess` installs a
+ * per-run control backed by the same in-flight SSH confirmation promise used by
+ * timeouts and terminal-result cleanup. The fallback exists for callers/tests
+ * that register a legacy `RunningProcess` without that control.
+ */
+export async function stopRunningProcessTransport(
+  runId: string,
+  options: RunningProcessTransportStopOptions = {},
+): Promise<RunningProcessTransportStopEvidence> {
+  const running = runningProcesses.get(runId) ?? null;
+  if (running?.stopTransport) return await running.stopTransport(options);
+
+  const remoteControl = running?.terminateRemote ?? remoteProcessTerminationControls.get(runId) ?? null;
+  let remoteEvidence: SshProcessGroupTerminationEvidence | null = null;
+  let remoteError: unknown = null;
+  if (remoteControl) {
+    try {
+      remoteEvidence = await remoteControl({ confirmationTimeoutMs: options.confirmationTimeoutMs });
+      if (!remoteEvidence.confirmedExited) {
+        throw new UnconfirmedSshProcessTerminationError({ runId, evidence: remoteEvidence });
+      }
+    } catch (error) {
+      remoteError = error instanceof UnconfirmedSshProcessTerminationError
+        ? error
+        : new UnconfirmedSshProcessTerminationError({ runId, cause: error });
+    }
+  }
+
+  let localError: unknown = null;
+  if (running && runningProcesses.get(runId) === running) {
+    try {
+      await terminateAndConfirmLocalProcess(runId, running, {
+        ...options,
+        forceAfterMs: Math.max(1, options.localForceAfterMs ?? running.graceSec * 1000),
+      });
+    } catch (error) {
+      localError = error;
+    }
+  }
+
+  if (remoteError) throw remoteError;
+  if (localError) throw localError;
+  return {
+    kind: "process_transport_stop",
+    handled: Boolean(running || remoteControl),
+    scope: remoteControl ? "ssh" : running ? "local" : null,
+    remote: remoteEvidence,
+  };
+}
 export const MAX_CAPTURE_BYTES = 4 * 1024 * 1024;
 export const MAX_EXCERPT_BYTES = 32 * 1024;
 const TERMINAL_RESULT_SCAN_OVERLAP_CHARS = 64 * 1024;
@@ -2158,6 +2485,7 @@ function resolveWindowsCmdShell(env: NodeJS.ProcessEnv): string {
 }
 
 async function resolveSpawnTarget(
+  runId: string,
   command: string,
   args: string[],
   cwd: string,
@@ -2176,6 +2504,7 @@ async function resolveSpawnTarget(
     }
     const spawnTarget = await buildSshSpawnTarget({
       spec: remote,
+      runId,
       command,
       args,
       env: Object.fromEntries(
@@ -2187,6 +2516,7 @@ async function resolveSpawnTarget(
       args: spawnTarget.args,
       cwd: process.cwd(),
       cleanup: spawnTarget.cleanup,
+      terminateRemote: spawnTarget.terminateRemote,
     };
   }
 
@@ -3031,6 +3361,16 @@ export async function runChildProcess(
     localProcessSandbox?: LocalProcessSandboxOptions | null;
   },
 ): Promise<RunProcessResult> {
+  if (processCancellationRequests.has(runId)) {
+    throw new Error("Process start cancelled before spawn");
+  }
+  if (pendingProcessStarts.has(runId) || runningProcesses.has(runId)) {
+    throw new Error("Process start rejected because this run already has an active process");
+  }
+  const pendingStart = new AbortController();
+  pendingProcessStarts.set(runId, pendingStart);
+  const priorRemoteControl = remoteProcessTerminationControls.get(runId) ?? null;
+
   const onLogError = opts.onLogError ?? ((err, id, msg) => console.warn({ err, runId: id }, msg));
   return new Promise<RunProcessResult>((resolve, reject) => {
     const rawMerged: NodeJS.ProcessEnv = {
@@ -3057,12 +3397,33 @@ export async function runChildProcess(
     if (opts.localProcessSandbox?.homeDir) {
       mergedEnv.HOME = opts.localProcessSandbox.homeDir;
     }
-    void resolveSpawnTarget(command, args, opts.cwd, mergedEnv, {
-      remoteExecution: opts.remoteExecution ?? null,
-      remoteEnv: opts.remoteExecution ? opts.env : null,
-      localProcessSandbox: opts.localProcessSandbox ?? null,
-    })
+    void Promise.resolve()
+      .then(async () => {
+        if (priorRemoteControl) {
+          const priorTermination = await priorRemoteControl();
+          if (!priorTermination.confirmedExited) {
+            throw new Error("Prior SSH process-group termination could not be confirmed");
+          }
+          if (remoteProcessTerminationControls.get(runId) === priorRemoteControl) {
+            remoteProcessTerminationControls.delete(runId);
+          }
+        }
+        if (pendingStart.signal.aborted || processCancellationRequests.has(runId)) {
+          throw new Error("Process start cancelled before spawn");
+        }
+        return resolveSpawnTarget(runId, command, args, opts.cwd, mergedEnv, {
+          remoteExecution: opts.remoteExecution ?? null,
+          remoteEnv: opts.remoteExecution ? opts.env : null,
+          localProcessSandbox: opts.localProcessSandbox ?? null,
+        });
+      })
       .then((target) => {
+        if (pendingStart.signal.aborted || processCancellationRequests.has(runId)) {
+          pendingProcessStarts.delete(runId);
+          void target.cleanup?.();
+          reject(new Error("Process start cancelled before spawn"));
+          return;
+        }
         const childEnv = { ...mergedEnv, ...target.env };
         for (const [key, value] of Object.entries(childEnv)) {
           if (value === undefined) delete childEnv[key];
@@ -3077,14 +3438,66 @@ export async function runChildProcess(
         const startedAt = new Date().toISOString();
         const processGroupId = resolveProcessGroupId(child);
 
+        let confirmedRemoteTermination: SshProcessGroupTerminationEvidence | null = null;
+        let remoteTerminationInFlight: Promise<SshProcessGroupTerminationEvidence> | null = null;
+        let latestRemoteTerminationAttempt: Promise<SshProcessGroupTerminationEvidence> | null = null;
+        const terminateRemote = target.terminateRemote
+          ? (options: { confirmationTimeoutMs?: number } = {}) => {
+            if (confirmedRemoteTermination) return Promise.resolve(confirmedRemoteTermination);
+            if (remoteTerminationInFlight) return remoteTerminationInFlight;
+
+            const attempt = Promise.resolve()
+              .then(() => target.terminateRemote!(options))
+              .then((evidence) => {
+                if (!evidence.confirmedExited) {
+                  throw new UnconfirmedSshProcessTerminationError({ runId, evidence });
+                }
+                confirmedRemoteTermination = evidence;
+                return evidence;
+              })
+              .catch((error) => {
+                if (error instanceof UnconfirmedSshProcessTerminationError) throw error;
+                throw new UnconfirmedSshProcessTerminationError({ runId, cause: error });
+              });
+
+            remoteTerminationInFlight = attempt;
+            latestRemoteTerminationAttempt = attempt;
+            void attempt.then(
+              () => undefined,
+              () => {
+                // Preserve the failed attempt for settlement evidence, but
+                // allow an explicit cancellation/reconciliation caller to retry.
+                if (remoteTerminationInFlight === attempt) remoteTerminationInFlight = null;
+              },
+            );
+            return attempt;
+          }
+          : undefined;
+
         const spawnPersistPromise =
           typeof child.pid === "number" && child.pid > 0 && opts.onSpawn
-            ? opts.onSpawn({ pid: child.pid, processGroupId, startedAt }).catch((err) => {
-              onLogError(err, runId, "failed to record child process metadata");
-            })
+            ? opts.onSpawn({ pid: child.pid, processGroupId, startedAt })
+              .catch((err) => {
+                onLogError(err, runId, "failed to record child process metadata");
+                throw err;
+              })
             : Promise.resolve();
+        // Child close/error can race metadata persistence. Settlement below
+        // awaits this promise; attach a handler now so a late persistence
+        // failure cannot become an interim unhandled rejection.
+        void spawnPersistPromise.catch(() => undefined);
 
-        runningProcesses.set(runId, { child, graceSec: opts.graceSec, processGroupId });
+        const runningProcess: RunningProcess = {
+          child,
+          graceSec: opts.graceSec,
+          processGroupId,
+          terminateRemote,
+        };
+        runningProcesses.set(runId, runningProcess);
+        if (terminateRemote) {
+          remoteProcessTerminationControls.set(runId, terminateRemote);
+        }
+        pendingProcessStarts.delete(runId);
 
         let timedOut = false;
         let stdout = "";
@@ -3095,20 +3508,123 @@ export async function runChildProcess(
         let terminalCleanupSignal: NodeJS.Signals | null = null;
         let terminalCleanupForceKilled = false;
         let terminalCleanupTimer: NodeJS.Timeout | null = null;
-        let terminalCleanupKillTimer: NodeJS.Timeout | null = null;
+        let localTerminationPromise: Promise<LocalProcessTerminationEvidence> | null = null;
+        let transportStopPromise: Promise<RunningProcessTransportStopEvidence> | null = null;
         let terminalResultStdoutScanOffset = 0;
         let terminalResultStderrScanOffset = 0;
+        let childClosed = false;
+        let settlementStarted = false;
+        let timeout: NodeJS.Timeout | null = null;
 
         const clearTerminalCleanupTimers = () => {
           if (terminalCleanupTimer) clearTimeout(terminalCleanupTimer);
-          if (terminalCleanupKillTimer) clearTimeout(terminalCleanupKillTimer);
           terminalCleanupTimer = null;
-          terminalCleanupKillTimer = null;
         };
+
+        const terminateLocal = (options: RunningProcessTransportStopOptions = {}) => {
+          if (localTerminationPromise) return localTerminationPromise;
+          localTerminationPromise = terminateAndConfirmLocalProcess(runId, runningProcess, {
+            ...options,
+            forceAfterMs: Math.max(1, options.localForceAfterMs ?? opts.graceSec * 1000),
+          });
+          // Every caller receives this exact promise. Attach an immediate
+          // handler so confirmation failure cannot become an interim
+          // unhandled rejection while the child close event is still pending.
+          void localTerminationPromise.catch(() => undefined);
+          return localTerminationPromise;
+        };
+
+        const observeTransportStopFailure = (
+          stopPromise: Promise<RunningProcessTransportStopEvidence>,
+        ) => {
+          void stopPromise.catch((error) => {
+            if (settlementStarted) return;
+            settlementStarted = true;
+            if (timeout) clearTimeout(timeout);
+            clearTerminalCleanupTimers();
+            // Keep the running-process record and spawn target intact. The
+            // heartbeat layer needs these identifiers/control handles to
+            // retain its fence and retry termination.
+            reject(error);
+          });
+        };
+
+        const beginTransportStop = (options: RunningProcessTransportStopOptions = {}) => {
+          if (transportStopPromise) return transportStopPromise;
+
+          if (terminateRemote) {
+            const remoteAttempt = latestRemoteTerminationAttempt
+              ?? terminateRemote({ confirmationTimeoutMs: options.confirmationTimeoutMs });
+            transportStopPromise = (async () => {
+              let remoteEvidence: SshProcessGroupTerminationEvidence | null = null;
+              let remoteError: unknown = null;
+              try {
+                remoteEvidence = await remoteAttempt;
+              } catch (error) {
+                remoteError = error;
+              }
+
+              // Remote proof is authoritative for the workload, but the local
+              // SSH client is also a detached process group. Confirm that it is
+              // absent before either resolving or surfacing remote uncertainty.
+              let localEvidence: LocalProcessTerminationEvidence | null = null;
+              let localError: unknown = null;
+              try {
+                localEvidence = await terminateLocal(options);
+              } catch (error) {
+                localError = error;
+              }
+              if (terminalCleanupStarted && (remoteEvidence?.forceKilled || localEvidence?.forceKilled)) {
+                terminalCleanupSignal = "SIGKILL";
+                terminalCleanupForceKilled = true;
+              }
+              if (remoteError) throw remoteError;
+              if (localError) throw localError;
+              return {
+                kind: "process_transport_stop" as const,
+                handled: true,
+                scope: "ssh" as const,
+                remote: remoteEvidence,
+              };
+            })();
+            observeTransportStopFailure(transportStopPromise);
+            return transportStopPromise;
+          }
+
+          transportStopPromise = terminateLocal(options).then((evidence) => {
+            if (terminalCleanupStarted && evidence.forceKilled) {
+              terminalCleanupSignal = "SIGKILL";
+              terminalCleanupForceKilled = true;
+            }
+            return {
+              kind: "process_transport_stop" as const,
+              handled: true,
+              scope: "local" as const,
+              remote: null,
+            };
+          });
+          observeTransportStopFailure(transportStopPromise);
+          return transportStopPromise;
+        };
+
+        runningProcess.stopTransport = beginTransportStop;
+        void spawnPersistPromise.catch(() => {
+          // Without durable retry identifiers, the execution may not continue
+          // running. Use the same group-confirmed stop as every other failure
+          // path; the eventual close handler will surface the metadata error.
+          clearTerminalCleanupTimers();
+          void beginTransportStop();
+        });
+
+        const transportStopRequiredForSettlement = () =>
+          // A direct child can close while a same-group descendant remains
+          // alive. Every settlement path therefore proves the complete local
+          // group absent; SSH additionally proves the remote group absent.
+          transportStopPromise ?? beginTransportStop();
 
         const maybeArmTerminalResultCleanup = () => {
           const terminalCleanup = opts.terminalResultCleanup;
-          if (!terminalCleanup || terminalCleanupStarted || timedOut) return;
+          if (!terminalCleanup || terminalCleanupStarted || timedOut || childClosed) return;
           if (!terminalResultSeen) {
             const stdoutStart = Math.max(0, terminalResultStdoutScanOffset - TERMINAL_RESULT_SCAN_OVERLAP_CHARS);
             const stderrStart = Math.max(0, terminalResultStderrScanOffset - TERMINAL_RESULT_SCAN_OVERLAP_CHARS);
@@ -3134,27 +3650,17 @@ export async function runChildProcess(
             if (terminalCleanupStarted || timedOut) return;
             terminalCleanupStarted = true;
             terminalCleanupSignal = "SIGTERM";
-            signalRunningProcess({ child, processGroupId }, "SIGTERM");
-            terminalCleanupKillTimer = setTimeout(() => {
-              terminalCleanupKillTimer = null;
-              terminalCleanupSignal = "SIGKILL";
-              terminalCleanupForceKilled = true;
-              signalRunningProcess({ child, processGroupId }, "SIGKILL");
-            }, Math.max(1, opts.graceSec) * 1000);
+            void beginTransportStop();
           }, graceMs);
         };
 
-        const timeout =
-          opts.timeoutSec > 0
-            ? setTimeout(() => {
-                timedOut = true;
-                clearTerminalCleanupTimers();
-                signalRunningProcess({ child, processGroupId }, "SIGTERM");
-                setTimeout(() => {
-                  signalRunningProcess({ child, processGroupId }, "SIGKILL");
-                }, Math.max(1, opts.graceSec) * 1000);
-              }, opts.timeoutSec * 1000)
-            : null;
+        timeout = opts.timeoutSec > 0
+          ? setTimeout(() => {
+              timedOut = true;
+              clearTerminalCleanupTimers();
+              void beginTransportStop();
+            }, opts.timeoutSec * 1000)
+          : null;
 
         child.stdout?.on("data", (chunk: unknown) => {
           const readable = child.stdout;
@@ -3190,25 +3696,51 @@ export async function runChildProcess(
 
         const stdin = child.stdin;
         if (opts.stdin != null && stdin) {
-          void spawnPersistPromise.finally(() => {
+          void spawnPersistPromise.then(() => {
             if (child.killed || stdin.destroyed) return;
             stdin.write(opts.stdin as string);
             stdin.end();
-          });
+          }).catch(() => undefined);
         }
 
         child.on("error", (err: Error) => {
           if (timeout) clearTimeout(timeout);
           clearTerminalCleanupTimers();
-          runningProcesses.delete(runId);
-          void target.cleanup?.();
+          childClosed = true;
           const errno = (err as NodeJS.ErrnoException).code;
           const pathValue = mergedEnv.PATH ?? mergedEnv.Path ?? "";
           const msg =
             errno === "ENOENT"
               ? `Failed to start command "${command}" in "${opts.cwd}". Verify adapter command, working directory, and PATH (${pathValue}).`
               : `Failed to start command "${command}" in "${opts.cwd}": ${err.message}`;
-          reject(new Error(msg));
+          if (settlementStarted) return;
+          settlementStarted = true;
+          const pendingTransportStop = transportStopRequiredForSettlement();
+          void (async () => {
+            let settlementError: unknown = new Error(msg);
+            try {
+              await pendingTransportStop;
+            } catch (stopError) {
+              // Do not let metadata/log persistence hide process-tree
+              // uncertainty. The typed error carries the retry identifiers.
+              reject(stopError);
+              return;
+            }
+            try {
+              await spawnPersistPromise;
+            } catch (spawnPersistError) {
+              settlementError = spawnPersistError;
+            }
+            if (runningProcesses.get(runId)?.child === child) {
+              runningProcesses.delete(runId);
+            }
+            try {
+              await target.cleanup?.();
+            } catch (cleanupError) {
+              onLogError(cleanupError, runId, "failed to clean up child process spawn target");
+            }
+            reject(settlementError);
+          })();
         });
 
         child.on("exit", () => {
@@ -3218,11 +3750,37 @@ export async function runChildProcess(
         child.on("close", (code: number | null, signal: NodeJS.Signals | null) => {
           if (timeout) clearTimeout(timeout);
           clearTerminalCleanupTimers();
-          runningProcesses.delete(runId);
-          void logChain.finally(() => {
-            void Promise.resolve()
-              .then(() => target.cleanup?.())
-              .finally(() => {
+          childClosed = true;
+          if (settlementStarted) return;
+          settlementStarted = true;
+          const pendingTransportStop = transportStopRequiredForSettlement();
+          void (async () => {
+            let settlementError: unknown = null;
+            try {
+              await pendingTransportStop;
+            } catch (error) {
+              // Do not let metadata/log persistence hide process-tree
+              // uncertainty. The typed error carries the retry identifiers.
+              reject(error);
+              return;
+            }
+            try {
+              await logChain;
+              await spawnPersistPromise;
+            } catch (error) {
+              settlementError = error;
+            }
+            if (runningProcesses.get(runId)?.child === child) {
+              runningProcesses.delete(runId);
+            }
+            try {
+              await target.cleanup?.();
+            } catch (cleanupError) {
+              onLogError(cleanupError, runId, "failed to clean up child process spawn target");
+            }
+            if (settlementError) {
+              reject(settlementError);
+            } else {
               resolve({
                 exitCode: code,
                 signal,
@@ -3243,10 +3801,13 @@ export async function runChildProcess(
                   }
                   : null,
               });
-              });
-          });
+            }
+          })();
         });
       })
-      .catch(reject);
+      .catch((error) => {
+        pendingProcessStarts.delete(runId);
+        reject(error);
+      });
   });
 }

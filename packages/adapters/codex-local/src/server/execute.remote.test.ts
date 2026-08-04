@@ -2,6 +2,10 @@ import { mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from "node:
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type {
+  RunProcessResult,
+  RunningProcessTransportStopEvidence,
+} from "@paperclipai/adapter-utils/server-utils";
 
 const {
   runChildProcess,
@@ -9,10 +13,11 @@ const {
   resolveCommandForLogs,
   prepareWorkspaceForSshExecution,
   restoreWorkspaceFromSshExecution,
+  stopRunningProcessTransport,
   syncDirectoryToSsh,
   startAdapterExecutionTargetPaperclipBridge,
 } = vi.hoisted(() => ({
-  runChildProcess: vi.fn(async () => ({
+  runChildProcess: vi.fn(async (..._args: unknown[]): Promise<RunProcessResult> => ({
     exitCode: 1,
     signal: null,
     timedOut: false,
@@ -25,6 +30,12 @@ const {
   resolveCommandForLogs: vi.fn(async () => "/usr/bin/codex"),
   prepareWorkspaceForSshExecution: vi.fn(async () => ({ gitBacked: false })),
   restoreWorkspaceFromSshExecution: vi.fn(async () => undefined),
+  stopRunningProcessTransport: vi.fn(async (..._args: unknown[]): Promise<RunningProcessTransportStopEvidence> => ({
+    kind: "process_transport_stop" as const,
+    handled: true,
+    scope: "ssh" as const,
+    remote: null,
+  })),
   syncDirectoryToSsh: vi.fn(async () => undefined),
   startAdapterExecutionTargetPaperclipBridge: vi.fn(async () => ({
     env: {
@@ -45,6 +56,7 @@ vi.mock("@paperclipai/adapter-utils/server-utils", async () => {
     ensureCommandResolvable,
     resolveCommandForLogs,
     runChildProcess,
+    stopRunningProcessTransport,
   };
 });
 
@@ -70,18 +82,122 @@ vi.mock("@paperclipai/adapter-utils/execution-target", async () => {
   };
 });
 
+import { UnconfirmedSshProcessTerminationError } from "@paperclipai/adapter-utils/server-utils";
 import { execute } from "./execute.js";
+import { CODEX_OUTPUT_INACTIVITY_MONITOR_SIGTERM_GRACE_MS } from "./output-inactivity-monitor.js";
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
 
 describe("codex remote execution", () => {
   const cleanupDirs: string[] = [];
 
   afterEach(async () => {
+    vi.useRealTimers();
     vi.clearAllMocks();
     while (cleanupDirs.length > 0) {
       const dir = cleanupDirs.pop();
       if (!dir) continue;
       await rm(dir, { recursive: true, force: true }).catch(() => undefined);
     }
+  });
+
+  async function startMonitoredRemoteExecution(runId: string) {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-codex-monitor-"));
+    cleanupDirs.push(rootDir);
+    const workspaceDir = path.join(rootDir, "workspace");
+    const codexHomeDir = path.join(rootDir, "codex-home");
+    await mkdir(workspaceDir, { recursive: true });
+    await mkdir(codexHomeDir, { recursive: true });
+    await writeFile(path.join(codexHomeDir, "auth.json"), "{}", "utf8");
+    const onLog = vi.fn(async (_stream: "stdout" | "stderr", _chunk: string) => undefined);
+
+    return {
+      onLog,
+      execution: execute({
+        runId,
+        agent: {
+          id: "agent-1",
+          companyId: "company-1",
+          name: "CodexCoder",
+          adapterType: "codex_local",
+          adapterConfig: {},
+        },
+        runtime: {
+          sessionId: null,
+          sessionParams: null,
+          sessionDisplayId: null,
+          taskKey: null,
+        },
+        config: {
+          command: "codex",
+          engine: "cli",
+          env: { CODEX_HOME: codexHomeDir },
+          outputInactivityTimeoutMs: 10,
+        },
+        context: {
+          paperclipWorkspace: {
+            cwd: workspaceDir,
+            source: "project_primary",
+          },
+        },
+        executionTransport: {
+          remoteExecution: {
+            host: "127.0.0.1",
+            port: 2222,
+            username: "fixture",
+            remoteWorkspacePath: "/remote/workspace",
+            remoteCwd: "/remote/workspace",
+            privateKey: "PRIVATE KEY",
+            knownHosts: "[127.0.0.1]:2222 ssh-ed25519 AAAA",
+            strictHostKeyChecking: true,
+          },
+        },
+        onLog,
+      }),
+    };
+  }
+
+  function installDeferredProcess() {
+    const spawned = deferred<void>();
+    const result = deferred<RunProcessResult>();
+    runChildProcess.mockImplementationOnce(async (...args: unknown[]) => {
+      const options = args[3] as {
+        onSpawn?: (meta: {
+          pid: number;
+          processGroupId: number | null;
+          startedAt: string;
+        }) => Promise<void>;
+      };
+      await options.onSpawn?.({
+        // Intentionally not a host PID. Sandbox/provider onSpawn metadata must
+        // never be passed directly to process.kill by the Codex adapter.
+        pid: 987_654,
+        processGroupId: null,
+        startedAt: new Date().toISOString(),
+      });
+      spawned.resolve(undefined);
+      return await result.promise;
+    });
+    return { spawned: spawned.promise, result };
+  }
+
+  const stoppedProcessResult = (overrides: Partial<RunProcessResult> = {}): RunProcessResult => ({
+    exitCode: null,
+    signal: "SIGTERM",
+    timedOut: false,
+    stdout: "",
+    stderr: "",
+    pid: 987_654,
+    startedAt: new Date().toISOString(),
+    ...overrides,
   });
 
   it("prepares the workspace, syncs CODEX_HOME, and restores workspace changes for remote SSH execution", async () => {
@@ -544,5 +660,144 @@ describe("codex remote execution", () => {
     ]);
     expect(call?.[3].env.CODEX_HOME).toBe(`${managedRemoteWorkspace}/.paperclip-runtime/codex/home`);
     expect(call?.[3].remoteExecution?.remoteCwd).toBe(managedRemoteWorkspace);
+  });
+
+  it("awaits the transport stop confirmation before returning an inactivity result", async () => {
+    vi.useFakeTimers();
+    const runId = "run-monitor-confirmation";
+    const child = installDeferredProcess();
+    const stop = deferred<RunningProcessTransportStopEvidence>();
+    const confirmedStop = {
+      kind: "process_transport_stop",
+      handled: true,
+      scope: "ssh",
+      remote: {
+        kind: "process_group_termination",
+        scope: "ssh",
+        target: "group",
+        suspendSent: true,
+        termSent: true,
+        forceKilled: true,
+        confirmedExited: true,
+        outcome: "force_killed",
+      },
+    } satisfies RunningProcessTransportStopEvidence;
+    stopRunningProcessTransport.mockReturnValueOnce(stop.promise);
+    const { execution } = await startMonitoredRemoteExecution(runId);
+    let settled = false;
+    void execution.then(
+      () => { settled = true; },
+      () => { settled = true; },
+    );
+
+    try {
+      await child.spawned;
+      await vi.advanceTimersByTimeAsync(10);
+      expect(stopRunningProcessTransport).toHaveBeenCalledWith(runId, {
+        localForceAfterMs: CODEX_OUTPUT_INACTIVITY_MONITOR_SIGTERM_GRACE_MS,
+      });
+
+      child.result.resolve(stoppedProcessResult());
+      await vi.advanceTimersByTimeAsync(0);
+      expect(settled).toBe(false);
+
+      stop.resolve(confirmedStop);
+      await expect(execution).resolves.toMatchObject({
+        errorCode: "codex_output_inactivity_monitor",
+        signal: "SIGKILL",
+        resultJson: {
+          outputInactivityMonitor: {
+            kind: "output_inactivity",
+            terminationSignal: "SIGKILL",
+          },
+        },
+      });
+      expect(stopRunningProcessTransport).toHaveBeenCalledTimes(1);
+    } finally {
+      child.result.resolve(stoppedProcessResult());
+      stop.resolve(confirmedStop);
+      await execution.catch(() => undefined);
+    }
+  });
+
+  it("bubbles an unconfirmed SSH termination error from the inactivity stop", async () => {
+    vi.useFakeTimers();
+    const runId = "run-monitor-unconfirmed";
+    const child = installDeferredProcess();
+    const stop = deferred<RunningProcessTransportStopEvidence>();
+    const terminationError = new UnconfirmedSshProcessTerminationError({
+      runId,
+      evidence: {
+        kind: "process_group_termination",
+        scope: "ssh",
+        target: "group",
+        suspendSent: false,
+        termSent: false,
+        forceKilled: false,
+        confirmedExited: false,
+        outcome: "not_started",
+      },
+    });
+    stopRunningProcessTransport.mockReturnValueOnce(stop.promise);
+    const { execution } = await startMonitoredRemoteExecution(runId);
+
+    try {
+      await child.spawned;
+      await vi.advanceTimersByTimeAsync(10);
+      stop.reject(terminationError);
+      await vi.advanceTimersByTimeAsync(0);
+
+      // A failed confirmation does not settle execute until the transport's
+      // process result also drains, but it remains the authoritative error.
+      child.result.resolve(stoppedProcessResult());
+      await expect(execution).rejects.toBe(terminationError);
+      expect(stopRunningProcessTransport).toHaveBeenCalledTimes(1);
+    } finally {
+      child.result.resolve(stoppedProcessResult());
+      stop.reject(terminationError);
+      await execution.catch(() => undefined);
+    }
+  });
+
+  it("never signals a provider-style PID when no transport stop control is registered", async () => {
+    vi.useFakeTimers();
+    const runId = "run-monitor-provider-fallback";
+    const child = installDeferredProcess();
+    const killSpy = vi.spyOn(process, "kill");
+    stopRunningProcessTransport.mockResolvedValueOnce({
+      kind: "process_transport_stop",
+      handled: false,
+      scope: null,
+      remote: null,
+    });
+    const { execution, onLog } = await startMonitoredRemoteExecution(runId);
+    let settled = false;
+    void execution.then(
+      () => { settled = true; },
+      () => { settled = true; },
+    );
+
+    try {
+      await child.spawned;
+      await vi.advanceTimersByTimeAsync(10);
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(stopRunningProcessTransport).toHaveBeenCalledTimes(1);
+      expect(killSpy).not.toHaveBeenCalled();
+      expect(settled).toBe(false);
+      expect(onLog.mock.calls.some(([, chunk]) =>
+        String(chunk).includes("waiting for provider timeout"))).toBe(true);
+
+      child.result.resolve(stoppedProcessResult({ signal: null, timedOut: true }));
+      await expect(execution).resolves.toMatchObject({
+        errorCode: "codex_output_inactivity_monitor",
+        signal: null,
+      });
+      expect(killSpy).not.toHaveBeenCalled();
+    } finally {
+      child.result.resolve(stoppedProcessResult({ signal: null, timedOut: true }));
+      await execution.catch(() => undefined);
+      killSpy.mockRestore();
+    }
   });
 });

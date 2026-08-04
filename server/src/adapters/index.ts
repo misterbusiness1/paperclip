@@ -31,4 +31,10 @@ export type {
   AdapterAgent,
   AdapterRuntime,
 } from "@paperclipai/adapter-utils";
-export { runningProcesses } from "./utils.js";
+export {
+  clearProcessCancellation,
+  clearRemoteProcessTerminationControl,
+  getRemoteProcessTerminationControl,
+  requestProcessCancellation,
+  runningProcesses,
+} from "./utils.js";

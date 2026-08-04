@@ -35,6 +35,7 @@ const {
   }));
   const heartbeatServiceMock = {
     resolveSchedulingSuppression: resolveHeartbeatSchedulingSuppressionMock,
+    reconcilePendingRunCancellations: vi.fn(async () => ({ cancelled: 0, pending: 0 })),
     reconcileHotRestartAdoption: vi.fn(async () => ({ mode: "none" })),
     reapOrphanedRuns: vi.fn(async () => ({ reaped: 0, runIds: [] })),
     promoteDueScheduledRetries: vi.fn(async () => ({ promoted: 0, runIds: [] })),
@@ -295,6 +296,7 @@ describe("startServer feedback export wiring", () => {
     const started = await startServer();
 
     expect(started.server).toBe(fakeServer);
+    expect(heartbeatServiceMock.reconcilePendingRunCancellations).toHaveBeenCalledTimes(1);
     expect(feedbackServiceFactoryMock).toHaveBeenCalledTimes(1);
     expect(createAppMock).toHaveBeenCalledTimes(1);
     expect(createAppMock.mock.calls[0]?.[1]).toMatchObject({
@@ -324,6 +326,7 @@ describe("startServer feedback export wiring", () => {
     try {
       await startServer();
 
+      expect(heartbeatServiceMock.reconcilePendingRunCancellations).toHaveBeenCalledTimes(1);
       expect(heartbeatServiceMock.reapOrphanedRuns).not.toHaveBeenCalled();
       expect(heartbeatServiceMock.tickTimers).not.toHaveBeenCalled();
       expect(environmentCustomImagesServiceMock.cleanupExpiredSetupSessions).toHaveBeenCalledTimes(1);

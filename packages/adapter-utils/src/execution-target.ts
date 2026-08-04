@@ -39,6 +39,13 @@ import { sanitizeRemoteExecutionEnv } from "./remote-execution-env.js";
 import { preferredShellForSandbox, shellCommandArgs } from "./sandbox-shell.js";
 import type { RuntimeProgressSink, RuntimeStatusSink } from "./runtime-progress.js";
 import type { LocalProcessSandboxOptions } from "./local-process-sandbox.js";
+import {
+  buildPosixManagedNodeProcessGroupLaunch,
+  buildPosixManagedProcessGroupStop,
+  isRetryablePosixManagedProcessGroupStopFailure,
+  parsePosixManagedProcessGroupIdentity,
+  parsePosixManagedProcessGroupStopEvidence,
+} from "./posix-managed-process-group.js";
 
 export type { RuntimeProgressSink } from "./runtime-progress.js";
 
@@ -138,6 +145,8 @@ export interface AdapterExecutionTargetPaperclipBridgeHandle {
 
 export interface AdapterExecutionTargetProcessSessionBridgeHandle {
   agentCommand: string;
+  pid: number;
+  processGroupId: number;
   stop(): Promise<void>;
 }
 
@@ -1306,6 +1315,8 @@ export async function startAdapterExecutionTargetProcessSessionBridge(input: {
   const sessionDir = path.posix.join(bridgeRuntimeDir, sessionId);
   const stdinDir = path.posix.join(sessionDir, "stdin");
   const eventsDir = path.posix.join(sessionDir, "events");
+  const ownershipFile = path.posix.join(sessionDir, "process-group.json");
+  const pidFile = path.posix.join(sessionDir, "process-group.pid");
   const remoteScriptPath = path.posix.join(bridgeRuntimeDir, PROCESS_SESSION_REMOTE_SCRIPT);
   const client = createCommandManagedSandboxCallbackBridgeQueueClient({
     runner,
@@ -1326,27 +1337,107 @@ export async function startAdapterExecutionTargetProcessSessionBridge(input: {
   }), "utf8").toString("base64");
 
   await onLog("stdout", `[paperclip] Starting ACP process session bridge in sandbox (${target.providerKey ?? "provider"}).\n`);
+  const launch = buildPosixManagedNodeProcessGroupLaunch({
+    entrypoint: remoteScriptPath,
+    metadataFile: ownershipFile,
+    pidFile,
+  });
   const startResult = await runner.execute({
-    command: shellCommand,
-    args: shellCommandArgs(
-      [
-        `mkdir -p ${shellQuote(stdinDir)} ${shellQuote(eventsDir)}`,
-        `PAPERCLIP_PROCESS_SESSION_DIR=${shellQuote(sessionDir)} ` +
-          `PAPERCLIP_PROCESS_SESSION_COMMAND_B64=${shellQuote(commandPayload)} ` +
-          `nohup node ${shellQuote(remoteScriptPath)} >/dev/null 2>&1 < /dev/null &`,
-        "printf '%s\\n' \"$!\"",
-      ].join("\n"),
-    ),
+    command: launch.command,
+    args: launch.args,
     cwd: target.remoteCwd,
     env: {
       PAPERCLIP_SANDBOX_EXEC_CHANNEL: "bridge",
+      PAPERCLIP_PROCESS_SESSION_DIR: sessionDir,
+      PAPERCLIP_PROCESS_SESSION_COMMAND_B64: commandPayload,
     },
     timeoutMs,
   });
+  let managedIdentity = (() => {
+    try {
+      return parsePosixManagedProcessGroupIdentity(startResult.stdout, launch.nonce);
+    } catch {
+      return null;
+    }
+  })();
+  if (!managedIdentity) {
+    const ownershipBody = await client.readTextFile(ownershipFile).catch(() => "");
+    if (ownershipBody) {
+      try {
+        managedIdentity = parsePosixManagedProcessGroupIdentity(ownershipBody, launch.nonce);
+      } catch {
+        managedIdentity = null;
+      }
+    }
+    if (!managedIdentity) {
+      const pid = Number.parseInt(await client.readTextFile(pidFile).catch(() => ""), 10);
+      if (Number.isInteger(pid) && pid > 1) {
+        managedIdentity = {
+          kind: "posix_managed_process_group",
+          version: 1,
+          pid,
+          processGroupId: pid,
+          nonce: launch.nonce,
+          startedAt: new Date().toISOString(),
+        };
+      }
+    }
+  }
+  if (!managedIdentity) {
+    throw new Error(`Failed to start sandbox ACP process session bridge: ${startResult.stderr || startResult.stdout}`);
+  }
+  const ownedProcessGroup = managedIdentity;
+  let managedStopPromise: Promise<void> | null = null;
+  let managedStopConfirmed = false;
+  const stopManagedProcessGroup = () => {
+    if (managedStopConfirmed) return Promise.resolve();
+    if (managedStopPromise) return managedStopPromise;
+    const attempt = (async () => {
+      const stop = buildPosixManagedProcessGroupStop({
+        identity: ownedProcessGroup,
+        metadataFile: ownershipFile,
+        pidFile,
+        confirmationTimeoutMs: 5_000,
+      });
+      let stopResult: Awaited<ReturnType<typeof runner.execute>>;
+      let stopAttempt = 0;
+      do {
+        stopAttempt += 1;
+        stopResult = await runner.execute({
+          command: stop.command,
+          args: stop.args,
+          cwd: target.remoteCwd,
+          env: { PAPERCLIP_SANDBOX_EXEC_CHANNEL: "bridge" },
+          timeoutMs: Math.max(timeoutMs ?? 0, 10_000),
+        });
+      } while (stopAttempt < 2 && isRetryablePosixManagedProcessGroupStopFailure(stopResult));
+      if (stopResult.timedOut || (stopResult.exitCode ?? 1) !== 0) {
+        throw new Error(
+          `Failed to stop sandbox ACP process session bridge `
+          + `(pid ${ownedProcessGroup.pid}, pgid ${ownedProcessGroup.processGroupId}): `
+          + `${stopResult.stderr || stopResult.stdout}`,
+        );
+      }
+      parsePosixManagedProcessGroupStopEvidence(stopResult.stdout, ownedProcessGroup);
+    })();
+    managedStopPromise = attempt;
+    void attempt.then(
+      () => {
+        managedStopConfirmed = true;
+        if (managedStopPromise === attempt) managedStopPromise = null;
+      },
+      () => {
+        if (managedStopPromise === attempt) managedStopPromise = null;
+      },
+    );
+    return attempt;
+  };
   if (startResult.timedOut || (startResult.exitCode ?? 1) !== 0) {
+    await stopManagedProcessGroup();
     throw new Error(`Failed to start sandbox ACP process session bridge: ${startResult.stderr || startResult.stdout}`);
   }
 
+  try {
   let socket: net.Socket | null = null;
   let stopping = false;
   let stdinSeq = 0;
@@ -1492,6 +1583,8 @@ export async function startAdapterExecutionTargetProcessSessionBridge(input: {
 
   return {
     agentCommand,
+    pid: ownedProcessGroup.pid,
+    processGroupId: ownedProcessGroup.processGroupId,
     stop: async () => {
       stopping = true;
       if (pollTimer) clearTimeout(pollTimer);
@@ -1501,10 +1594,25 @@ export async function startAdapterExecutionTargetProcessSessionBridge(input: {
         path.posix.join(stdinDir, `${String(stdinSeq + 1).padStart(12, "0")}.json`),
         jsonLine({ type: "stdinEnd" }),
       ).catch(() => undefined);
-      await client.remove(sessionDir).catch(() => undefined);
-      await fs.rm(proxyDir, { recursive: true, force: true }).catch(() => undefined);
+      try {
+        await stopManagedProcessGroup();
+        await client.remove(sessionDir);
+      } finally {
+        await fs.rm(proxyDir, { recursive: true, force: true }).catch(() => undefined);
+      }
     },
   };
+  } catch (error) {
+    try {
+      await stopManagedProcessGroup();
+    } catch (stopError) {
+      throw new AggregateError(
+        [error, stopError],
+        "Failed to initialize and clean up the sandbox ACP process session bridge",
+      );
+    }
+    throw error;
+  }
 }
 
 function getProcessSessionProxySource(input: { port: number; token: string }): string {
@@ -1596,7 +1704,10 @@ child.stderr.on("data", (chunk) => void writeEvent({ type: "data", stream: "stde
 child.on("error", (error) => void writeEvent({ type: "error", message: error.message }));
 // "close" (not "exit") so stdout/stderr fully drain before the exit event;
 // the write chain then guarantees the exit file lands after every data file.
-child.on("close", (code, signal) => void writeEvent({ type: "exit", code, signal }));
+child.on("close", (code, signal) => {
+  stdinClosed = true;
+  void writeEvent({ type: "exit", code, signal });
+});
 
 async function pollStdin() {
   while (!stdinClosed) {

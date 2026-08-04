@@ -101,6 +101,24 @@ describe("sandbox callback bridge", () => {
     throw new Error(`Timed out waiting for a JSON file in ${directory}.`);
   }
 
+  function isProcessGroupAlive(processGroupId: number): boolean {
+    try {
+      process.kill(-processGroupId, 0);
+      return true;
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code === "EPERM";
+    }
+  }
+
+  async function waitForProcessGroupExit(processGroupId: number, timeoutMs = 2_000): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (!isProcessGroupAlive(processGroupId)) return true;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    return !isProcessGroupAlive(processGroupId);
+  }
+
   afterEach(async () => {
     while (cleanupFns.length > 0) {
       const cleanup = cleanupFns.pop();
@@ -124,7 +142,27 @@ describe("sandbox callback bridge", () => {
     await mkdir(remoteWorkspaceDir, { recursive: true });
     await writeFile(path.join(localWorkspaceDir, "README.md"), "bridge test\n", "utf8");
 
-    const runner = createExecRunner();
+    const delegateRunner = createExecRunner();
+    let managedStopAttempts = 0;
+    const runner = {
+      execute: async (input: Parameters<typeof delegateRunner.execute>[0]): Promise<RunProcessResult> => {
+        if (input.args?.[0] === "-e" && input.args[1]?.includes("posix_managed_process_group_stop")) {
+          managedStopAttempts += 1;
+          if (managedStopAttempts === 1) {
+            return {
+              exitCode: 125,
+              signal: null,
+              timedOut: false,
+              stdout: "",
+              stderr: "transient managed stop failure",
+              pid: null,
+              startedAt: new Date().toISOString(),
+            };
+          }
+        }
+        return await delegateRunner.execute(input);
+      },
+    };
 
     const bridgeAsset = await createSandboxCallbackBridgeAsset();
     cleanupFns.push(bridgeAsset.cleanup);
@@ -256,7 +294,106 @@ describe("sandbox callback bridge", () => {
     expect(seenRequests[0]?.headers.authorization).toBeUndefined();
     expect(seenRequests[0]?.headers["x-paperclip-run-id"]).toBeUndefined();
 
+    const ownership = JSON.parse(await readFile(directories.ownershipFile, "utf8")) as {
+      pid?: number;
+      processGroupId?: number;
+      nonce?: string;
+    };
+    expect(bridge.processGroupId).toBe(bridge.pid);
+    expect(ownership).toMatchObject({
+      pid: bridge.pid,
+      processGroupId: bridge.processGroupId,
+      nonce: expect.any(String),
+    });
+    expect(isProcessGroupAlive(bridge.processGroupId)).toBe(true);
+
+    await expect(bridge.stop()).rejects.toThrow("transient managed stop failure");
+    expect(isProcessGroupAlive(bridge.processGroupId)).toBe(true);
+    await expect(bridge.stop()).resolves.toBeUndefined();
+    expect(managedStopAttempts).toBe(2);
+    expect(await waitForProcessGroupExit(bridge.processGroupId)).toBe(true);
+    await expect(readFile(directories.ownershipFile, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readFile(directories.pidFile, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+
   });
+
+  it.skipIf(process.platform === "win32")(
+    "confirms owned process-group cleanup when bridge readiness is invalid",
+    async () => {
+      const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-bridge-invalid-ready-"));
+      cleanupDirs.push(rootDir);
+      const remoteWorkspaceDir = path.join(rootDir, "remote-workspace");
+      const localAssetDir = path.join(rootDir, "local-asset");
+      const entrypoint = path.join(localAssetDir, "invalid-ready.mjs");
+      const queueDir = path.join(remoteWorkspaceDir, "queue");
+      await mkdir(remoteWorkspaceDir, { recursive: true });
+      await mkdir(localAssetDir, { recursive: true });
+      await writeFile(
+        entrypoint,
+        [
+          'import { promises as fs } from "node:fs";',
+          'import path from "node:path";',
+          'const queueDir = process.env.PAPERCLIP_BRIDGE_QUEUE_DIR;',
+          'await fs.mkdir(queueDir, { recursive: true });',
+          'await fs.writeFile(path.join(queueDir, "ready.json"), "{invalid", "utf8");',
+          'setInterval(() => {}, 1000);',
+        ].join("\n"),
+        "utf8",
+      );
+      const delegate = createExecRunner();
+      let launchedProcessGroupId: number | null = null;
+      let managedStopAttempts = 0;
+      const runner = {
+        execute: async (input: Parameters<typeof delegate.execute>[0]) => {
+          if (input.args?.[0] === "-e" && input.args[1]?.includes("posix_managed_process_group_stop")) {
+            managedStopAttempts += 1;
+            if (managedStopAttempts === 1) {
+              return {
+                exitCode: 125,
+                signal: null,
+                timedOut: false,
+                stdout: "",
+                stderr: "kill EPERM",
+                pid: null,
+                startedAt: new Date().toISOString(),
+              } satisfies RunProcessResult;
+            }
+          }
+          const result = await delegate.execute(input);
+          try {
+            const parsed = JSON.parse(result.stdout.trim()) as { kind?: string; processGroupId?: number };
+            if (parsed.kind === "posix_managed_process_group" && typeof parsed.processGroupId === "number") {
+              launchedProcessGroupId = parsed.processGroupId;
+            }
+          } catch {
+            // Most bridge setup commands do not emit JSON ownership metadata.
+          }
+          return result;
+        },
+      };
+      const directories = sandboxCallbackBridgeDirectories(queueDir);
+
+      await expect(startSandboxCallbackBridgeServer({
+        runner,
+        remoteCwd: remoteWorkspaceDir,
+        assetRemoteDir: path.join(remoteWorkspaceDir, "assets"),
+        queueDir,
+        bridgeToken: createSandboxCallbackBridgeToken(),
+        bridgeAsset: {
+          localDir: localAssetDir,
+          entrypoint,
+          cleanup: async () => {},
+        },
+        timeoutMs: 5_000,
+      })).rejects.toThrow("invalid readiness JSON");
+
+      expect(launchedProcessGroupId).not.toBeNull();
+      expect(managedStopAttempts).toBe(2);
+      expect(await waitForProcessGroupExit(launchedProcessGroupId!)).toBe(true);
+      await expect(readFile(directories.ownershipFile, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(readFile(directories.pidFile, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    },
+  );
 
   it("denies non-allowlisted requests by default", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-bridge-default-policy-"));

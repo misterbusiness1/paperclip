@@ -220,8 +220,8 @@ export function isPidAlive(pid: number) {
   try {
     process.kill(pid, 0);
     return true;
-  } catch {
-    return false;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException | undefined)?.code === "EPERM";
   }
 }
 
@@ -231,9 +231,20 @@ export function isProcessGroupAlive(processGroupId: number | null | undefined) {
   try {
     process.kill(-processGroupId, 0);
     return true;
-  } catch {
-    return false;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException | undefined)?.code === "EPERM";
   }
+}
+
+export interface LocalServiceTerminationEvidence {
+  kind: "process_group_termination";
+  scope: "local";
+  target: "group" | "pid";
+  suspendSent: boolean;
+  termSent: boolean;
+  forceKilled: boolean;
+  confirmedExited: boolean;
+  outcome: "already_exited" | "terminated" | "force_killed" | "unconfirmed";
 }
 
 async function isLikelyMatchingCommand(record: LocalServiceRegistryRecord) {
@@ -364,44 +375,88 @@ export async function touchLocalServiceRegistryRecord(
 
 export async function terminateLocalService(
   record: Pick<LocalServiceRegistryRecord, "pid" | "processGroupId">,
-  opts?: { signal?: NodeJS.Signals; forceAfterMs?: number },
-) {
+  opts?: {
+    signal?: NodeJS.Signals;
+    forceAfterMs?: number;
+    suspendBeforeTerminate?: boolean;
+    confirmationTimeoutMs?: number;
+  },
+): Promise<LocalServiceTerminationEvidence> {
   const signal = opts?.signal ?? "SIGTERM";
   const targetProcessGroup = process.platform !== "win32" && record.processGroupId && record.processGroupId > 0;
-  try {
-    if (targetProcessGroup) {
-      process.kill(-record.processGroupId!, signal);
-    } else {
-      process.kill(record.pid, signal);
-    }
-  } catch {
-    return;
-  }
-
-  const deadline = Date.now() + (opts?.forceAfterMs ?? 2_000);
-  while (Date.now() < deadline) {
-    const targetAlive = targetProcessGroup
-      ? isProcessGroupAlive(record.processGroupId)
-      : isPidAlive(record.pid);
-    if (!targetAlive) {
-      return;
-    }
-    await delay(100);
-  }
-
-  const stillAlive = targetProcessGroup
+  const target = targetProcessGroup ? -record.processGroupId! : record.pid;
+  const targetIsAlive = () => targetProcessGroup
     ? isProcessGroupAlive(record.processGroupId)
     : isPidAlive(record.pid);
-  if (!stillAlive) return;
-  try {
-    if (targetProcessGroup) {
-      process.kill(-record.processGroupId!, "SIGKILL");
-    } else {
-      process.kill(record.pid, "SIGKILL");
+  const evidence: LocalServiceTerminationEvidence = {
+    kind: "process_group_termination",
+    scope: "local",
+    target: targetProcessGroup ? "group" : "pid",
+    suspendSent: false,
+    termSent: false,
+    forceKilled: false,
+    confirmedExited: false,
+    outcome: "unconfirmed",
+  };
+  const sendSignal = (nextSignal: NodeJS.Signals) => {
+    try {
+      process.kill(target, nextSignal);
+      return true;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException | undefined)?.code;
+      if (code === "ESRCH") return false;
+      throw new Error(`Failed to signal ${evidence.target} during process termination`);
     }
-  } catch {
-    // Ignore cleanup races.
+  };
+  const confirmExit = async (timeoutMs: number) => {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (!targetIsAlive()) return true;
+      await delay(50);
+    }
+    return !targetIsAlive();
+  };
+
+  if (!targetIsAlive()) {
+    return {
+      ...evidence,
+      confirmedExited: true,
+      outcome: "already_exited",
+    };
   }
+
+  if (opts?.suspendBeforeTerminate && process.platform !== "win32") {
+    evidence.suspendSent = sendSignal("SIGSTOP");
+  }
+
+  evidence.termSent = sendSignal(signal);
+
+  if (!opts?.suspendBeforeTerminate && await confirmExit(opts?.forceAfterMs ?? 2_000)) {
+    return {
+      ...evidence,
+      confirmedExited: true,
+      outcome: "terminated",
+    };
+  }
+
+  if (!targetIsAlive()) {
+    return {
+      ...evidence,
+      confirmedExited: true,
+      outcome: "terminated",
+    };
+  }
+
+  evidence.forceKilled = sendSignal("SIGKILL");
+  if (await confirmExit(opts?.confirmationTimeoutMs ?? 5_000)) {
+    return {
+      ...evidence,
+      confirmedExited: true,
+      outcome: "force_killed",
+    };
+  }
+
+  return evidence;
 }
 
 export async function readLocalServicePortOwner(port: number) {

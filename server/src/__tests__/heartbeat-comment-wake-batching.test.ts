@@ -620,7 +620,12 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
 
       await heartbeat.cancelRun(firstRun!.id);
 
-      await waitFor(() => gateway.getAgentPayloads().length === 2);
+      // Cancellation is fenced immediately, but deferred work must not be
+      // promoted until the active adapter execution has actually drained.
+      expect(gateway.getAgentPayloads()).toHaveLength(1);
+      gateway.releaseFirstWait();
+
+      await waitFor(() => gateway.getAgentPayloads().length === 2, 90_000);
       const promotedPayload = gateway.getAgentPayloads()[1] ?? {};
       expect(promotedPayload.paperclip).toBeUndefined();
       const promotedWake = parseWakePayloadFromMessage(promotedPayload.message);
@@ -633,7 +638,6 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
       });
       expect(String(promotedPayload.message ?? "")).toContain("Queued follow-up");
 
-      gateway.releaseFirstWait();
       await waitFor(async () => {
         const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
         return runs.length === 2 && runs.every((run) => ["cancelled", "succeeded"].includes(run.status));

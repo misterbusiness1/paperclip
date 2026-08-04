@@ -36,6 +36,17 @@ export interface SshCommandResult {
   stderr: string;
 }
 
+export interface SshProcessGroupTerminationEvidence {
+  kind: "process_group_termination";
+  scope: "ssh";
+  target: "group";
+  suspendSent: boolean;
+  termSent: boolean;
+  forceKilled: boolean;
+  confirmedExited: boolean;
+  outcome: "already_exited" | "force_killed" | "not_started";
+}
+
 export interface SshRemoteExecutionSpec extends SshConnectionConfig {
   remoteCwd: string;
 }
@@ -1156,6 +1167,7 @@ export async function runSshCommand(
     stdin?: string;
     timeoutMs?: number;
     maxBuffer?: number;
+    sourceProfiles?: boolean;
   } = {},
 ): Promise<SshCommandResult> {
   let cleanup: () => Promise<void> = () => Promise.resolve();
@@ -1177,9 +1189,13 @@ export async function runSshCommand(
     // / NVM_DIR / etc. would silently undo the explicit env passed in here.
     const envArgs = envEntries.map(([key, value]) => `${key}=${shellQuote(value)}`);
     const remoteScript = [
-      'if [ -f "$HOME/.profile" ]; then . "$HOME/.profile" >/dev/null 2>&1 || true; fi',
-      'if [ -f "$HOME/.bash_profile" ]; then . "$HOME/.bash_profile" >/dev/null 2>&1 || true; fi',
-      'if [ -f "$HOME/.zprofile" ]; then . "$HOME/.zprofile" >/dev/null 2>&1 || true; fi',
+      ...(options.sourceProfiles === false
+        ? []
+        : [
+          'if [ -f "$HOME/.profile" ]; then . "$HOME/.profile" >/dev/null 2>&1 || true; fi',
+          'if [ -f "$HOME/.bash_profile" ]; then . "$HOME/.bash_profile" >/dev/null 2>&1 || true; fi',
+          'if [ -f "$HOME/.zprofile" ]; then . "$HOME/.zprofile" >/dev/null 2>&1 || true; fi',
+        ]),
       envArgs.length > 0
         ? `exec env ${envArgs.join(" ")} sh -c ${shellQuote(remoteCommand)}`
         : `exec sh -c ${shellQuote(remoteCommand)}`,
@@ -1209,6 +1225,7 @@ export async function runSshCommand(
 
 export async function buildSshSpawnTarget(input: {
   spec: SshRemoteExecutionSpec;
+  runId: string;
   command: string;
   args: string[];
   env: Record<string, string>;
@@ -1216,7 +1233,11 @@ export async function buildSshSpawnTarget(input: {
   command: string;
   args: string[];
   cleanup: () => Promise<void>;
+  terminateRemote: (options?: { confirmationTimeoutMs?: number }) => Promise<SshProcessGroupTerminationEvidence>;
 }> {
+  if (!/^[A-Za-z0-9_-]+$/.test(input.runId)) {
+    throw new Error("Invalid run id for SSH process supervision");
+  }
   for (const key of Object.keys(input.env)) {
     if (!isValidShellEnvKey(key)) {
       throw new Error(`Invalid SSH environment variable key: ${key}`);
@@ -1228,17 +1249,88 @@ export async function buildSshSpawnTarget(input: {
     .filter((entry): entry is [string, string] => typeof entry[1] === "string")
     .map(([key, value]) => `${key}=${shellQuote(value)}`);
   const remoteCommandParts = [shellQuote(input.command), ...input.args.map((arg) => shellQuote(arg))].join(" ");
-  const remoteScript = [
+  // This is cooperative lifecycle supervision under the configured SSH user,
+  // not an adversarial isolation boundary. Workloads that must not be able to
+  // tamper with supervisor state require a separate-identity service/cgroup or
+  // a sandbox provider whose control plane is outside the workload principal.
+  const controlDirectory = path.posix.join(input.spec.remoteCwd, ".paperclip-runtime", "process-groups");
+  const controlFile = path.posix.join(controlDirectory, `${input.runId}.state`);
+  const cancellationFile = path.posix.join(controlDirectory, `${input.runId}.cancel`);
+  const readinessFile = path.posix.join(controlDirectory, `${input.runId}.ready`);
+  const startGateFile = path.posix.join(controlDirectory, `${input.runId}.go`);
+  const controlNonce = randomUUID();
+  const supervisedCommand = envArgs.length > 0
+    ? `env ${envArgs.join(" ")} ${remoteCommandParts}`
+    : remoteCommandParts;
+  const profiledCommand = [
     'if [ -f "$HOME/.profile" ]; then . "$HOME/.profile" >/dev/null 2>&1 || true; fi',
     'if [ -f "$HOME/.bash_profile" ]; then . "$HOME/.bash_profile" >/dev/null 2>&1 || true; fi',
     'if [ -f "$HOME/.zprofile" ]; then . "$HOME/.zprofile" >/dev/null 2>&1 || true; fi',
     'export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"',
     '[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh" >/dev/null 2>&1 || true',
+    `exec ${supervisedCommand}`,
+  ].join("\n");
+  const gatedCommand = [
+    `ready_file=${shellQuote(readinessFile)}`,
+    `gate_file=${shellQuote(startGateFile)}`,
+    `cancel_file=${shellQuote(cancellationFile)}`,
+    `control_nonce=${shellQuote(controlNonce)}`,
+    'set -e',
+    'umask 077',
+    'ready_tmp="${ready_file}.$$"',
+    'printf "ready:%s:%s\\n" "$control_nonce" "$$" > "$ready_tmp"',
+    'chmod 600 "$ready_tmp"',
+    'mv -f "$ready_tmp" "$ready_file"',
+    'while :; do if [ "$(cat "$cancel_file" 2>/dev/null || true)" = "cancel:${control_nonce}" ]; then exit 143; fi; if [ "$(cat "$gate_file" 2>/dev/null || true)" = "go:${control_nonce}" ]; then break; fi; sleep 0.02; done',
+    `exec sh -c ${shellQuote(profiledCommand)}`,
+  ].join("\n");
+  const remoteScript = [
+    'set -e',
+    `control_dir=${shellQuote(controlDirectory)}`,
+    `control_file=${shellQuote(controlFile)}`,
+    `cancel_file=${shellQuote(cancellationFile)}`,
+    `ready_file=${shellQuote(readinessFile)}`,
+    `gate_file=${shellQuote(startGateFile)}`,
+    `control_nonce=${shellQuote(controlNonce)}`,
+    'umask 077',
+    'mkdir -p "$control_dir"',
+    'rm -f "$ready_file" "$gate_file"',
+    'write_control_state() { control_tmp="${control_file}.$$"; printf "%s\\n" "$1" > "$control_tmp"; chmod 600 "$control_tmp"; mv -f "$control_tmp" "$control_file"; }',
+    'write_cancel_state() { cancel_tmp="${cancel_file}.$$"; printf "cancel:%s\\n" "$control_nonce" > "$cancel_tmp"; chmod 600 "$cancel_tmp"; mv -f "$cancel_tmp" "$cancel_file"; }',
+    'is_cancel_requested() { [ "$(cat "$cancel_file" 2>/dev/null || true)" = "cancel:${control_nonce}" ]; }',
+    'refresh_child_pgid() { if [ -z "${child_pgid:-}" ]; then ready_state=$(cat "$ready_file" 2>/dev/null || true); case "$ready_state" in "ready:${control_nonce}:"*) candidate_pgid=${ready_state##*:}; case "$candidate_pgid" in ""|*[!0-9]*) ;; *) if [ "$candidate_pgid" -gt 1 ] 2>/dev/null; then child_pgid=$candidate_pgid; fi ;; esac ;; esac; fi; }',
+    'child_group_is_alive() { refresh_child_pgid; [ -n "${child_pgid:-}" ] && kill -0 -- "-$child_pgid" 2>/dev/null; }',
+    'stop_child_group() { refresh_child_pgid; stop_pgid="${child_pgid:-}"; if [ -n "$stop_pgid" ] && kill -0 -- "-$stop_pgid" 2>/dev/null; then kill -STOP -- "-$stop_pgid" 2>/dev/null || true; kill -TERM -- "-$stop_pgid" 2>/dev/null || true; kill -KILL -- "-$stop_pgid" 2>/dev/null || true; stop_wait=0; while kill -0 -- "-$stop_pgid" 2>/dev/null && [ "$stop_wait" -lt 100 ]; do sleep 0.05; stop_wait=$((stop_wait + 1)); done; elif [ -n "${launcher_pid:-}" ] && kill -0 "$launcher_pid" 2>/dev/null; then kill -STOP "$launcher_pid" 2>/dev/null || true; kill -TERM "$launcher_pid" 2>/dev/null || true; kill -KILL "$launcher_pid" 2>/dev/null || true; fi; }',
+    'supervisor_complete=0',
+    'on_supervisor_exit() { exit_status=$?; trap - EXIT HUP INT TERM; if [ "$supervisor_complete" -ne 1 ]; then write_cancel_state || true; stop_child_group || true; fi; exit "$exit_status"; }',
+    'on_supervisor_signal() { trap - EXIT HUP INT TERM; write_cancel_state || true; stop_child_group || true; if child_group_is_alive || { [ -n "${launcher_pid:-}" ] && [ -z "${child_pgid:-}" ]; }; then write_control_state "unconfirmed:${control_nonce}" || true; supervisor_complete=1; exit 125; fi; write_control_state "exited:${control_nonce}" || true; supervisor_complete=1; exit 143; }',
+    'trap on_supervisor_exit EXIT',
+    'trap on_supervisor_signal HUP INT TERM',
+    'write_control_state "starting:${control_nonce}"',
+    'if is_cancel_requested; then write_control_state "exited:${control_nonce}"; exit 143; fi',
     `cd ${shellQuote(input.spec.remoteCwd)}`,
-    envArgs.length > 0
-      ? `exec env ${envArgs.join(" ")} ${remoteCommandParts}`
-      : `exec ${remoteCommandParts}`,
-  ].join(" && ");
+    'if ! command -v setsid >/dev/null 2>&1; then write_control_state "unsupported:${control_nonce}"; exit 127; fi',
+    `setsid -w sh -c ${shellQuote(gatedCommand)} <&0 &`,
+    'launcher_pid=$!',
+    'ready_wait=0',
+    'while [ "$ready_wait" -lt 250 ]; do if is_cancel_requested; then stop_child_group; child_status=0; wait "$launcher_pid" || child_status=$?; refresh_child_pgid; if [ -z "${child_pgid:-}" ] || child_group_is_alive; then write_control_state "unconfirmed:${control_nonce}"; exit 125; fi; write_control_state "exited:${control_nonce}"; exit 143; fi; refresh_child_pgid; if [ -n "${child_pgid:-}" ]; then break; fi; if ! kill -0 "$launcher_pid" 2>/dev/null; then child_status=0; wait "$launcher_pid" || child_status=$?; refresh_child_pgid; if [ -z "${child_pgid:-}" ] || child_group_is_alive; then write_control_state "unconfirmed:${control_nonce}"; exit 125; fi; write_control_state "exited:${control_nonce}"; exit "$child_status"; fi; sleep 0.02; ready_wait=$((ready_wait + 1)); done',
+    'case "${child_pgid:-}" in ""|*[!0-9]*) write_control_state "unconfirmed:${control_nonce}"; write_cancel_state; stop_child_group; exit 125 ;; esac',
+    'if ! kill -0 -- "-$child_pgid" 2>/dev/null; then write_control_state "unconfirmed:${control_nonce}"; write_cancel_state; stop_child_group; exit 125; fi',
+    'write_control_state "running:${control_nonce}:${child_pgid}"',
+    'if is_cancel_requested; then stop_child_group; child_status=0; wait "$launcher_pid" || child_status=$?; if child_group_is_alive; then write_control_state "unconfirmed:${control_nonce}"; exit 125; fi; write_control_state "exited:${control_nonce}"; exit 143; fi',
+    'gate_tmp="${gate_file}.$$"',
+    'printf "go:%s\\n" "$control_nonce" > "$gate_tmp"',
+    'chmod 600 "$gate_tmp"',
+    'mv -f "$gate_tmp" "$gate_file"',
+    'child_status=0; wait "$launcher_pid" || child_status=$?',
+    'stop_child_group',
+    'if kill -0 -- "-$child_pgid" 2>/dev/null; then write_control_state "unconfirmed:${control_nonce}"; exit 125; fi',
+    'write_control_state "exited:${control_nonce}"',
+    'rm -f "$ready_file" "$gate_file"',
+    'supervisor_complete=1',
+    'trap - EXIT HUP INT TERM',
+    'exit "$child_status"',
+  ].join("\n");
 
   sshArgs.push(
     "-p",
@@ -1251,6 +1343,87 @@ export async function buildSshSpawnTarget(input: {
     command: "ssh",
     args: sshArgs,
     cleanup: auth.cleanup,
+    terminateRemote: async (options = {}) => {
+      const confirmationPolls = Math.max(
+        10,
+        Math.min(400, Math.ceil((options.confirmationTimeoutMs ?? 5_000) / 50)),
+      );
+      const terminationScript = [
+        `control_dir=${shellQuote(controlDirectory)}`,
+        `control_file=${shellQuote(controlFile)}`,
+        `cancel_file=${shellQuote(cancellationFile)}`,
+        `ready_file=${shellQuote(readinessFile)}`,
+        `control_nonce=${shellQuote(controlNonce)}`,
+        'umask 077',
+        'mkdir -p "$control_dir"',
+        'cancel_tmp="${cancel_file}.$$"',
+        'printf "cancel:%s\\n" "$control_nonce" > "$cancel_tmp"',
+        'chmod 600 "$cancel_tmp"',
+        'mv -f "$cancel_tmp" "$cancel_file"',
+        'control_state=""',
+        'remote_pgid=""',
+        'control_wait=0',
+        `while [ "$control_wait" -lt ${confirmationPolls} ]; do if [ -f "$control_file" ]; then control_state=$(cat "$control_file" 2>/dev/null || true); case "$control_state" in "exited:\${control_nonce}") printf "PAPERCLIP_REMOTE_ALREADY_EXITED\\n"; exit 0 ;; "running:\${control_nonce}:"*) candidate_pgid=\${control_state##*:}; case "$candidate_pgid" in ""|*[!0-9]*) ;; *) if [ "$candidate_pgid" -gt 1 ] 2>/dev/null; then remote_pgid=$candidate_pgid; break; fi ;; esac ;; "unsupported:\${control_nonce}") exit 125 ;; esac; fi; ready_state=$(cat "$ready_file" 2>/dev/null || true); case "$ready_state" in "ready:\${control_nonce}:"*) candidate_pgid=\${ready_state##*:}; case "$candidate_pgid" in ""|*[!0-9]*) ;; *) if [ "$candidate_pgid" -gt 1 ] 2>/dev/null; then remote_pgid=$candidate_pgid; break; fi ;; esac ;; esac; sleep 0.05; control_wait=$((control_wait + 1)); done`,
+        'case "$remote_pgid" in ""|*[!0-9]*) printf "PAPERCLIP_REMOTE_NOT_STARTED\\n"; exit 0 ;; esac',
+        'if ! kill -0 -- "-$remote_pgid" 2>/dev/null; then printf "exited:%s\\n" "$control_nonce" > "$control_file"; printf "PAPERCLIP_REMOTE_ALREADY_EXITED\\n"; exit 0; fi',
+        'kill -STOP -- "-$remote_pgid" 2>/dev/null || exit 125',
+        'kill -TERM -- "-$remote_pgid" 2>/dev/null || true',
+        'kill -KILL -- "-$remote_pgid" 2>/dev/null || true',
+        'confirm_wait=0',
+        `while kill -0 -- "-$remote_pgid" 2>/dev/null && [ "$confirm_wait" -lt ${confirmationPolls} ]; do sleep 0.05; confirm_wait=$((confirm_wait + 1)); done`,
+        'if kill -0 -- "-$remote_pgid" 2>/dev/null; then exit 125; fi',
+        'printf "exited:%s\\n" "$control_nonce" > "$control_file"',
+        'printf "PAPERCLIP_REMOTE_FORCE_KILLED\\n"',
+      ].join("; ");
+
+      try {
+        const result = await runSshCommand(input.spec, terminationScript, {
+          timeoutMs: Math.max(10_000, (options.confirmationTimeoutMs ?? 5_000) + 5_000),
+          maxBuffer: 16 * 1024,
+          sourceProfiles: false,
+        });
+        const outcome = result.stdout.trim().split(/\r?\n/).at(-1);
+        if (outcome === "PAPERCLIP_REMOTE_ALREADY_EXITED") {
+          return {
+            kind: "process_group_termination",
+            scope: "ssh",
+            target: "group",
+            suspendSent: false,
+            termSent: false,
+            forceKilled: false,
+            confirmedExited: true,
+            outcome: "already_exited",
+          };
+        }
+        if (outcome === "PAPERCLIP_REMOTE_FORCE_KILLED") {
+          return {
+            kind: "process_group_termination",
+            scope: "ssh",
+            target: "group",
+            suspendSent: true,
+            termSent: true,
+            forceKilled: true,
+            confirmedExited: true,
+            outcome: "force_killed",
+          };
+        }
+        if (outcome === "PAPERCLIP_REMOTE_NOT_STARTED") {
+          return {
+            kind: "process_group_termination",
+            scope: "ssh",
+            target: "group",
+            suspendSent: false,
+            termSent: false,
+            forceKilled: false,
+            confirmedExited: false,
+            outcome: "not_started",
+          };
+        }
+        throw new Error("unexpected termination acknowledgement");
+      } catch {
+        throw new Error("SSH remote process-group termination could not be confirmed");
+      }
+    },
   };
 }
 

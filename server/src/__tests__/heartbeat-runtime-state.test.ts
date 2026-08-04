@@ -27,6 +27,12 @@ vi.doMock("../adapters/index.js", () => ({
     testEnvironment: vi.fn(),
   })),
   listAdapterModelProfiles: vi.fn(() => []),
+  // This suite creates a synthetic running row without launching an adapter.
+  // Model it as a start that cancellation successfully intercepted.
+  requestProcessCancellation: vi.fn(() => ({ pendingStartCancelled: true })),
+  clearProcessCancellation: vi.fn(),
+  getRemoteProcessTerminationControl: vi.fn(() => null),
+  clearRemoteProcessTerminationControl: vi.fn(),
   runningProcesses: new Map(),
 }));
 

@@ -25,8 +25,18 @@ import {
   issueThreadInteractions,
   issues,
 } from "@paperclipai/db";
-import { parseObject, asBoolean, asNumber } from "../../adapters/utils.js";
-import { runningProcesses } from "../../adapters/index.js";
+import {
+  parseObject,
+  asBoolean,
+  asNumber,
+  isTrackedLocalChildProcessAdapter,
+} from "../../adapters/utils.js";
+import {
+  clearProcessCancellation,
+  getRemoteProcessTerminationControl,
+  requestProcessCancellation,
+  runningProcesses,
+} from "../../adapters/index.js";
 import { visibleIssueCondition } from "../issue-visibility.js";
 import { forbidden, notFound } from "../../errors.js";
 import { logger } from "../../middleware/logger.js";
@@ -51,6 +61,10 @@ import {
 } from "../issue-dependency-wakeups.js";
 import { evaluateAgentInvokabilityFromDb } from "../agent-invokability.js";
 import { getRunLogStore } from "../run-log-store.js";
+import {
+  sealRunMutationActivity,
+  waitForRunMutationActivityToDrain,
+} from "../run-mutation-activity.js";
 import {
   DEFAULT_MAX_SUCCESSFUL_RUN_HANDOFF_ATTEMPTS,
   FINISH_SUCCESSFUL_RUN_HANDOFF_REASON,
@@ -87,16 +101,6 @@ const STALE_ACTIVE_RUN_EVALUATION_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.staleActiv
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
 const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON = "execution_review_participant_recovery";
 const RESOLVED_DEPENDENCY_WAKE_BACKSTOP_CANDIDATE_LIMIT = 500;
-const SESSIONED_LOCAL_ADAPTERS = new Set([
-  "claude_local",
-  "codex_local",
-  "cursor",
-  "gemini_local",
-  "hermes_local",
-  "opencode_local",
-  "pi_local",
-]);
-
 // GGU-809: when a stranded `in_progress` issue would otherwise hit the
 // `isRepeatedProductiveContinuationRecovery` escalation path, exempt the
 // escalation if the assignee posted a comment or attachment within this window.
@@ -124,6 +128,27 @@ type RecoveryWakeup = (
   agentId: string,
   opts?: RecoveryWakeupOptions,
 ) => Promise<typeof heartbeatRuns.$inferSelect | null>;
+
+type RecoveryServiceDeps = {
+  enqueueWakeup: RecoveryWakeup;
+  /**
+   * Confirms that the same-process executeRun continuation has fully settled.
+   * Source-resolved recovery deliberately fails closed when this proof is not
+   * available: a stopped child can still have buffered run writes in flight.
+   */
+  waitForRunExecutionDrain?: (runId: string) => Promise<boolean>;
+  /**
+   * Releases run-scoped capabilities and leases after the terminal CAS. The
+   * heartbeat owner supplies an idempotent implementation backed by the same
+   * runtime/orchestrator instances that acquired those resources.
+   */
+  releaseTerminalRunResources?: (
+    run: Pick<
+      typeof heartbeatRuns.$inferSelect,
+      "id" | "companyId" | "agentId" | "status" | "error"
+    >,
+  ) => Promise<void>;
+};
 
 type ResolvedDependencyWakeBackstopSource =
   | "issue_graph_liveness.backstop"
@@ -679,7 +704,7 @@ function buildLivenessOriginalIssueComment(finding: IssueLivenessFinding, escala
   ].join("\n");
 }
 
-export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup }) {
+export function recoveryService(db: Db, deps: RecoveryServiceDeps) {
   const issuesSvc = issueService(db);
   const recoveryActionsSvc = issueRecoveryActionService(db);
   const treeControlSvc = issueTreeControlService(db);
@@ -1467,70 +1492,207 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     run: typeof heartbeatRuns.$inferSelect;
     runningAgent: typeof agents.$inferSelect;
   }) {
-    if (!SESSIONED_LOCAL_ADAPTERS.has(input.runningAgent.adapterType)) {
+    const environment = parseObject(parseObject(input.run.contextSnapshot).paperclipEnvironment);
+    const persistedDriver = typeof environment.driver === "string" ? environment.driver : "unknown";
+    const running = runningProcesses.get(input.run.id);
+    // A live remote controller is stronger transport evidence than a missing or
+    // stale persisted environment snapshot. In particular, treating its local
+    // SSH client as a normal local adapter could leave the remote process group
+    // alive while incorrectly terminalizing the run.
+    const remoteControl = running?.terminateRemote ?? getRemoteProcessTerminationControl(input.run.id);
+    const driver = remoteControl ? "ssh" : persistedDriver;
+    const pidCandidate = running?.child.pid ?? input.run.processPid ?? null;
+    const groupCandidate = running?.processGroupId ?? input.run.processGroupId ?? null;
+    const pid = typeof pidCandidate === "number" && Number.isInteger(pidCandidate) && pidCandidate > 1
+      ? pidCandidate
+      : null;
+    const processGroupId = typeof groupCandidate === "number" && Number.isInteger(groupCandidate) && groupCandidate > 1
+      ? groupCandidate
+      : null;
+    const sanitizeTermination = (evidence: {
+      kind: "process_group_termination";
+      scope: "local" | "ssh";
+      target: "group" | "pid";
+      suspendSent: boolean;
+      termSent: boolean;
+      forceKilled: boolean;
+      confirmedExited: boolean;
+      outcome: string;
+    } | null) => evidence
+      ? {
+          kind: evidence.kind,
+          scope: evidence.scope,
+          target: evidence.target,
+          suspendSent: evidence.suspendSent,
+          termSent: evidence.termSent,
+          forceKilled: evidence.forceKilled,
+          confirmedExited: evidence.confirmedExited,
+          outcome: evidence.outcome,
+        }
+      : null;
+
+    if (driver === "ssh") {
+      if (!remoteControl) {
+        return {
+          attempted: false,
+          confirmedExited: false,
+          outcome: "ssh_control_unavailable",
+          adapterType: input.runningAgent.adapterType,
+          driver,
+        };
+      }
+
+      try {
+        const remote = await remoteControl();
+        if (!remote.confirmedExited) {
+          return {
+            attempted: true,
+            confirmedExited: false,
+            outcome: "ssh_termination_unconfirmed",
+            adapterType: input.runningAgent.adapterType,
+            driver,
+            processTermination: { remote: sanitizeTermination(remote), local: null },
+          };
+        }
+
+        let local: Awaited<ReturnType<typeof terminateLocalService>> | null = null;
+        const localAlive =
+          (pid !== null && isPidAlive(pid))
+          || (processGroupId !== null && isProcessGroupAlive(processGroupId));
+        if (localAlive) {
+          local = await terminateLocalService(
+            { pid: pid ?? processGroupId!, processGroupId },
+            {
+              ...(running ? { forceAfterMs: Math.max(1, running.graceSec) * 1000 } : {}),
+              suspendBeforeTerminate: true,
+            },
+          );
+          if (!local.confirmedExited) {
+            return {
+              attempted: true,
+              confirmedExited: false,
+              outcome: "local_ssh_client_termination_unconfirmed",
+              adapterType: input.runningAgent.adapterType,
+              driver,
+              processTermination: {
+                remote: sanitizeTermination(remote),
+                local: sanitizeTermination(local),
+              },
+            };
+          }
+        }
+
+        runningProcesses.delete(input.run.id);
+        return {
+          attempted: true,
+          confirmedExited: true,
+          outcome: "terminated",
+          adapterType: input.runningAgent.adapterType,
+          driver,
+          processTermination: {
+            remote: sanitizeTermination(remote),
+            local: sanitizeTermination(local),
+          },
+        };
+      } catch {
+        return {
+          attempted: true,
+          confirmedExited: false,
+          outcome: "ssh_termination_unconfirmed",
+          adapterType: input.runningAgent.adapterType,
+          driver,
+        };
+      }
+    }
+
+    if (driver !== "local") {
       return {
         attempted: false,
-        outcome: "skipped_non_local_adapter",
+        confirmedExited: false,
+        outcome: "unsupported_execution_driver",
         adapterType: input.runningAgent.adapterType,
+        driver,
       };
     }
 
-    const running = runningProcesses.get(input.run.id);
-    const pid = running?.child.pid ?? input.run.processPid ?? null;
-    const processGroupId = running?.processGroupId ?? input.run.processGroupId ?? null;
-    if (typeof pid !== "number" && typeof processGroupId !== "number") {
+    // POSIX local adapters are launched as process-group leaders. A dead root
+    // PID alone does not prove that its descendants exited, so recovery must
+    // have a valid PGID and confirm the whole group is absent before it can
+    // publish a terminal state.
+    if (
+      process.platform !== "win32"
+      && isTrackedLocalChildProcessAdapter(input.runningAgent.adapterType)
+      && processGroupId === null
+    ) {
       return {
         attempted: false,
+        confirmedExited: false,
+        outcome: "process_group_metadata_required",
+        adapterType: input.runningAgent.adapterType,
+        driver,
+      };
+    }
+
+    if (pid === null && processGroupId === null) {
+      return {
+        attempted: false,
+        confirmedExited: false,
         outcome: "no_process_metadata",
         adapterType: input.runningAgent.adapterType,
+        driver,
       };
     }
-
     const wasAlive =
-      (typeof pid === "number" && isPidAlive(pid)) ||
-      (typeof processGroupId === "number" && isProcessGroupAlive(processGroupId));
+      (pid !== null && isPidAlive(pid)) ||
+      (processGroupId !== null && isProcessGroupAlive(processGroupId));
     if (!wasAlive) {
       runningProcesses.delete(input.run.id);
       return {
         attempted: false,
-        outcome: "not_running",
+        confirmedExited: true,
+        outcome: "already_exited",
         adapterType: input.runningAgent.adapterType,
-        pid,
-        processGroupId,
+        driver,
       };
     }
 
     try {
-      await terminateLocalService(
+      const local = await terminateLocalService(
         {
-          pid: typeof pid === "number" && Number.isInteger(pid) && pid > 0
-            ? pid
-            : (processGroupId ?? 0),
-          processGroupId: typeof processGroupId === "number" && Number.isInteger(processGroupId) && processGroupId > 0
-            ? processGroupId
-            : null,
+          pid: pid ?? processGroupId!,
+          processGroupId,
         },
-        running ? { forceAfterMs: Math.max(1, running.graceSec) * 1000 } : undefined,
+        {
+          ...(running ? { forceAfterMs: Math.max(1, running.graceSec) * 1000 } : {}),
+          suspendBeforeTerminate: true,
+        },
       );
+      if (!local.confirmedExited) {
+        return {
+          attempted: true,
+          confirmedExited: false,
+          outcome: "local_termination_unconfirmed",
+          adapterType: input.runningAgent.adapterType,
+          driver,
+          processTermination: { local: sanitizeTermination(local), remote: null },
+        };
+      }
       runningProcesses.delete(input.run.id);
-      const stillAlive =
-        (typeof pid === "number" && isPidAlive(pid)) ||
-        (typeof processGroupId === "number" && isProcessGroupAlive(processGroupId));
       return {
         attempted: true,
-        outcome: stillAlive ? "termination_sent_still_running" : "terminated",
+        confirmedExited: true,
+        outcome: "terminated",
         adapterType: input.runningAgent.adapterType,
-        pid,
-        processGroupId,
+        driver,
+        processTermination: { local: sanitizeTermination(local), remote: null },
       };
-    } catch (error) {
+    } catch {
       return {
         attempted: true,
-        outcome: "failed",
+        confirmedExited: false,
+        outcome: "local_termination_unconfirmed",
         adapterType: input.runningAgent.adapterType,
-        pid,
-        processGroupId,
-        error: error instanceof Error ? error.message : String(error),
+        driver,
       };
     }
   }
@@ -1563,7 +1725,53 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     now: Date;
   }) {
     if (!input.evidence) return { kind: "skipped" as const };
-    const cleanup = await cleanupSourceResolvedRunProcess({ run: input.run, runningAgent: input.runningAgent });
+    const fencedAt = new Date();
+    const fencedRun = await db
+      .update(heartbeatRuns)
+      .set({ cancellationRequestedAt: fencedAt, updatedAt: fencedAt })
+      .where(and(
+        eq(heartbeatRuns.id, input.run.id),
+        eq(heartbeatRuns.companyId, input.run.companyId),
+        eq(heartbeatRuns.status, "running"),
+        isNull(heartbeatRuns.cancellationRequestedAt),
+        isNull(heartbeatRuns.finishedAt),
+      ))
+      .returning()
+      .then((rows) => rows[0] ?? null);
+    if (!fencedRun) return { kind: "skipped" as const };
+
+    sealRunMutationActivity(db, fencedRun.id);
+    requestProcessCancellation(fencedRun.id);
+    const cleanup = await cleanupSourceResolvedRunProcess({ run: fencedRun, runningAgent: input.runningAgent });
+    if (!cleanup.confirmedExited) {
+      await appendRecoveryRunEvent(fencedRun, {
+        level: "warn",
+        message: "Source-resolved watchdog fold remains fenced pending confirmed process exit",
+        payload: { cleanup },
+      }).catch(() => undefined);
+      return { kind: "skipped" as const };
+    }
+
+    let executionDrained = false;
+    if (deps.waitForRunExecutionDrain) {
+      try {
+        executionDrained = await deps.waitForRunExecutionDrain(fencedRun.id);
+      } catch {
+        executionDrained = false;
+      }
+    }
+    if (!executionDrained || !deps.releaseTerminalRunResources) {
+      await appendRecoveryRunEvent(fencedRun, {
+        level: "warn",
+        message: "Source-resolved watchdog fold remains fenced pending execution drain and resource cleanup ownership",
+        payload: {
+          cleanup,
+          executionDrainConfirmed: executionDrained,
+          resourceCleanupOwnerAvailable: Boolean(deps.releaseTerminalRunResources),
+        },
+      }).catch(() => undefined);
+      return { kind: "skipped" as const };
+    }
     const finalRunStatus = input.sourceIssue.status === "cancelled" ? "cancelled" : "succeeded";
     const resultJson = {
       ...parseObject(input.run.resultJson),
@@ -1579,8 +1787,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         evaluationIssueId: input.existingEvaluation?.id ?? null,
         evaluationIssueIdentifier: input.existingEvaluation?.identifier ?? null,
         cleanup,
+        executionDrained,
       },
     };
+    await waitForRunMutationActivityToDrain(db, fencedRun.id);
     const finalizedRun = await db.transaction(async (tx) => {
       const [updatedRun] = await tx
         .update(heartbeatRuns)
@@ -1592,7 +1802,13 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           resultJson,
           updatedAt: input.now,
         })
-        .where(and(eq(heartbeatRuns.id, input.run.id), eq(heartbeatRuns.companyId, input.run.companyId), eq(heartbeatRuns.status, "running")))
+        .where(and(
+          eq(heartbeatRuns.id, fencedRun.id),
+          eq(heartbeatRuns.companyId, fencedRun.companyId),
+          eq(heartbeatRuns.status, "running"),
+          eq(heartbeatRuns.cancellationRequestedAt, fencedRun.cancellationRequestedAt!),
+          isNull(heartbeatRuns.finishedAt),
+        ))
         .returning();
       if (!updatedRun) return null;
 
@@ -1627,6 +1843,13 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       return updatedRun;
     });
     if (!finalizedRun) return { kind: "skipped" as const };
+    await deps.releaseTerminalRunResources(finalizedRun).catch(() => {
+      logger.warn(
+        { runId: finalizedRun.id },
+        "source-resolved watchdog run resource cleanup did not fully complete",
+      );
+    });
+    clearProcessCancellation(finalizedRun.id);
 
     if (input.existingEvaluation && !isTerminalIssueStatus(input.existingEvaluation.status)) {
       await issuesSvc.update(input.existingEvaluation.id, { status: "done" });
@@ -2174,6 +2397,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         and(
           opts?.companyId ? eq(heartbeatRuns.companyId, opts.companyId) : undefined,
           eq(heartbeatRuns.status, "running"),
+          isNull(heartbeatRuns.cancellationRequestedAt),
+          isNull(heartbeatRuns.finishedAt),
           sql`coalesce(${heartbeatRuns.lastOutputAt}, ${heartbeatRuns.processStartedAt}, ${heartbeatRuns.startedAt}, ${heartbeatRuns.createdAt}) <= ${suspicionBefore.toISOString()}::timestamptz`,
         ),
       )

@@ -73,6 +73,7 @@ export interface HeartbeatRun {
   status: HeartbeatRunStatus;
   responsibleUserId: string | null;
   startedAt: Date | null;
+  cancellationRequestedAt?: Date | null;
   finishedAt: Date | null;
   error: string | null;
   wakeupRequestId: string | null;

@@ -1420,6 +1420,73 @@ describe("IssueDetail", () => {
     await flushReact();
   });
 
+  it("does not expose or queue against a cancellation-fenced active-run fallback", async () => {
+    const postedComment = createDeferred<IssueComment>();
+    mockIssuesApi.get.mockResolvedValue(createIssue({
+      status: "in_progress",
+      executionRunId: "run-fenced",
+    }));
+    mockIssuesApi.addComment.mockReturnValue(postedComment.promise);
+    mockHeartbeatsApi.activeRunForIssue.mockResolvedValue({
+      id: "run-fenced",
+      status: "running",
+      invocationSource: "issue",
+      triggerDetail: null,
+      contextCommentId: null,
+      contextWakeCommentId: null,
+      startedAt: "2026-04-21T00:00:00.000Z",
+      cancellationRequestedAt: "2026-04-21T00:00:01.000Z",
+      finishedAt: null,
+      createdAt: "2026-04-21T00:00:00.000Z",
+      agentId: "agent-1",
+      agentName: "Coder",
+      adapterType: "codex_local",
+      issueId: "issue-1",
+    });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <IssueDetail />
+        </QueryClientProvider>,
+      );
+    });
+    await flushReact();
+    await flushReact();
+
+    const props = mockIssueChatThreadRender.mock.calls.at(-1)?.[0] as {
+      onAdd: (body: string) => Promise<void>;
+      onCancelRun?: () => Promise<void>;
+    };
+    expect(props.onCancelRun).toBeUndefined();
+
+    await act(async () => {
+      void props.onAdd("Comment after cancellation fence");
+      await Promise.resolve();
+    });
+    await flushReact();
+
+    const nextProps = mockIssueChatThreadRender.mock.calls.at(-1)?.[0] as {
+      comments?: Array<{
+        body: string;
+        clientStatus?: string;
+        queueState?: string;
+        queueTargetRunId?: string | null;
+      }>;
+    };
+    const optimisticComment = nextProps.comments?.find(
+      (comment) => comment.body === "Comment after cancellation fence",
+    );
+    expect(optimisticComment).toMatchObject({ clientStatus: "pending" });
+    expect(optimisticComment?.queueState).toBeUndefined();
+    expect(optimisticComment?.queueTargetRunId).toBeNull();
+
+    await act(async () => {
+      postedComment.resolve(createIssueComment({ body: "Comment after cancellation fence" }));
+    });
+    await flushReact();
+  });
+
   it("hides the plan decomposition panel by default", async () => {
     mockIssuesApi.get.mockResolvedValue(createIssue());
 

@@ -330,11 +330,12 @@ function resolveInterruptibleIssueRun(
   liveRuns: readonly LiveRunForIssue[] | undefined,
 ) {
   const issueLiveRun =
-    (liveRuns ?? []).find((run) => run.status === "running") ??
-    (liveRuns ?? []).find((run) => run.status === "queued") ??
+    (liveRuns ?? []).find((run) => run.status === "running" && !run.cancellationRequestedAt) ??
+    (liveRuns ?? []).find((run) => run.status === "queued" && !run.cancellationRequestedAt) ??
     null;
   return issueLiveRun ?? (
-    activeRun?.status === "running" || activeRun?.status === "queued"
+    (activeRun?.status === "running" || activeRun?.status === "queued") &&
+      !activeRun.cancellationRequestedAt
       ? activeRun
       : null
   );

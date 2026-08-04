@@ -3265,7 +3265,7 @@ rl.on("line", (line) => {
     ]);
   });
 
-  it("rejects durable sessions after the heartbeat run is no longer active", async () => {
+  it("rejects durable sessions as soon as heartbeat cancellation is fenced", async () => {
     const company = await createCompany(db);
     const agent = await createAgent(db, company.id);
     const { run } = await createIssueAndRun(db, company.id, agent.id);
@@ -3278,7 +3278,7 @@ rl.on("line", (line) => {
 
     await db
       .update(heartbeatRuns)
-      .set({ status: "succeeded", completedAt: new Date() })
+      .set({ cancellationRequestedAt: new Date() })
       .where(eq(heartbeatRuns.id, run.id));
 
     await expect(gateway.listToolsForSession(session.token)).rejects.toMatchObject({
@@ -3306,7 +3306,7 @@ rl.on("line", (line) => {
     expect(audit.details).toMatchObject({
       decision: "deny",
       reasonCode: "session_run_inactive",
-      runStatus: "succeeded",
+      runStatus: "running",
     });
     expect(JSON.stringify(audit)).not.toContain(session.token);
   });
@@ -3407,7 +3407,7 @@ rl.on("line", (line) => {
 
     await db
       .update(heartbeatRuns)
-      .set({ status: "succeeded", completedAt: new Date() })
+      .set({ cancellationRequestedAt: new Date() })
       .where(eq(heartbeatRuns.id, run.id));
 
     const replay = await request(app)

@@ -4,6 +4,14 @@ import os from "node:os";
 import path from "node:path";
 
 import type { CommandManagedRuntimeRunner } from "./command-managed-runtime.js";
+import {
+  buildPosixManagedNodeProcessGroupLaunch,
+  buildPosixManagedProcessGroupStop,
+  isRetryablePosixManagedProcessGroupStopFailure,
+  parsePosixManagedProcessGroupIdentity,
+  parsePosixManagedProcessGroupStopEvidence,
+  type PosixManagedProcessGroupIdentity,
+} from "./posix-managed-process-group.js";
 import { preferredShellForSandbox, shellCommandArgs } from "./sandbox-shell.js";
 import type { RunProcessResult } from "./server-utils.js";
 
@@ -144,6 +152,7 @@ export interface SandboxCallbackBridgeDirectories {
   logsDir: string;
   readyFile: string;
   pidFile: string;
+  ownershipFile: string;
   logFile: string;
 }
 
@@ -172,6 +181,7 @@ export interface StartedSandboxCallbackBridgeServer {
   host: string;
   port: number;
   pid: number;
+  processGroupId: number;
   directories: SandboxCallbackBridgeDirectories;
   stop(): Promise<void>;
 }
@@ -306,6 +316,7 @@ export function sandboxCallbackBridgeDirectories(rootDir: string): SandboxCallba
     logsDir: path.posix.join(rootDir, "logs"),
     readyFile: path.posix.join(rootDir, "ready.json"),
     pidFile: path.posix.join(rootDir, "server.pid"),
+    ownershipFile: path.posix.join(rootDir, "server.process-group.json"),
     logFile: path.posix.join(rootDir, "logs", "bridge.log"),
   };
 }
@@ -913,19 +924,29 @@ export async function startSandboxCallbackBridgeServer(input: {
     maxBodyBytes: input.maxBodyBytes,
   });
   const nodeCommand = input.nodeCommand?.trim() || "node";
-  const startResult = await input.runner.execute({
-    command: shellCommand,
-    args: shellCommandArgs(
+  requireSuccessfulResult(
+    "prepare sandbox callback bridge launch",
+    await runShell(
+      input.runner,
+      input.remoteCwd,
       [
         `mkdir -p ${shellQuote(directories.requestsDir)} ${shellQuote(directories.responsesDir)} ${shellQuote(directories.logsDir)}`,
         `rm -f ${shellQuote(directories.readyFile)} ${shellQuote(directories.pidFile)}`,
-        `nohup ${shellQuote(nodeCommand)} ${shellQuote(remoteEntrypoint)} ` +
-          `>> ${shellQuote(directories.logFile)} 2>&1 < /dev/null &`,
-        "pid=$!",
-        `printf '%s\\n' \"$pid\" > ${shellQuote(directories.pidFile)}`,
-        "printf '{\"pid\":%s}\\n' \"$pid\"",
       ].join("\n"),
+      timeoutMs,
+      shellCommand,
     ),
+  );
+  const launch = buildPosixManagedNodeProcessGroupLaunch({
+    nodeCommand,
+    entrypoint: remoteEntrypoint,
+    metadataFile: directories.ownershipFile,
+    pidFile: directories.pidFile,
+    logFile: directories.logFile,
+  });
+  const startResult = await input.runner.execute({
+    command: launch.command,
+    args: launch.args,
     cwd: input.remoteCwd,
     env: {
       [SANDBOX_EXEC_CHANNEL_ENV]: SANDBOX_EXEC_CHANNEL_BRIDGE,
@@ -933,7 +954,126 @@ export async function startSandboxCallbackBridgeServer(input: {
     },
     timeoutMs,
   });
-  requireSuccessfulResult("start sandbox callback bridge", startResult);
+  let identity: PosixManagedProcessGroupIdentity | null = null;
+  try {
+    identity = parsePosixManagedProcessGroupIdentity(startResult.stdout, launch.nonce);
+  } catch {
+    const ownershipResult = await runShell(
+      input.runner,
+      input.remoteCwd,
+      `if [ -s ${shellQuote(directories.ownershipFile)} ]; then cat ${shellQuote(directories.ownershipFile)}; fi`,
+      timeoutMs,
+      shellCommand,
+    );
+    if (!ownershipResult.timedOut && ownershipResult.exitCode === 0 && ownershipResult.stdout.trim()) {
+      try {
+        identity = parsePosixManagedProcessGroupIdentity(ownershipResult.stdout, launch.nonce);
+      } catch {
+        identity = null;
+      }
+    }
+    if (!identity) {
+      const pidResult = await runShell(
+        input.runner,
+        input.remoteCwd,
+        `if [ -s ${shellQuote(directories.pidFile)} ]; then cat ${shellQuote(directories.pidFile)}; fi`,
+        timeoutMs,
+        shellCommand,
+      );
+      const pid = Number.parseInt(pidResult.stdout.trim(), 10);
+      if (!pidResult.timedOut && pidResult.exitCode === 0 && Number.isInteger(pid) && pid > 1) {
+        identity = {
+          kind: "posix_managed_process_group",
+          version: 1,
+          pid,
+          processGroupId: pid,
+          nonce: launch.nonce,
+          startedAt: new Date().toISOString(),
+        };
+      }
+    }
+  }
+  if (!identity) {
+    throw new Error(buildRunnerFailureMessage("start sandbox callback bridge", startResult));
+  }
+  const launchFailed = startResult.timedOut || (startResult.exitCode ?? 1) !== 0;
+  const managedIdentity = identity;
+
+  let managedStopPromise: Promise<void> | null = null;
+  let managedStopConfirmed = false;
+  const stopManagedProcessGroup = () => {
+    if (managedStopConfirmed) return Promise.resolve();
+    if (managedStopPromise) return managedStopPromise;
+    const attempt = (async () => {
+      const stop = buildPosixManagedProcessGroupStop({
+        identity: managedIdentity,
+        metadataFile: directories.ownershipFile,
+        pidFile: directories.pidFile,
+        confirmationTimeoutMs: 5_000,
+        nodeCommand,
+      });
+      let stopResult: Awaited<ReturnType<typeof input.runner.execute>>;
+      let stopAttempt = 0;
+      do {
+        stopAttempt += 1;
+        stopResult = await input.runner.execute({
+          command: stop.command,
+          args: stop.args,
+          cwd: input.remoteCwd,
+          env: { [SANDBOX_EXEC_CHANNEL_ENV]: SANDBOX_EXEC_CHANNEL_BRIDGE },
+          timeoutMs: Math.max(timeoutMs, 10_000),
+        });
+      } while (stopAttempt < 2 && isRetryablePosixManagedProcessGroupStopFailure(stopResult));
+      requireSuccessfulResult(
+        `stop sandbox callback bridge (pid ${managedIdentity.pid}, pgid ${managedIdentity.processGroupId})`,
+        stopResult,
+      );
+      parsePosixManagedProcessGroupStopEvidence(stopResult.stdout, managedIdentity);
+    })();
+    managedStopPromise = attempt;
+    void attempt.then(
+      () => {
+        managedStopConfirmed = true;
+        if (managedStopPromise === attempt) managedStopPromise = null;
+      },
+      () => {
+        if (managedStopPromise === attempt) managedStopPromise = null;
+      },
+    );
+    return attempt;
+  };
+  let bridgeStopPromise: Promise<void> | null = null;
+  let bridgeStopConfirmed = false;
+  const stopAndCleanupManagedProcessGroup = () => {
+    if (bridgeStopConfirmed) return Promise.resolve();
+    if (bridgeStopPromise) return bridgeStopPromise;
+    const attempt = (async () => {
+      await stopManagedProcessGroup();
+      const cleanupResult = await runShell(
+        input.runner,
+        input.remoteCwd,
+        `rm -f ${shellQuote(directories.readyFile)} ${shellQuote(directories.pidFile)}`,
+        timeoutMs,
+        shellCommand,
+      );
+      requireSuccessfulResult("clean up sandbox callback bridge control files", cleanupResult);
+    })();
+    bridgeStopPromise = attempt;
+    void attempt.then(
+      () => {
+        bridgeStopConfirmed = true;
+        if (bridgeStopPromise === attempt) bridgeStopPromise = null;
+      },
+      () => {
+        if (bridgeStopPromise === attempt) bridgeStopPromise = null;
+      },
+    );
+    return attempt;
+  };
+  if (launchFailed) {
+    await stopAndCleanupManagedProcessGroup();
+    throw new Error(buildRunnerFailureMessage("start sandbox callback bridge", startResult));
+  }
 
   const readyResult = await runShell(
     input.runner,
@@ -959,15 +1099,34 @@ export async function startSandboxCallbackBridgeServer(input: {
     timeoutMs,
     shellCommand,
   );
-  requireSuccessfulResult("wait for sandbox callback bridge readiness", readyResult);
+  if (readyResult.timedOut || (readyResult.exitCode ?? 1) !== 0) {
+    await stopAndCleanupManagedProcessGroup();
+    throw new Error(buildRunnerFailureMessage("wait for sandbox callback bridge readiness", readyResult));
+  }
 
-  let readyData: { host?: string; port?: number; baseUrl?: string; pid?: number };
+  let readyData: {
+    host?: string;
+    port?: number;
+    baseUrl?: string;
+    pid?: number;
+    processGroupId?: number;
+    nonce?: string;
+  };
   try {
-    readyData = JSON.parse(readyResult.stdout.trim()) as { host?: string; port?: number; baseUrl?: string; pid?: number };
+    readyData = JSON.parse(readyResult.stdout.trim()) as typeof readyData;
   } catch (error) {
+    await stopAndCleanupManagedProcessGroup();
     throw new Error(
       `Sandbox callback bridge wrote invalid readiness JSON: ${error instanceof Error ? error.message : String(error)}`,
     );
+  }
+  if (
+    readyData.pid !== managedIdentity.pid
+    || readyData.processGroupId !== managedIdentity.processGroupId
+    || readyData.nonce !== managedIdentity.nonce
+  ) {
+    await stopAndCleanupManagedProcessGroup();
+    throw new Error("Sandbox callback bridge readiness did not match its owned process group.");
   }
 
   const host = typeof readyData.host === "string" && readyData.host.trim().length > 0
@@ -975,6 +1134,7 @@ export async function startSandboxCallbackBridgeServer(input: {
     : "127.0.0.1";
   const port = typeof readyData.port === "number" && Number.isFinite(readyData.port) ? readyData.port : 0;
   if (!port) {
+    await stopAndCleanupManagedProcessGroup();
     throw new Error("Sandbox callback bridge did not report a listening port.");
   }
   const baseUrl =
@@ -986,35 +1146,10 @@ export async function startSandboxCallbackBridgeServer(input: {
     baseUrl,
     host,
     port,
-    pid: typeof readyData.pid === "number" && Number.isFinite(readyData.pid) ? readyData.pid : 0,
+    pid: managedIdentity.pid,
+    processGroupId: managedIdentity.processGroupId,
     directories,
-    stop: async () => {
-      const stopResult = await input.runner.execute({
-        command: shellCommand,
-        args: shellCommandArgs(
-          [
-            `if [ -s ${shellQuote(directories.pidFile)} ]; then`,
-            `  pid="$(cat ${shellQuote(directories.pidFile)})"`,
-            "  kill \"$pid\" 2>/dev/null || true",
-            "  i=0",
-            "  while kill -0 \"$pid\" 2>/dev/null && [ \"$i\" -lt 40 ]; do",
-            "    i=$((i + 1))",
-            "    sleep 0.05",
-            "  done",
-            "fi",
-            `rm -f ${shellQuote(directories.pidFile)} ${shellQuote(directories.readyFile)}`,
-          ].join("\n"),
-        ),
-        cwd: input.remoteCwd,
-        env: {
-          [SANDBOX_EXEC_CHANNEL_ENV]: SANDBOX_EXEC_CHANNEL_BRIDGE,
-        },
-        timeoutMs,
-      });
-      if (stopResult.timedOut) {
-        throw new Error(buildRunnerFailureMessage("stop sandbox callback bridge", stopResult));
-      }
-    },
+    stop: stopAndCleanupManagedProcessGroup,
   };
 }
 
@@ -1032,10 +1167,11 @@ const pollIntervalMs = Number(process.env.PAPERCLIP_BRIDGE_POLL_INTERVAL_MS || "
 const responseTimeoutMs = Number(process.env.PAPERCLIP_BRIDGE_RESPONSE_TIMEOUT_MS || "30000");
 const maxQueueDepth = Number(process.env.PAPERCLIP_BRIDGE_MAX_QUEUE_DEPTH || "${DEFAULT_BRIDGE_MAX_QUEUE_DEPTH}");
 const maxBodyBytes = Number(process.env.PAPERCLIP_BRIDGE_MAX_BODY_BYTES || "${DEFAULT_BRIDGE_MAX_BODY_BYTES}");
+const managedProcessNonce = process.env.PAPERCLIP_MANAGED_PROCESS_NONCE || "";
 const allowedHeaders = new Set(${JSON.stringify([...DEFAULT_SANDBOX_CALLBACK_BRIDGE_HEADER_ALLOWLIST])});
 
-if (!queueDir || !bridgeToken) {
-  throw new Error("PAPERCLIP_BRIDGE_QUEUE_DIR and PAPERCLIP_BRIDGE_TOKEN are required.");
+if (!queueDir || !bridgeToken || !managedProcessNonce) {
+  throw new Error("Sandbox callback bridge environment is incomplete.");
 }
 
 const requestsDir = path.posix.join(queueDir, "requests");
@@ -1176,6 +1312,8 @@ server.listen(port, host, async () => {
   }
   const ready = {
     pid: process.pid,
+    processGroupId: process.pid,
+    nonce: managedProcessNonce,
     host,
     port: address.port,
     baseUrl: \`http://\${host}:\${address.port}\`,

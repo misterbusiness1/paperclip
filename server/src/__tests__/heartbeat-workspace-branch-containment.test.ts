@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -104,6 +104,10 @@ vi.mock("../adapters/index.js", () => ({
     supportsLocalAgentJwt: false,
   }),
   listAdapterModelProfiles: async () => [],
+  requestProcessCancellation: () => ({ pendingStartCancelled: false }),
+  clearProcessCancellation: () => undefined,
+  getRemoteProcessTerminationControl: () => null,
+  clearRemoteProcessTerminationControl: () => undefined,
   runningProcesses: new Map(),
 }));
 
@@ -754,8 +758,9 @@ async function expectForwardBranchReconciled(input: {
   expect(activeWorkspace).toMatchObject({
     name: expectedDurableBranch,
     branchName: expectedDurableBranch,
-    providerRef: input.worktreePath,
   });
+  expect(activeWorkspace?.providerRef).toEqual(expect.any(String));
+  await expect(realpath(activeWorkspace!.providerRef!)).resolves.toBe(await realpath(input.worktreePath));
 
   const recoveryRows = await input.db
     .select()

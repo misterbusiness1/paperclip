@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { chmod, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -11,11 +12,20 @@ import {
   readSshEnvLabFixtureStatus,
   restoreWorkspaceFromSshExecution,
   runSshCommand,
+  shellQuote,
   syncDirectoryFromSsh,
   syncDirectoryToSsh,
   startSshEnvLabFixture,
   stopSshEnvLabFixture,
 } from "./ssh.js";
+import {
+  clearProcessCancellation,
+  getRemoteProcessTerminationControl,
+  requestProcessCancellation,
+  runningProcesses,
+  runChildProcess,
+  signalRunningProcess,
+} from "./server-utils.js";
 import { prepareRemoteManagedRuntime } from "./remote-managed-runtime.js";
 
 const SSH_FIXTURE_TEST_TIMEOUT_MS = 30_000;
@@ -31,6 +41,57 @@ async function git(cwd: string, args: string[]): Promise<string> {
       resolve(stdout.trim());
     });
   });
+}
+
+async function assertShellSyntax(script: string) {
+  await new Promise<void>((resolve, reject) => {
+    execFile("sh", ["-n", "-c", script], (error, _stdout, stderr) => {
+      if (error) {
+        reject(new Error(stderr.trim() || error.message));
+        return;
+      }
+      resolve();
+    });
+  });
+}
+
+function readShellQuotedWord(value: string, start = 0) {
+  if (value[start] !== "'") {
+    throw new Error("Expected a single-quoted shell word");
+  }
+  let decoded = "";
+  let cursor = start + 1;
+  while (cursor < value.length) {
+    const quote = value.indexOf("'", cursor);
+    if (quote < 0) throw new Error("Unterminated single-quoted shell word");
+    decoded += value.slice(cursor, quote);
+    if (value.startsWith(`'"'"'`, quote)) {
+      decoded += "'";
+      cursor = quote + 5;
+      continue;
+    }
+    return { decoded, end: quote + 1 };
+  }
+  throw new Error("Unterminated single-quoted shell word");
+}
+
+async function waitForOutput(read: () => string, expected: string, timeoutMs = 5_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (read().includes(expected)) return;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  expect(read()).toContain(expected);
+}
+
+async function waitForRunningProcess(runId: string, timeoutMs = 5_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const running = runningProcesses.get(runId);
+    if (running) return running;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  return runningProcesses.get(runId) ?? null;
 }
 
 async function startSshEnvLabFixtureOrSkip(statePath: string, label: string) {
@@ -173,6 +234,7 @@ describe("ssh env-lab fixture", () => {
   it("rejects invalid environment variable keys when constructing SSH spawn targets", async () => {
     await expect(
       buildSshSpawnTarget({
+        runId: "invalid-env-key-test",
         spec: {
           host: "ssh.example.test",
           port: 22,
@@ -191,6 +253,302 @@ describe("ssh env-lab fixture", () => {
       }),
     ).rejects.toThrow("Invalid SSH environment variable key: BAD KEY");
   });
+
+  it("constructs a syntactically valid, gated SSH supervisor", async () => {
+    const target = await buildSshSpawnTarget({
+      runId: "supervisor-syntax-test",
+      spec: {
+        host: "ssh.example.test",
+        port: 22,
+        username: "ssh-user",
+        remoteCwd: "/srv/paperclip/work space",
+        remoteWorkspacePath: "/srv/paperclip/work space",
+        privateKey: null,
+        knownHosts: null,
+        strictHostKeyChecking: true,
+      },
+      command: "printf",
+      args: ["apostrophe's value"],
+      env: { SAFE_VALUE: "space and apostrophe's value" },
+    });
+
+    try {
+      const remoteArgument = target.args.at(-1) ?? "";
+      expect(remoteArgument.startsWith("sh -c ")).toBe(true);
+      const supervisor = readShellQuotedWord(remoteArgument, "sh -c ".length).decoded;
+      await assertShellSyntax(supervisor);
+      expect(supervisor).toContain("setsid -w");
+      expect(supervisor).toContain("ready_file");
+      expect(supervisor).toContain("gate_file");
+      expect(supervisor.indexOf("setsid -w")).toBeLessThan(supervisor.indexOf(".profile"));
+      const gatedPrefix = "setsid -w sh -c ";
+      const gatedStart = supervisor.indexOf(gatedPrefix);
+      expect(gatedStart).toBeGreaterThanOrEqual(0);
+      const gated = readShellQuotedWord(supervisor, gatedStart + gatedPrefix.length).decoded;
+      await assertShellSyntax(gated);
+      const profiledPrefix = "exec sh -c ";
+      const profiledStart = gated.indexOf(profiledPrefix);
+      expect(profiledStart).toBeGreaterThanOrEqual(0);
+      const profiled = readShellQuotedWord(gated, profiledStart + profiledPrefix.length).decoded;
+      await assertShellSyntax(profiled);
+      expect(profiled).toContain(".profile");
+      expect(supervisor).toContain('[ -z "${child_pgid:-}" ] || child_group_is_alive');
+    } finally {
+      await target.cleanup();
+    }
+  });
+
+  it("recovers a nonce-bound PGID from readiness after a pre-ready unconfirmed state", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-ready-recovery-"));
+    cleanupDirs.push(rootDir);
+    const statePath = path.join(rootDir, "state.json");
+    const started = await startSshEnvLabFixtureOrSkip(statePath, "SSH readiness-recovery fixture test");
+    if (!started) return;
+    const config = await buildSshEnvLabFixtureConfig(started);
+    const runId = randomUUID();
+    const target = await buildSshSpawnTarget({
+      runId,
+      spec: { ...config, remoteCwd: started.workspaceDir },
+      command: "true",
+      args: [],
+      env: {},
+    });
+    const remoteArgument = target.args.at(-1) ?? "";
+    const supervisor = readShellQuotedWord(remoteArgument, "sh -c ".length).decoded;
+    const nonceAssignment = supervisor.match(/^control_nonce=(.+)$/m)?.[1];
+    expect(nonceAssignment).toBeTruthy();
+    const nonce = readShellQuotedWord(nonceAssignment!).decoded;
+    const controlDir = path.posix.join(started.workspaceDir, ".paperclip-runtime", "process-groups");
+    const readyPath = path.posix.join(controlDir, `${runId}.ready`);
+    const controlPath = path.posix.join(controlDir, `${runId}.state`);
+    const markerPath = path.posix.join(started.workspaceDir, `ready-recovery-marker-${randomUUID()}`);
+
+    try {
+      const inner = [
+        `printf 'ready:%s:%s\\n' ${JSON.stringify(nonce)} "$$" > ${JSON.stringify(readyPath)}`,
+        "sleep 1",
+        `printf late > ${JSON.stringify(markerPath)}`,
+        "sleep 30",
+      ].join("; ");
+      await runSshCommand(
+        config,
+        [
+          `mkdir -p ${JSON.stringify(controlDir)}`,
+          `rm -f ${JSON.stringify(readyPath)} ${JSON.stringify(controlPath)} ${JSON.stringify(markerPath)}`,
+          `nohup setsid sh -c ${shellQuote(inner)} >/dev/null 2>&1 </dev/null &`,
+          `wait_count=0; while [ ! -s ${JSON.stringify(readyPath)} ] && [ "$wait_count" -lt 100 ]; do sleep 0.02; wait_count=$((wait_count + 1)); done`,
+          `test -s ${JSON.stringify(readyPath)}`,
+          `printf 'unconfirmed:%s\\n' ${JSON.stringify(nonce)} > ${JSON.stringify(controlPath)}`,
+        ].join("; "),
+        { sourceProfiles: false, timeoutMs: 10_000 },
+      );
+
+      await expect(target.terminateRemote({ confirmationTimeoutMs: 5_000 })).resolves.toMatchObject({
+        scope: "ssh",
+        confirmedExited: true,
+        forceKilled: true,
+      });
+      await new Promise((resolve) => setTimeout(resolve, 1_100));
+      const marker = await runSshCommand(
+        config,
+        `test ! -e ${JSON.stringify(markerPath)} && printf absent`,
+        { sourceProfiles: false },
+      );
+      expect(marker.stdout).toBe("absent");
+    } finally {
+      await target.terminateRemote({ confirmationTimeoutMs: 2_000 }).catch(() => undefined);
+      await target.cleanup();
+    }
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  it("confirms remote group cancellation before a delayed descendant can write", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-cancel-"));
+    cleanupDirs.push(rootDir);
+    const statePath = path.join(rootDir, "state.json");
+    const started = await startSshEnvLabFixtureOrSkip(statePath, "SSH cancellation fixture test");
+    if (!started) return;
+    const config = await buildSshEnvLabFixtureConfig(started);
+    const markerPath = path.posix.join(started.workspaceDir, `late-write-${randomUUID()}`);
+    const runId = randomUUID();
+    let output = "";
+    const resultPromise = runChildProcess(
+      runId,
+      "sh",
+      [
+        "-c",
+        `(sleep 1; printf late > ${JSON.stringify(markerPath)}) & printf 'READY\\n'; wait`,
+      ],
+      {
+        cwd: started.workspaceDir,
+        env: {},
+        timeoutSec: 0,
+        graceSec: 1,
+        remoteExecution: { ...config, remoteCwd: started.workspaceDir },
+        onLog: async (_stream, chunk) => {
+          output += chunk;
+        },
+      },
+    );
+
+    try {
+      await waitForOutput(() => output, "READY");
+      const running = runningProcesses.get(runId);
+      expect(running?.terminateRemote).toBeTypeOf("function");
+      const evidence = await running!.terminateRemote!({ confirmationTimeoutMs: 5_000 });
+      expect(evidence).toMatchObject({
+        scope: "ssh",
+        confirmedExited: true,
+      });
+      await resultPromise;
+      await new Promise((resolve) => setTimeout(resolve, 1_100));
+      const marker = await runSshCommand(config, `test ! -e ${JSON.stringify(markerPath)} && printf absent`, {
+        sourceProfiles: false,
+      });
+      expect(marker.stdout).toBe("absent");
+    } finally {
+      const running = runningProcesses.get(runId);
+      if (running?.terminateRemote) {
+        await running.terminateRemote({ confirmationTimeoutMs: 2_000 }).catch(() => undefined);
+      }
+      if (running) signalRunningProcess(running, "SIGKILL");
+      await resultPromise.catch(() => undefined);
+      runningProcesses.delete(runId);
+    }
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  it("tombstones an SSH launch cancelled immediately after the local client spawns", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-pre-ready-cancel-"));
+    cleanupDirs.push(rootDir);
+    const statePath = path.join(rootDir, "state.json");
+    const started = await startSshEnvLabFixtureOrSkip(statePath, "SSH pre-ready cancellation fixture test");
+    if (!started) return;
+    const config = await buildSshEnvLabFixtureConfig(started);
+    const markerPath = path.posix.join(started.workspaceDir, `pre-ready-write-${randomUUID()}`);
+    const runId = randomUUID();
+    const resultPromise = runChildProcess(
+      runId,
+      "sh",
+      ["-c", `sleep 1; printf late > ${JSON.stringify(markerPath)}`],
+      {
+        cwd: started.workspaceDir,
+        env: {},
+        timeoutSec: 0,
+        graceSec: 1,
+        remoteExecution: { ...config, remoteCwd: started.workspaceDir },
+        onLog: async () => {},
+      },
+    );
+
+    try {
+      const running = await waitForRunningProcess(runId);
+      expect(running?.terminateRemote).toBeTypeOf("function");
+      const evidence = await running!.terminateRemote!({ confirmationTimeoutMs: 5_000 });
+      expect(evidence.confirmedExited).toBe(true);
+      await resultPromise;
+      await new Promise((resolve) => setTimeout(resolve, 1_100));
+      const marker = await runSshCommand(config, `test ! -e ${JSON.stringify(markerPath)} && printf absent`, {
+        sourceProfiles: false,
+      });
+      expect(marker.stdout).toBe("absent");
+    } finally {
+      const running = runningProcesses.get(runId);
+      if (running?.terminateRemote) {
+        await running.terminateRemote({ confirmationTimeoutMs: 2_000 }).catch(() => undefined);
+      }
+      if (running) signalRunningProcess(running, "SIGKILL");
+      await resultPromise.catch(() => undefined);
+      runningProcesses.delete(runId);
+    }
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  it("retains remote termination control after a fenced SSH client closes", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-control-retention-"));
+    cleanupDirs.push(rootDir);
+    const statePath = path.join(rootDir, "state.json");
+    const started = await startSshEnvLabFixtureOrSkip(statePath, "SSH control-retention fixture test");
+    if (!started) return;
+    const config = await buildSshEnvLabFixtureConfig(started);
+    const runId = randomUUID();
+    let output = "";
+    const resultPromise = runChildProcess(
+      runId,
+      "sh",
+      ["-c", "printf 'READY\\n'; sleep 0.25"],
+      {
+        cwd: started.workspaceDir,
+        env: {},
+        timeoutSec: 0,
+        graceSec: 1,
+        remoteExecution: { ...config, remoteCwd: started.workspaceDir },
+        onLog: async (_stream, chunk) => {
+          output += chunk;
+        },
+      },
+    );
+
+    try {
+      await waitForOutput(() => output, "READY");
+      await resultPromise;
+      expect(runningProcesses.has(runId)).toBe(false);
+
+      const terminateRemote = getRemoteProcessTerminationControl(runId);
+      expect(terminateRemote).toBeTypeOf("function");
+      expect(requestProcessCancellation(runId)).toEqual({ pendingStartCancelled: false });
+      await expect(terminateRemote!({ confirmationTimeoutMs: 2_000 })).resolves.toMatchObject({
+        scope: "ssh",
+        confirmedExited: true,
+        outcome: "already_exited",
+      });
+    } finally {
+      const running = runningProcesses.get(runId);
+      if (running) signalRunningProcess(running, "SIGKILL");
+      await resultPromise.catch(() => undefined);
+      runningProcesses.delete(runId);
+      clearProcessCancellation(runId);
+    }
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  it("confirms a prior SSH group before a sequential same-run attempt", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-sequential-attempt-"));
+    cleanupDirs.push(rootDir);
+    const statePath = path.join(rootDir, "state.json");
+    const started = await startSshEnvLabFixtureOrSkip(statePath, "SSH sequential-attempt fixture test");
+    if (!started) return;
+    const config = await buildSshEnvLabFixtureConfig(started);
+    const runId = randomUUID();
+
+    try {
+      const first = await runChildProcess(runId, "printf", ["first"], {
+        cwd: started.workspaceDir,
+        env: {},
+        timeoutSec: 0,
+        graceSec: 1,
+        remoteExecution: { ...config, remoteCwd: started.workspaceDir },
+        onLog: async () => {},
+      });
+      expect(first.stdout).toBe("first");
+      expect(getRemoteProcessTerminationControl(runId)).toBeTypeOf("function");
+
+      const second = await runChildProcess(runId, "printf", ["second"], {
+        cwd: started.workspaceDir,
+        env: {},
+        timeoutSec: 0,
+        graceSec: 1,
+        remoteExecution: { ...config, remoteCwd: started.workspaceDir },
+        onLog: async () => {},
+      });
+      expect(second.stdout).toBe("second");
+    } finally {
+      const terminateRemote = getRemoteProcessTerminationControl(runId);
+      if (terminateRemote) {
+        await terminateRemote({ confirmationTimeoutMs: 2_000 }).catch(() => undefined);
+      }
+      const running = runningProcesses.get(runId);
+      if (running) signalRunningProcess(running, "SIGKILL");
+      runningProcesses.delete(runId);
+      clearProcessCancellation(runId);
+    }
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
 
   it("syncs a local directory into the remote fixture workspace", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-fixture-"));

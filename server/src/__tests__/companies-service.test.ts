@@ -35,6 +35,19 @@ if (!embeddedPostgresSupport.supported) {
   );
 }
 
+// Archive tests insert running rows directly instead of starting an adapter.
+// Give those rows an explicit local execution identity that is known absent so
+// cancellation can confirm exit. A running row with no driver or process-group
+// identity is intentionally unconfirmable and must remain fenced.
+function confirmedExitedLocalExecutionFixture() {
+  const absentProcessId = 999_999_999;
+  return {
+    contextSnapshot: { paperclipEnvironment: { driver: "local" } },
+    processPid: absentProcessId,
+    processGroupId: absentProcessId,
+  };
+}
+
 describeEmbeddedPostgres("companyService", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
@@ -232,6 +245,7 @@ describeEmbeddedPostgres("companyService", () => {
       invocationSource: "timer",
       status: "running",
       wakeupRequestId,
+      ...confirmedExitedLocalExecutionFixture(),
     });
 
     const archived = await companyService(db).archive(companyId, {
@@ -473,6 +487,7 @@ describeEmbeddedPostgres("companyService", () => {
       invocationSource: "timer",
       status: "running",
       wakeupRequestId,
+      ...confirmedExitedLocalExecutionFixture(),
     });
 
     const archived = await companyService(db).update(
@@ -730,6 +745,7 @@ describeEmbeddedPostgres("companyService", () => {
       invocationSource: "timer",
       status: "running",
       wakeupRequestId: runWakeupId,
+      ...confirmedExitedLocalExecutionFixture(),
     });
 
     const archived = await companyService(db).archive(companyId, {

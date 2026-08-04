@@ -62,6 +62,7 @@ import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import type { PluginStreamBus } from "../services/plugin-stream-bus.js";
 import type { PluginToolDispatcher } from "../services/plugin-tool-dispatcher.js";
 import { ToolGatewayHttpError, type ToolGatewayService } from "../services/tool-gateway.js";
+import { startTrackedRunMutation } from "../services/run-mutation-activity.js";
 import type { PluginPerformActionActorContext, ToolRunContext } from "@paperclipai/plugin-sdk";
 import { JsonRpcCallError, PLUGIN_RPC_ERROR_CODES } from "@paperclipai/plugin-sdk";
 import {
@@ -794,7 +795,13 @@ export function pluginRoutes(
     }
 
     const [run] = await db
-      .select({ companyId: heartbeatRuns.companyId, agentId: heartbeatRuns.agentId })
+      .select({
+        companyId: heartbeatRuns.companyId,
+        agentId: heartbeatRuns.agentId,
+        status: heartbeatRuns.status,
+        cancellationRequestedAt: heartbeatRuns.cancellationRequestedAt,
+        finishedAt: heartbeatRuns.finishedAt,
+      })
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.id, runContext.runId))
       .limit(1);
@@ -803,6 +810,9 @@ export function pluginRoutes(
     }
     if (run.agentId !== runContext.agentId) {
       return '"runContext.runId" does not belong to "runContext.agentId"';
+    }
+    if (run.status !== "running" || run.cancellationRequestedAt || run.finishedAt) {
+      return '"runContext.runId" is not active';
     }
 
     const [project] = await db
@@ -1023,6 +1033,18 @@ export function pluginRoutes(
       return;
     }
 
+    if (
+      req.actor.type === "agent"
+      && (
+        req.actor.agentId !== runContext.agentId
+        || req.actor.companyId !== runContext.companyId
+        || (req.actor.runId && req.actor.runId !== runContext.runId)
+      )
+    ) {
+      res.status(403).json({ error: "runContext does not belong to the authenticated agent run" });
+      return;
+    }
+
     assertCompanyAccess(req, runContext.companyId);
     const scopeError = await validateToolRunContextScope(runContext);
     if (scopeError) {
@@ -1067,11 +1089,20 @@ export function pluginRoutes(
     }
 
     try {
-      const result = await toolDeps.toolDispatcher.executeTool(
-        tool,
-        parameters ?? {},
-        runContext,
+      const tracked = startTrackedRunMutation(
+        db,
+        runContext.runId,
+        () => toolDeps.toolDispatcher.executeTool(
+          tool,
+          parameters ?? {},
+          runContext,
+        ),
       );
+      if (!tracked.admitted) {
+        res.status(403).json({ error: "Run is not active" });
+        return;
+      }
+      const result = await tracked.promise;
       res.json(result);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);

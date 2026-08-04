@@ -1,7 +1,6 @@
 // Re-export everything from the shared adapter-utils/server-utils package.
 // This file is kept as a convenience shim so existing in-tree
 // imports (process/, http/, heartbeat.ts) don't need rewriting.
-import type { ChildProcess } from "node:child_process";
 import { logger } from "../middleware/logger.js";
 import * as serverUtils from "@paperclipai/adapter-utils/server-utils";
 export type { RunProcessResult } from "@paperclipai/adapter-utils/server-utils";
@@ -13,8 +12,11 @@ type BuildInvocationEnvForLogsOptions = {
   resolvedCommandEnvKey?: string;
 };
 
-export const runningProcesses: Map<string, { child: ChildProcess; graceSec: number; processGroupId: number | null }> =
-  serverUtils.runningProcesses;
+export const runningProcesses = serverUtils.runningProcesses;
+export const requestProcessCancellation = serverUtils.requestProcessCancellation;
+export const clearProcessCancellation = serverUtils.clearProcessCancellation;
+export const clearRemoteProcessTerminationControl = serverUtils.clearRemoteProcessTerminationControl;
+export const getRemoteProcessTerminationControl = serverUtils.getRemoteProcessTerminationControl;
 export const MAX_CAPTURE_BYTES = serverUtils.MAX_CAPTURE_BYTES;
 export const MAX_EXCERPT_BYTES = serverUtils.MAX_EXCERPT_BYTES;
 export const parseObject = serverUtils.parseObject;
@@ -36,6 +38,25 @@ export const ensurePathInEnv = serverUtils.ensurePathInEnv;
 export const ensureAbsoluteDirectory = serverUtils.ensureAbsoluteDirectory;
 export const ensureCommandResolvable = serverUtils.ensureCommandResolvable;
 export const resolveCommandForLogs = serverUtils.resolveCommandForLogs;
+
+// These adapters launch a directly managed child (or SSH client) through the
+// shared process runner and persist PID/PGID metadata via onSpawn. Recovery must
+// require whole-process-group exit proof for them on POSIX.
+const TRACKED_LOCAL_CHILD_PROCESS_ADAPTER_TYPES = new Set([
+  "claude_local",
+  "codex_local",
+  "cursor",
+  "gemini_local",
+  "grok_local",
+  "hermes_local",
+  "opencode_local",
+  "pi_local",
+  "process",
+]);
+
+export function isTrackedLocalChildProcessAdapter(adapterType: string) {
+  return TRACKED_LOCAL_CHILD_PROCESS_ADAPTER_TYPES.has(adapterType);
+}
 
 export function buildInvocationEnvForLogs(
   env: Record<string, string>,

@@ -64,7 +64,10 @@ import { getBoardClaimWarningUrl, initializeBoardClaimChallenge } from "./board-
 import { maybePersistWorktreeRuntimePorts } from "./worktree-config.js";
 import { initTelemetry, getTelemetryClient } from "./telemetry.js";
 import { conflict } from "./errors.js";
-import { coordinateHeartbeatSchedulerShutdown } from "./shutdown.js";
+import {
+  coordinateHeartbeatSchedulerShutdown,
+  drainHeartbeatRunsForSafeShutdown,
+} from "./shutdown.js";
 import type {
   InstanceDatabaseBackupRunResult,
   InstanceDatabaseBackupTrigger,
@@ -824,6 +827,9 @@ export async function startServer(): Promise<StartedServer> {
 
   let drainHeartbeatRunsForShutdown: ((signal: "SIGINT" | "SIGTERM") => Promise<unknown>) | null = null;
   let prepareHotRestartShutdown: ((signal: "SIGINT" | "SIGTERM") => Promise<{ skipDrain: boolean }>) | null = null;
+  let suppressHeartbeatRunAdmissionForShutdown: (() => void) | null = null;
+  let waitForHeartbeatRunAdmissionIdle: (() => Promise<void>) | null = null;
+  let drainHeartbeatRunExecutionsForShutdown: (() => Promise<void>) | null = null;
   let heartbeatSchedulerStopped = false;
   let heartbeatSchedulerInterval: ReturnType<typeof setInterval> | null = null;
   const heartbeatSchedulerInFlight = new Set<Promise<void>>();
@@ -841,11 +847,29 @@ export async function startServer(): Promise<StartedServer> {
       await Promise.allSettled([...heartbeatSchedulerInFlight]);
     }
   };
+  const heartbeat = heartbeatService(db as any, { pluginWorkerManager });
+  drainHeartbeatRunsForShutdown = heartbeat.drainRunningRunsForShutdown;
+  prepareHotRestartShutdown = heartbeat.prepareHotRestartShutdown;
+  suppressHeartbeatRunAdmissionForShutdown = heartbeat.suppressRunAdmissionForShutdown;
+  waitForHeartbeatRunAdmissionIdle = heartbeat.waitForRunAdmissionIdle;
+  drainHeartbeatRunExecutionsForShutdown = heartbeat.drainActiveRunExecutions;
+
+  // Durable cancellation cleanup is independent of timer scheduling. Manual
+  // runs can exist when the scheduler is disabled or suppressed, and must not
+  // remain indefinitely fenced without a startup termination attempt.
+  try {
+    const cancellationRecovery = await heartbeat.reconcilePendingRunCancellations();
+    if (cancellationRecovery.cancelled > 0 || cancellationRecovery.pending > 0) {
+      logger.warn(cancellationRecovery, "startup heartbeat cancellation reconciliation complete");
+    }
+  } catch (err) {
+    logger.error(
+      { err },
+      "startup heartbeat cancellation reconciliation failed - fenced runs will remain ineligible for execution",
+    );
+  }
 
   if (config.heartbeatSchedulerEnabled) {
-    const heartbeat = heartbeatService(db as any, { pluginWorkerManager });
-    drainHeartbeatRunsForShutdown = heartbeat.drainRunningRunsForShutdown;
-    prepareHotRestartShutdown = heartbeat.prepareHotRestartShutdown;
     const environmentCustomImages = environmentCustomImageService(db as any, { pluginWorkerManager });
     const routines = routineService(db as any, { pluginWorkerManager });
     const tools = toolAccessService(db as any, {
@@ -1198,7 +1222,16 @@ export async function startServer(): Promise<StartedServer> {
   });
   
   {
+    let shutdownStarted = false;
     const shutdown = async (signal: "SIGINT" | "SIGTERM") => {
+      if (shutdownStarted) return;
+      shutdownStarted = true;
+      suppressHeartbeatRunAdmissionForShutdown?.();
+      try {
+        server.close();
+      } catch (err) {
+        logger.warn({ err, signal }, "failed to close HTTP admission during shutdown");
+      }
       heartbeatSchedulerStopped = true;
       if (heartbeatSchedulerInterval) {
         clearInterval(heartbeatSchedulerInterval);
@@ -1209,12 +1242,13 @@ export async function startServer(): Promise<StartedServer> {
         signal,
         prepareHotRestartShutdown,
         waitForHeartbeatSchedulerIdle,
+        waitForHeartbeatRunAdmissionIdle: waitForHeartbeatRunAdmissionIdle ?? undefined,
       });
       const skipHeartbeatDrain = heartbeatShutdown.hotRestart?.skipDrain === true;
       if (skipHeartbeatDrain) {
         logger.info(
           { signal, hotRestart: heartbeatShutdown.hotRestart },
-          "hot-restart shutdown prepared; skipping heartbeat scheduler idle wait and graceful run drain",
+          "hot-restart shutdown prepared; skipping graceful run drain",
         );
       } else if (heartbeatShutdown.preparationError) {
         logger.error(
@@ -1230,12 +1264,18 @@ export async function startServer(): Promise<StartedServer> {
       }
 
       if (!skipHeartbeatDrain && drainHeartbeatRunsForShutdown) {
-        try {
-          const drain = await drainHeartbeatRunsForShutdown(signal);
-          logger.info({ signal, drain }, "graceful heartbeat run drain complete");
-        } catch (err) {
-          logger.error({ err, signal }, "graceful heartbeat run drain failed");
-        }
+        const drain = await drainHeartbeatRunsForSafeShutdown({
+          signal,
+          drain: drainHeartbeatRunsForShutdown,
+          onAttemptFailure: (err, attempt) => {
+            logger.error(
+              { err, signal, attempt },
+              "graceful heartbeat run drain remains unconfirmed; retaining process state and retrying",
+            );
+          },
+        });
+        logger.info({ signal, drain }, "graceful heartbeat run drain complete");
+        await drainHeartbeatRunExecutionsForShutdown?.();
       }
 
       const appShutdown = (app as { locals?: { paperclipShutdown?: () => void } }).locals?.paperclipShutdown;

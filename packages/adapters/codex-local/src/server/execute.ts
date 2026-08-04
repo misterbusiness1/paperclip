@@ -37,6 +37,8 @@ import {
   resolvePaperclipDesiredSkillNames,
   renderTemplate,
   renderPaperclipWakePrompt,
+  stopRunningProcessTransport,
+  type RunningProcessTransportStopEvidence,
   isPaperclipRecoveryWakePayload,
   stringifyPaperclipWakePayload,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
@@ -120,29 +122,6 @@ function firstNonEmptyLine(text: string): string {
       .map((line) => line.trim())
       .find(Boolean) ?? ""
   );
-}
-
-function signalCodexChild(
-  target: { pid: number | null; processGroupId: number | null },
-  signal: NodeJS.Signals,
-): boolean {
-  if (process.platform !== "win32" && target.processGroupId && target.processGroupId > 0) {
-    try {
-      process.kill(-target.processGroupId, signal);
-      return true;
-    } catch {
-      // Fall back to direct child signal if group signaling fails (e.g. group already gone).
-    }
-  }
-  if (target.pid && target.pid > 0) {
-    try {
-      process.kill(target.pid, signal);
-      return true;
-    } catch {
-      return false;
-    }
-  }
-  return false;
 }
 
 function hasNonEmptyEnvValue(env: Record<string, string>, key: string): boolean {
@@ -1044,9 +1023,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       let monitorTerminationSignal: NodeJS.Signals | null = null;
       let monitorElapsedMs = 0;
       let monitorTimeoutMs = 0;
-      let killTarget: { pid: number | null; processGroupId: number | null } | null = null;
-      let sigkillTimer: ReturnType<typeof setTimeout> | null = null;
+      let processSpawned = false;
       let monitorLogPromise: Promise<unknown> | null = null;
+      let monitorTransportStopPromise: Promise<RunningProcessTransportStopEvidence> | null = null;
 
       const monitor =
         monitorResolution.mode === "disabled"
@@ -1065,31 +1044,56 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
                   `timeoutMs=${monitorResolution.timeoutMs} elapsedSinceLastEventMs=${monitorElapsedMs} ` +
                   `outputChunkCount=${state.outputChunkCount} outputBytes=${state.outputBytes} ` +
                   `parsedEvents=${state.parsedEventCount} (timeout=${timeoutSecLabel}s elapsed=${elapsedSec}s); ` +
-                  `terminating codex child via SIGTERM (5s grace, then SIGKILL).\n`;
-                // Issue the log without awaiting on the kill hot path, but capture
+                  `requesting transport-aware termination (5s local grace where supported).\n`;
+                // Issue the log without awaiting on the termination hot path, but capture
                 // the promise so the surrounding try/finally can await flush before
                 // the run resolves. Without this the diagnostic that explains the
-                // kill could be dropped if the child exits faster than onLog flushes.
+                // stop could be dropped if the child exits faster than onLog flushes.
                 monitorLogPromise = Promise.resolve(onLog("stderr", logLine)).catch(() => {});
-                const target = killTarget;
-                if (!target || (target.pid == null && target.processGroupId == null)) {
-                  return;
-                }
-                const sentSig = signalCodexChild(target, "SIGTERM");
-                if (sentSig) monitorTerminationSignal = "SIGTERM";
-                sigkillTimer = setTimeout(() => {
-                  sigkillTimer = null;
-                  const stillSent = signalCodexChild(target, "SIGKILL");
-                  if (stillSent) monitorTerminationSignal = "SIGKILL";
-                }, CODEX_OUTPUT_INACTIVITY_MONITOR_SIGTERM_GRACE_MS);
-                if (typeof (sigkillTimer as { unref?: () => void }).unref === "function") {
-                  (sigkillTimer as { unref: () => void }).unref();
+                if (!processSpawned) return;
+                if (!monitorTransportStopPromise) {
+                  const stopPromise = stopRunningProcessTransport(runId, {
+                    localForceAfterMs: CODEX_OUTPUT_INACTIVITY_MONITOR_SIGTERM_GRACE_MS,
+                  }).then(async (evidence) => {
+                    if (evidence.handled) {
+                      // SSH termination evidence is authoritative because the
+                      // local ssh client may itself close on SIGTERM after the
+                      // remote group required SIGKILL. For a local process,
+                      // keep this unset and use proc.signal after it closes so
+                      // a grace-period escalation is reported accurately.
+                      if (evidence.remote) {
+                        if (evidence.remote.forceKilled) {
+                          monitorTerminationSignal = "SIGKILL";
+                        } else if (evidence.remote.termSent) {
+                          monitorTerminationSignal = "SIGTERM";
+                        }
+                      }
+                      return evidence;
+                    }
+
+                    // Provider/container PIDs are not host PIDs. Never pass
+                    // them to process.kill; leave the adapter pending behind
+                    // the provider timeout until providers expose a confirmed
+                    // termination control.
+                    await Promise.resolve(
+                      onLog(
+                        "stderr",
+                        "[paperclip] No registered transport termination control; waiting for provider timeout.\n",
+                      ),
+                    ).catch(() => undefined);
+                    return evidence;
+                  });
+                  monitorTransportStopPromise = stopPromise;
+                  // The run-attempt finally block awaits and propagates this
+                  // promise. Handle it now to avoid an interim unhandled
+                  // rejection if remote confirmation fails before child close.
+                  void stopPromise.catch(() => undefined);
                 }
               },
             });
 
       const wrappedOnSpawn = async (meta: { pid: number; processGroupId: number | null; startedAt: string }) => {
-        killTarget = { pid: meta.pid ?? null, processGroupId: meta.processGroupId };
+        processSpawned = true;
         if (onSpawn) {
           await onSpawn(meta);
         }
@@ -1117,6 +1121,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           runLogTail: paperclipBridge?.runLogTail,
           localProcessSandbox,
         });
+        // The stop evidence is part of the monitor result (for example, an
+        // SSH force-kill). Wait before shaping the result so it cannot capture
+        // stale signal metadata while the same promise is still in flight.
+        if (monitorTransportStopPromise) {
+          await monitorTransportStopPromise;
+        }
         const cleanedStderr = stripCodexRolloutNoise(proc.stderr);
         return {
           proc: {
@@ -1128,7 +1138,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           monitor: monitorFired
             ? {
                 fired: true as const,
-                terminationSignal: monitorTerminationSignal,
+                terminationSignal: monitorTerminationSignal ?? (proc.signal as NodeJS.Signals | null),
                 elapsedMsSinceLastEvent: monitorElapsedMs,
                 timeoutMs: monitorTimeoutMs,
               }
@@ -1136,13 +1146,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         };
       } finally {
         monitor?.stop();
-        if (sigkillTimer) {
-          clearTimeout(sigkillTimer);
-          sigkillTimer = null;
-        }
         if (monitorLogPromise) {
           await monitorLogPromise;
           monitorLogPromise = null;
+        }
+        if (monitorTransportStopPromise) {
+          await monitorTransportStopPromise;
+          monitorTransportStopPromise = null;
         }
       }
     };

@@ -64,6 +64,7 @@ import {
   type ToolRuntimeSlotView,
 } from "./tool-runtime-supervisor.js";
 import { recordToolRuntimeAuditWriteFailure } from "./tool-runtime-metrics.js";
+import { startTrackedRunMutation } from "./run-mutation-activity.js";
 import {
   canonicalToolArguments,
   readSignedToolArgumentsPayload,
@@ -90,6 +91,16 @@ const ACTIVE_GATEWAY_RUN_STATUSES = new Set(["running"]);
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 type McpGatewayProtocolMethod = "initialize" | "tools/list" | "tools/call";
+
+function isActiveGatewayRun(run: {
+  status: string;
+  cancellationRequestedAt: Date | null;
+  finishedAt: Date | null;
+}) {
+  return ACTIVE_GATEWAY_RUN_STATUSES.has(run.status)
+    && !run.cancellationRequestedAt
+    && !run.finishedAt;
+}
 type McpGatewayRateLimitConfig = { windowMs: number; max: number };
 type McpGatewayRateLimitState = { limited: boolean; count: number; retryAfterMs: number };
 type McpGatewayProtocolLimitOptions = {
@@ -1045,6 +1056,8 @@ export function createToolGatewayService(
         companyId: heartbeatRuns.companyId,
         agentId: heartbeatRuns.agentId,
         status: heartbeatRuns.status,
+        cancellationRequestedAt: heartbeatRuns.cancellationRequestedAt,
+        finishedAt: heartbeatRuns.finishedAt,
         contextSnapshot: heartbeatRuns.contextSnapshot,
       })
       .from(heartbeatRuns)
@@ -1057,7 +1070,7 @@ export function createToolGatewayService(
     if (run.agentId !== input.agentId) {
       throw new ToolGatewayHttpError(403, "Run does not belong to agent", "run_agent_mismatch");
     }
-    if (!ACTIVE_GATEWAY_RUN_STATUSES.has(run.status)) {
+    if (!isActiveGatewayRun(run)) {
       throw new ToolGatewayHttpError(403, "Run is not active", "run_inactive");
     }
 
@@ -1098,6 +1111,29 @@ export function createToolGatewayService(
       issueId,
       projectId,
     };
+  }
+
+  async function assertSessionRunCanDispatch(session: ToolGatewaySession) {
+    if (!session.runId) return;
+    if (!session.agentId) {
+      throw new ToolGatewayHttpError(403, "Run-bound tool dispatch requires an agent", "agent_context_required");
+    }
+    await resolveRunContext({
+      companyId: session.companyId,
+      agentId: session.agentId,
+      runId: session.runId,
+      issueId: session.issueId,
+      projectId: session.projectId,
+    });
+  }
+
+  function startSessionRunMutation<T>(session: ToolGatewaySession, start: () => Promise<T>): Promise<T> {
+    if (!session.runId) return start();
+    const tracked = startTrackedRunMutation(db, session.runId, start);
+    if (!tracked.admitted) {
+      throw new ToolGatewayHttpError(403, "Run is not active", "run_inactive");
+    }
+    return tracked.promise;
   }
 
   async function writeAudit(input: {
@@ -1226,6 +1262,8 @@ export function createToolGatewayService(
         companyId: heartbeatRuns.companyId,
         agentId: heartbeatRuns.agentId,
         status: heartbeatRuns.status,
+        cancellationRequestedAt: heartbeatRuns.cancellationRequestedAt,
+        finishedAt: heartbeatRuns.finishedAt,
       })
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.id, row.runId))
@@ -1234,7 +1272,7 @@ export function createToolGatewayService(
     if (!run
       || run.companyId !== row.companyId
       || run.agentId !== row.agentId
-      || !ACTIVE_GATEWAY_RUN_STATUSES.has(run.status)) {
+      || !isActiveGatewayRun(run)) {
       await writeSessionAuthFailure(row, "session_run_inactive", {
         runStatus: run?.status ?? null,
       });
@@ -3613,6 +3651,8 @@ export function createToolGatewayService(
           companyId: heartbeatRuns.companyId,
           agentId: heartbeatRuns.agentId,
           status: heartbeatRuns.status,
+          cancellationRequestedAt: heartbeatRuns.cancellationRequestedAt,
+          finishedAt: heartbeatRuns.finishedAt,
         })
         .from(heartbeatRuns)
         .where(eq(heartbeatRuns.id, tokenRunId))
@@ -3626,7 +3666,7 @@ export function createToolGatewayService(
           clientMetadata,
         });
       }
-      if (!ACTIVE_GATEWAY_RUN_STATUSES.has(run.status)) {
+      if (!isActiveGatewayRun(run)) {
         return recordNamedGatewayAuthFailure({
           gatewayId: input.gatewayId,
           gatewayPublicId: input.gatewayPublicId,
@@ -4049,6 +4089,20 @@ export function createToolGatewayService(
       : "tool_execution_failed";
     const message = input.error instanceof Error ? input.error.message : String(input.error);
     const now = new Date();
+    const [claimedFailure] = await db.update(toolActionRequests).set({
+      status: "failed",
+      resolvedAt: now,
+      updatedAt: now,
+    }).where(and(
+      eq(toolActionRequests.id, input.actionRequestId),
+      eq(toolActionRequests.status, "executing"),
+    )).returning({ id: toolActionRequests.id });
+    if (!claimedFailure) {
+      // Only the executor that won approved -> executing may publish a
+      // failure. A stale concurrent caller must never overwrite an already
+      // executed action or its succeeded invocation.
+      return { reasonCode, message, transitioned: false };
+    }
     await db.update(toolInvocations).set({
       status: "failed",
       errorCode: reasonCode,
@@ -4056,18 +4110,47 @@ export function createToolGatewayService(
       completedAt: now,
       updatedAt: now,
     }).where(eq(toolInvocations.id, input.invocationId));
-    await db.update(toolActionRequests).set({
-      status: "failed",
-      resolvedAt: now,
-      updatedAt: now,
-    }).where(eq(toolActionRequests.id, input.actionRequestId));
     await reflectToolActionInteractionLifecycle({
       actionRequestId: input.actionRequestId,
       status: "failed",
       errorCode: reasonCode,
       errorMessage: message,
     });
-    return { reasonCode, message };
+    return { reasonCode, message, transitioned: true };
+  }
+
+  async function assertApprovedInvocationOriginNotCancelled(input: {
+    invocation: typeof toolInvocations.$inferSelect;
+    actionRequestId: string;
+  }) {
+    const { invocation } = input;
+    if (!invocation.runId) return;
+    const [originRun] = await db
+      .select({
+        status: heartbeatRuns.status,
+        cancellationRequestedAt: heartbeatRuns.cancellationRequestedAt,
+        finishedAt: heartbeatRuns.finishedAt,
+      })
+      .from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.id, invocation.runId),
+        eq(heartbeatRuns.companyId, invocation.companyId),
+        eq(heartbeatRuns.agentId, invocation.agentId!),
+      ))
+      .limit(1);
+    if (originRun && isActiveGatewayRun(originRun)) return;
+
+    const error = new ToolGatewayHttpError(
+      409,
+      "Approved tool action cannot execute after its originating run was cancelled",
+      "action_origin_run_cancelled",
+    );
+    await markApprovedActionFailed({
+      actionRequestId: input.actionRequestId,
+      invocationId: invocation.id,
+      error,
+    });
+    throw error;
   }
 
   async function executeApprovedAgentInvocation(input: {
@@ -4184,6 +4267,10 @@ export function createToolGatewayService(
       sensitiveMode: "redact",
       promptInjectionMode: "ignore",
     }).summary;
+    await assertApprovedInvocationOriginNotCancelled({
+      invocation,
+      actionRequestId: claimed.id,
+    });
     const startedAt = Date.now();
     await db
       .update(toolInvocations)
@@ -4193,12 +4280,22 @@ export function createToolGatewayService(
 
     try {
       const executionTimeoutMs = timeoutMs(APPROVED_EXECUTION_TIMEOUT_MS);
+      await assertSessionRunCanDispatch(session);
       const result = tool.providerType === "mcp_remote_http"
-        ? (await executeRemoteHttpTool(session, tool, parameters, executionTimeoutMs, invocation.id)).result
+        ? (await startSessionRunMutation(
+            session,
+            () => executeRemoteHttpTool(session, tool, parameters, executionTimeoutMs, invocation.id),
+          )).result
         : tool.providerType === "mcp_local_stdio"
-          ? (await executeLocalStdioTool(session, tool, parameters, executionTimeoutMs)).result
+          ? (await startSessionRunMutation(
+              session,
+              () => executeLocalStdioTool(session, tool, parameters, executionTimeoutMs),
+            )).result
           : tool.providerType !== "paperclip_plugin"
-            ? await runWithTimeout(executeBuiltinTool(session, tool, parameters), executionTimeoutMs)
+            ? await runWithTimeout(
+                startSessionRunMutation(session, () => executeBuiltinTool(session, tool, parameters)),
+                executionTimeoutMs,
+              )
             : (() => { throw new ToolGatewayHttpError(409, "Plugin actions cannot execute outside their originating run", "approved_execution_unsupported"); })();
       const resultValidation = validateToolContent({
         value: result,
@@ -5733,33 +5830,53 @@ export function createToolGatewayService(
 
       try {
         const executionTimeoutMs = timeoutMs(input.timeoutMs);
+        await assertSessionRunCanDispatch(session);
         if (tool.providerType === "paperclip_plugin" && (!session.agentId || !session.runId)) {
           throw new ToolGatewayHttpError(403, "Plugin tools require an agent run context", "agent_context_required");
         }
         const connectedMcpExecution =
           tool.providerType === "mcp_remote_http"
-            ? await executeRemoteHttpTool(session, tool, effectiveParameters, executionTimeoutMs, invocationId, input.callerHeaders)
+            ? await startSessionRunMutation(
+                session,
+                () => executeRemoteHttpTool(
+                  session,
+                  tool,
+                  effectiveParameters,
+                  executionTimeoutMs,
+                  invocationId,
+                  input.callerHeaders,
+                ),
+              )
             : tool.providerType === "mcp_local_stdio"
-            ? await executeLocalStdioTool(session, tool, effectiveParameters, executionTimeoutMs)
+            ? await startSessionRunMutation(
+                session,
+                () => executeLocalStdioTool(session, tool, effectiveParameters, executionTimeoutMs),
+              )
             : null;
         const result =
           connectedMcpExecution
             ? connectedMcpExecution.result
             : tool.providerType === "paperclip_plugin"
             ? await runWithTimeout(
-                pluginToolDispatcher!.executeTool(
-                  tool.name,
-                  effectiveParameters,
-                  {
-                    agentId: session.agentId!,
-                    runId: session.runId!,
-                    companyId: session.companyId,
-                    projectId: session.projectId ?? "",
-                  },
+                startSessionRunMutation(
+                  session,
+                  () => pluginToolDispatcher!.executeTool(
+                    tool.name,
+                    effectiveParameters,
+                    {
+                      agentId: session.agentId!,
+                      runId: session.runId!,
+                      companyId: session.companyId,
+                      projectId: session.projectId ?? "",
+                    },
+                  ),
                 ),
                 executionTimeoutMs,
               )
-            : await runWithTimeout(executeBuiltinTool(session, tool, effectiveParameters), executionTimeoutMs);
+            : await runWithTimeout(
+                startSessionRunMutation(session, () => executeBuiltinTool(session, tool, effectiveParameters)),
+                executionTimeoutMs,
+              );
 
         const resultValidation = validateToolContent({
           value: result,
@@ -6052,7 +6169,11 @@ export function createToolGatewayService(
 
       const startedAt = Date.now();
       try {
-        const result = await pluginToolDispatcher.executeTool(input.tool, requestedParameters, input.runContext);
+        await assertSessionRunCanDispatch(sessionLike);
+        const result = await startSessionRunMutation(
+          sessionLike,
+          () => pluginToolDispatcher.executeTool(input.tool, requestedParameters, input.runContext),
+        );
         const resultValidation = validateToolContent({
           value: result,
           direction: "result",

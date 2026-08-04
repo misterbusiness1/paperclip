@@ -3,7 +3,12 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import {
+  buildSshSpawnTarget,
+  type SshProcessGroupTerminationEvidence,
+  type SshRemoteExecutionSpec,
+} from "./ssh.js";
 import {
   applyPaperclipWorkspaceEnv,
   appendWithByteCap,
@@ -11,20 +16,73 @@ import {
   buildRuntimeMountedSkillSnapshot,
   buildInvocationEnvForLogs,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
+  clearProcessCancellation,
   materializePaperclipSkillCopy,
   refreshPaperclipWorkspaceEnvForExecution,
+  requestProcessCancellation,
   renderPaperclipWakePrompt,
   runningProcesses,
   runChildProcess,
   sanitizeSshRemoteEnv,
   signalRunningProcess,
+  stopRunningProcessTransport,
   shapePaperclipWorkspaceEnvForExecution,
   rewriteWorkspaceCwdEnvVarsForExecution,
   stringifyPaperclipWakePayload,
   UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON,
   UNMANAGED_BACKGROUND_TASK_STOP_REASON,
+  UnconfirmedSshProcessTerminationError,
   WATCHDOG_DEFAULT_MANDATE,
 } from "./server-utils.js";
+
+vi.mock("./ssh.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./ssh.js")>();
+  return {
+    ...actual,
+    buildSshSpawnTarget: vi.fn(actual.buildSshSpawnTarget),
+  };
+});
+
+const mockBuildSshSpawnTarget = vi.mocked(buildSshSpawnTarget);
+
+const TEST_SSH_REMOTE_EXECUTION = {
+  host: "ssh.example.test",
+  port: 22,
+  username: "paperclip-test",
+  remoteCwd: "/tmp/paperclip-test",
+  remoteWorkspacePath: "/tmp/paperclip-test",
+  privateKey: null,
+  knownHosts: null,
+  strictHostKeyChecking: true,
+} satisfies SshRemoteExecutionSpec;
+
+const CONFIRMED_SSH_TERMINATION = {
+  kind: "process_group_termination",
+  scope: "ssh",
+  target: "group",
+  suspendSent: true,
+  termSent: true,
+  forceKilled: true,
+  confirmedExited: true,
+  outcome: "force_killed",
+} satisfies SshProcessGroupTerminationEvidence;
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
+
+async function createFakeSshPath() {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-fake-ssh-"));
+  await fs.symlink(process.execPath, path.join(directory, "ssh"));
+  return {
+    directory,
+    path: `${directory}${path.delimiter}${process.env.PATH ?? ""}`,
+  };
+}
 
 function isPidAlive(pid: number) {
   try {
@@ -442,6 +500,407 @@ describe("runChildProcess", () => {
     expect(finishedAt - startedAt).toBeGreaterThanOrEqual(spawnDelayMs);
   });
 
+  it("does not settle a closed child before process metadata persistence and propagates its failure", async () => {
+    let rejectPersistence!: (error: Error) => void;
+    const persistence = new Promise<void>((_resolve, reject) => {
+      rejectPersistence = reject;
+    });
+    const resultPromise = runChildProcess(
+      randomUUID(),
+      process.execPath,
+      ["-e", "process.exit(0)"],
+      {
+        cwd: process.cwd(),
+        env: {},
+        timeoutSec: 5,
+        graceSec: 1,
+        onLog: async () => {},
+        onLogError: () => {},
+        onSpawn: async () => await persistence,
+      },
+    );
+    let settled = false;
+    void resultPromise.then(
+      () => { settled = true; },
+      () => { settled = true; },
+    );
+
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(settled).toBe(false);
+
+    rejectPersistence(new Error("process metadata persistence failed"));
+    await expect(resultPromise).rejects.toThrow("process metadata persistence failed");
+  });
+
+  it("cancels a pending process start before the command can spawn", async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-cancel-before-spawn-"));
+    const markerPath = path.join(tempDir, "spawned");
+    const runId = randomUUID();
+    const resultPromise = runChildProcess(
+      runId,
+      process.execPath,
+      ["-e", `require("node:fs").writeFileSync(${JSON.stringify(markerPath)}, "spawned")`],
+      {
+        cwd: process.cwd(),
+        env: {},
+        timeoutSec: 5,
+        graceSec: 1,
+        onLog: async () => {},
+      },
+    );
+
+    try {
+      expect(requestProcessCancellation(runId)).toEqual({ pendingStartCancelled: true });
+      await expect(resultPromise).rejects.toThrow("Process start cancelled before spawn");
+      await expect(fs.access(markerPath)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      clearProcessCancellation(runId);
+      await resultPromise.catch(() => undefined);
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects concurrent process starts for the same run id", async () => {
+    const runId = randomUUID();
+    const first = runChildProcess(
+      runId,
+      process.execPath,
+      ["-e", "setInterval(() => {}, 1000)"],
+      {
+        cwd: process.cwd(),
+        env: {},
+        timeoutSec: 0,
+        graceSec: 1,
+        onLog: async () => {},
+      },
+    );
+
+    try {
+      await expect(
+        runChildProcess(
+          runId,
+          process.execPath,
+          ["-e", "process.stdout.write('duplicate')"],
+          {
+            cwd: process.cwd(),
+            env: {},
+            timeoutSec: 1,
+            graceSec: 1,
+            onLog: async () => {},
+          },
+        ),
+      ).rejects.toThrow("this run already has an active process");
+      await vi.waitFor(() => expect(runningProcesses.has(runId)).toBe(true));
+    } finally {
+      const running = runningProcesses.get(runId);
+      if (running) signalRunningProcess(running, "SIGKILL");
+      await first.catch(() => undefined);
+      runningProcesses.delete(runId);
+      clearProcessCancellation(runId);
+    }
+  });
+
+  it("does not send stdin when process metadata persistence is rejected", async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-rejected-spawn-metadata-"));
+    const markerPath = path.join(tempDir, "stdin-received");
+    try {
+      const result = runChildProcess(
+        randomUUID(),
+        process.execPath,
+        [
+          "-e",
+          `process.stdin.once('data', () => require('node:fs').writeFileSync(${JSON.stringify(markerPath)}, 'received')); setInterval(() => {}, 1000);`,
+        ],
+        {
+          cwd: process.cwd(),
+          env: {},
+          stdin: "must not be delivered",
+          timeoutSec: 1,
+          graceSec: 1,
+          onLog: async () => {},
+          onLogError: () => {},
+          onSpawn: async () => {
+            throw new Error("metadata fence rejected spawn");
+          },
+        },
+      );
+
+      await expect(result).rejects.toThrow("metadata fence rejected spawn");
+      await expect(fs.access(markerPath)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "keeps an SSH timeout pending until remote process-group termination is confirmed",
+    async () => {
+      const runId = randomUUID();
+      const fakeSsh = await createFakeSshPath();
+      const termination = deferred<SshProcessGroupTerminationEvidence>();
+      const terminateRemote = vi.fn(() => termination.promise);
+      mockBuildSshSpawnTarget.mockResolvedValueOnce({
+        command: process.execPath,
+        args: ["-e", "setTimeout(() => process.exit(0), 75)"],
+        cleanup: async () => {},
+        terminateRemote,
+      });
+      const resultPromise = runChildProcess(runId, "remote-command", [], {
+        cwd: process.cwd(),
+        env: { PATH: fakeSsh.path },
+        timeoutSec: 0.01,
+        graceSec: 1,
+        onLog: async () => {},
+        remoteExecution: TEST_SSH_REMOTE_EXECUTION,
+      });
+      let settled = false;
+      void resultPromise.then(
+        () => { settled = true; },
+        () => { settled = true; },
+      );
+
+      try {
+        await vi.waitFor(() => expect(terminateRemote).toHaveBeenCalledTimes(1));
+        expect(runningProcesses.has(runId)).toBe(true);
+        expect(settled).toBe(false);
+
+        termination.resolve(CONFIRMED_SSH_TERMINATION);
+        await expect(resultPromise).resolves.toMatchObject({ timedOut: true });
+        expect(runningProcesses.has(runId)).toBe(false);
+        expect(terminateRemote).toHaveBeenCalledTimes(1);
+      } finally {
+        termination.resolve(CONFIRMED_SSH_TERMINATION);
+        const running = runningProcesses.get(runId);
+        if (running) signalRunningProcess(running, "SIGKILL");
+        await resultPromise.catch(() => undefined);
+        clearProcessCancellation(runId);
+        await fs.rm(fakeSsh.directory, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "confirms the remote process group before settling an ordinary SSH client close",
+    async () => {
+      const runId = randomUUID();
+      const fakeSsh = await createFakeSshPath();
+      const termination = deferred<SshProcessGroupTerminationEvidence>();
+      const terminateRemote = vi.fn(() => termination.promise);
+      mockBuildSshSpawnTarget.mockResolvedValueOnce({
+        command: process.execPath,
+        args: ["-e", "process.exit(0)"],
+        cleanup: async () => {},
+        terminateRemote,
+      });
+
+      const resultPromise = runChildProcess(runId, "remote-command", [], {
+        cwd: process.cwd(),
+        env: { PATH: fakeSsh.path },
+        timeoutSec: 0,
+        graceSec: 1,
+        onLog: async () => {},
+        remoteExecution: TEST_SSH_REMOTE_EXECUTION,
+      });
+      let settled = false;
+      void resultPromise.then(
+        () => { settled = true; },
+        () => { settled = true; },
+      );
+
+      try {
+        await vi.waitFor(() => expect(terminateRemote).toHaveBeenCalledTimes(1));
+        expect(runningProcesses.has(runId)).toBe(true);
+        expect(settled).toBe(false);
+
+        termination.resolve(CONFIRMED_SSH_TERMINATION);
+        await expect(resultPromise).resolves.toMatchObject({ exitCode: 0, timedOut: false });
+        expect(runningProcesses.has(runId)).toBe(false);
+        expect(terminateRemote).toHaveBeenCalledTimes(1);
+      } finally {
+        termination.resolve(CONFIRMED_SSH_TERMINATION);
+        const running = runningProcesses.get(runId);
+        if (running) signalRunningProcess(running, "SIGKILL");
+        await resultPromise.catch(() => undefined);
+        clearProcessCancellation(runId);
+        await fs.rm(fakeSsh.directory, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "shares remote confirmation across per-run transport-stop callers",
+    async () => {
+      const runId = randomUUID();
+      const fakeSsh = await createFakeSshPath();
+      const termination = deferred<SshProcessGroupTerminationEvidence>();
+      const terminateRemote = vi.fn(() => termination.promise);
+      mockBuildSshSpawnTarget.mockResolvedValueOnce({
+        command: process.execPath,
+        args: ["-e", "setInterval(() => {}, 1000)"],
+        cleanup: async () => {},
+        terminateRemote,
+      });
+
+      const resultPromise = runChildProcess(runId, "remote-command", [], {
+        cwd: process.cwd(),
+        env: { PATH: fakeSsh.path },
+        timeoutSec: 0,
+        graceSec: 1,
+        onLog: async () => {},
+        remoteExecution: TEST_SSH_REMOTE_EXECUTION,
+      });
+
+      try {
+        await vi.waitFor(() => expect(runningProcesses.has(runId)).toBe(true));
+        const firstStop = stopRunningProcessTransport(runId);
+        const secondStop = stopRunningProcessTransport(runId);
+        await vi.waitFor(() => expect(terminateRemote).toHaveBeenCalledTimes(1));
+
+        termination.resolve(CONFIRMED_SSH_TERMINATION);
+        await expect(Promise.all([firstStop, secondStop])).resolves.toEqual([
+          {
+            kind: "process_transport_stop",
+            handled: true,
+            scope: "ssh",
+            remote: CONFIRMED_SSH_TERMINATION,
+          },
+          {
+            kind: "process_transport_stop",
+            handled: true,
+            scope: "ssh",
+            remote: CONFIRMED_SSH_TERMINATION,
+          },
+        ]);
+        await expect(resultPromise).resolves.toMatchObject({ signal: "SIGKILL" });
+        expect(terminateRemote).toHaveBeenCalledTimes(1);
+      } finally {
+        termination.resolve(CONFIRMED_SSH_TERMINATION);
+        const running = runningProcesses.get(runId);
+        if (running) signalRunningProcess(running, "SIGKILL");
+        await resultPromise.catch(() => undefined);
+        clearProcessCancellation(runId);
+        await fs.rm(fakeSsh.directory, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "keeps SSH terminal-result cleanup pending until remote process-group termination is confirmed",
+    async () => {
+      const runId = randomUUID();
+      const fakeSsh = await createFakeSshPath();
+      const termination = deferred<SshProcessGroupTerminationEvidence>();
+      const terminateRemote = vi.fn(() => termination.promise);
+      mockBuildSshSpawnTarget.mockResolvedValueOnce({
+        command: process.execPath,
+        args: [
+          "-e",
+          [
+            "process.stdout.write('terminal-result\\n');",
+            "setTimeout(() => process.exit(0), 250);",
+          ].join(" "),
+        ],
+        cleanup: async () => {},
+        terminateRemote,
+      });
+      let observed = "";
+      const hasTerminalResult = vi.fn(() => true);
+
+      const resultPromise = runChildProcess(runId, "remote-command", [], {
+        cwd: process.cwd(),
+        env: { PATH: fakeSsh.path },
+        timeoutSec: 0,
+        graceSec: 1,
+        onLog: async (_stream, chunk) => { observed += chunk; },
+        remoteExecution: TEST_SSH_REMOTE_EXECUTION,
+        terminalResultCleanup: {
+          graceMs: 0,
+          hasTerminalResult,
+        },
+      });
+      let settled = false;
+      void resultPromise.then(
+        () => { settled = true; },
+        () => { settled = true; },
+      );
+
+      try {
+        await vi.waitFor(() => expect(observed).toContain("terminal-result"));
+        expect(hasTerminalResult).toHaveBeenCalled();
+        await vi.waitFor(() => expect(terminateRemote).toHaveBeenCalledTimes(1));
+        expect(runningProcesses.has(runId)).toBe(true);
+        expect(settled).toBe(false);
+
+        termination.resolve(CONFIRMED_SSH_TERMINATION);
+        await expect(resultPromise).resolves.toMatchObject({
+          timedOut: false,
+          terminalResultCleanup: {
+            kind: "terminal_result_cleanup",
+            terminalResultSeen: true,
+            forceKilled: true,
+          },
+        });
+        expect(runningProcesses.has(runId)).toBe(false);
+        expect(terminateRemote).toHaveBeenCalledTimes(1);
+      } finally {
+        termination.resolve(CONFIRMED_SSH_TERMINATION);
+        const running = runningProcesses.get(runId);
+        if (running) signalRunningProcess(running, "SIGKILL");
+        await resultPromise.catch(() => undefined);
+        clearProcessCancellation(runId);
+        await fs.rm(fakeSsh.directory, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "rejects an SSH timeout with typed evidence when remote termination is unconfirmed",
+    async () => {
+      const runId = randomUUID();
+      const fakeSsh = await createFakeSshPath();
+      const unconfirmed = {
+        ...CONFIRMED_SSH_TERMINATION,
+        suspendSent: false,
+        termSent: false,
+        forceKilled: false,
+        confirmedExited: false,
+        outcome: "not_started",
+      } satisfies SshProcessGroupTerminationEvidence;
+      const terminateRemote = vi.fn(async () => unconfirmed);
+      mockBuildSshSpawnTarget.mockResolvedValueOnce({
+        command: process.execPath,
+        args: ["-e", "setTimeout(() => process.exit(0), 75)"],
+        cleanup: async () => {},
+        terminateRemote,
+      });
+
+      const resultPromise = runChildProcess(runId, "remote-command", [], {
+        cwd: process.cwd(),
+        env: { PATH: fakeSsh.path },
+        timeoutSec: 0.01,
+        graceSec: 1,
+        onLog: async () => {},
+        remoteExecution: TEST_SSH_REMOTE_EXECUTION,
+      });
+
+      try {
+        await expect(resultPromise).rejects.toMatchObject({
+          name: "UnconfirmedSshProcessTerminationError",
+          code: "ssh_process_termination_unconfirmed",
+          runId,
+          evidence: { confirmedExited: false, outcome: "not_started" },
+        });
+        await expect(resultPromise).rejects.toBeInstanceOf(UnconfirmedSshProcessTerminationError);
+      } finally {
+        const running = runningProcesses.get(runId);
+        if (running) signalRunningProcess(running, "SIGKILL");
+        await resultPromise.catch(() => undefined);
+        clearProcessCancellation(runId);
+        await fs.rm(fakeSsh.directory, { recursive: true, force: true });
+      }
+    },
+  );
+
   it.skipIf(process.platform === "win32")("kills descendant processes on timeout via the process group", async () => {
     let descendantPid: number | null = null;
 
@@ -475,14 +934,90 @@ describe("runChildProcess", () => {
   });
 
   it.skipIf(process.platform === "win32")(
-    "force-kills a child that ignores SIGTERM once the grace window elapses",
+    "prevents delayed SIGTERM-ignoring descendant writes after the direct child exits",
+    async () => {
+      const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-cancel-group-"));
+      const markerPath = path.join(tempDir, "late-write-marker");
+      const runId = randomUUID();
+      const descendantScript = [
+        "const fs = require('node:fs');",
+        "process.on('SIGTERM', () => {});",
+        `setTimeout(() => fs.writeFileSync(${JSON.stringify(markerPath)}, "late write"), 400);`,
+        "process.stdout.write('ready');",
+        "setInterval(() => {}, 1000);",
+      ].join(" ");
+      const parentScript = [
+        "const { spawn } = require('node:child_process');",
+        `const child = spawn(process.execPath, ["-e", ${JSON.stringify(descendantScript)}], { stdio: ["ignore", "pipe", "ignore"] });`,
+        "child.stdout.once('data', () => { process.stdout.write(`descendant:${child.pid}\\n`); setTimeout(() => process.exit(0), 25); });",
+      ].join(" ");
+      let observed = "";
+      let descendantPid: number | null = null;
+      let processGroupId: number | null = null;
+      const resultPromise = runChildProcess(
+        runId,
+        process.execPath,
+        ["-e", parentScript],
+        {
+          cwd: process.cwd(),
+          env: {},
+          timeoutSec: 0,
+          graceSec: 1,
+          onLog: async (_stream, chunk) => {
+            observed += chunk;
+            // Keep log persistence pending past the attempted delayed write.
+            // Group suspension must start at child close, before log drain.
+            await new Promise((resolve) => setTimeout(resolve, 600));
+          },
+          onSpawn: async (meta) => {
+            processGroupId = meta.processGroupId;
+          },
+        },
+      );
+
+      try {
+        const pidMatch = await waitForTextMatch(() => observed, /descendant:(\d+)/);
+        descendantPid = Number.parseInt(pidMatch?.[1] ?? "", 10);
+        expect(Number.isInteger(descendantPid) && descendantPid > 0).toBe(true);
+        expect(processGroupId).toBeTruthy();
+
+        await expect(resultPromise).resolves.toMatchObject({ exitCode: 0, signal: null });
+
+        expect(await waitForPidExit(descendantPid!, 2_000)).toBe(true);
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        await expect(fs.access(markerPath)).rejects.toMatchObject({ code: "ENOENT" });
+      } finally {
+        const running = runningProcesses.get(runId);
+        if (running) signalRunningProcess(running, "SIGKILL");
+        if (processGroupId) {
+          try {
+            process.kill(-processGroupId, "SIGKILL");
+          } catch {
+            /* already gone */
+          }
+        }
+        if (descendantPid && isPidAlive(descendantPid)) {
+          try {
+            process.kill(descendantPid, "SIGKILL");
+          } catch {
+            /* already gone */
+          }
+        }
+        await resultPromise.catch(() => undefined);
+        runningProcesses.delete(runId);
+        clearProcessCancellation(runId);
+        await fs.rm(tempDir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "force-kills a child that ignores SIGTERM",
     async () => {
       // Residual hang case: a child that installs a SIGTERM handler which
-      // swallows the signal and keeps running. The timeout sends SIGTERM at
-      // timeoutSec, then must escalate to SIGKILL graceSec later. If the
-      // escalation were gated on `child.killed` (which is true the instant
-      // SIGTERM is *sent*, not when the process exits) the SIGKILL would be
-      // suppressed and this child would outlive its deadline.
+      // swallows the signal and keeps running. The timeout must still freeze
+      // and escalate the group to SIGKILL; `child.killed` only means a signal
+      // was sent, not that the process exited.
       const result = await runChildProcess(
         randomUUID(),
         process.execPath,
@@ -631,14 +1166,15 @@ describe("runChildProcess", () => {
     );
 
     expect(result.timedOut).toBe(false);
-    expect(result.signal).toBe("SIGTERM");
+    expect(result.signal).toBe("SIGKILL");
     expect(result.terminalResultCleanup).toMatchObject({
       kind: "terminal_result_cleanup",
       stopped: true,
       stopReason: UNMANAGED_BACKGROUND_TASK_STOP_REASON,
       reason: UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON,
       terminalResultSeen: true,
-      signal: "SIGTERM",
+      signal: "SIGKILL",
+      forceKilled: true,
     });
     expect(result.stdout).toContain('"type":"result"');
   });

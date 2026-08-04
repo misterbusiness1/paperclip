@@ -1,4 +1,4 @@
-import { and, eq, inArray } from "drizzle-orm";
+import { and, eq, inArray, isNull } from "drizzle-orm";
 import { heartbeatRuns, type Db } from "@paperclipai/db";
 import {
   isResponsibleUserDenialCode,
@@ -29,6 +29,8 @@ export async function recordResponsibleUserDenialOnActiveRun(
   const conditions = [
     eq(heartbeatRuns.id, runId),
     inArray(heartbeatRuns.status, ["queued", "running"]),
+    isNull(heartbeatRuns.cancellationRequestedAt),
+    isNull(heartbeatRuns.finishedAt),
   ];
   if (input.agentId) conditions.push(eq(heartbeatRuns.agentId, input.agentId));
   if (input.companyId) conditions.push(eq(heartbeatRuns.companyId, input.companyId));

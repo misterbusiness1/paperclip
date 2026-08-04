@@ -62,6 +62,10 @@ vi.mock("../adapters/index.js", () => ({
     supportsLocalAgentJwt: false,
   }),
   listAdapterModelProfiles: async () => [],
+  requestProcessCancellation: () => ({ pendingStartCancelled: false }),
+  clearProcessCancellation: () => undefined,
+  getRemoteProcessTerminationControl: () => null,
+  clearRemoteProcessTerminationControl: () => undefined,
   runningProcesses: new Map(),
 }));
 

@@ -28,6 +28,10 @@ import {
 } from "../services/tool-gateway.js";
 import { canonicalToolArguments, signToolArguments } from "../services/tool-content-guards.js";
 import {
+  sealRunMutationActivity,
+  waitForRunMutationActivityToDrain,
+} from "../services/run-mutation-activity.js";
+import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
@@ -322,6 +326,97 @@ describeEmbeddedPostgres("tool gateway service", () => {
     });
     const [consumed] = await db.select().from(toolActionRequests);
     expect(consumed.status).toBe("executed");
+  });
+
+  it("fails an approved action without dispatch after its originating run is fenced", async () => {
+    const { company, agent, run } = await createRunFixture(db);
+    await db.insert(toolPolicies).values({
+      companyId: company.id,
+      name: "Review note writes",
+      policyType: "require_approval",
+      selectors: { toolName: "mcp-remote-fixture:update_note" },
+    });
+    const gateway = createTestToolGatewayService(db);
+    const session = await gateway.createSession({
+      companyId: company.id,
+      agentId: agent.id,
+      runId: run.id,
+    });
+
+    await expect(gateway.executeTool({
+      sessionToken: session.token,
+      tool: "mcp-remote-fixture:update_note",
+      parameters: { noteId: "n1", body: "must remain inert" },
+    })).rejects.toMatchObject({ reasonCode: "approval_required" });
+    const [actionRequest] = await db.select().from(toolActionRequests);
+    await db
+      .update(heartbeatRuns)
+      .set({ cancellationRequestedAt: new Date() })
+      .where(eq(heartbeatRuns.id, run.id));
+
+    const resolution = await gateway.approveActionRequest({
+      companyId: company.id,
+      actionRequestId: actionRequest.id,
+      actor: { userId: "board-user" },
+    });
+    expect(resolution.status).toBe("failed");
+
+    const [failedRequest] = await db.select().from(toolActionRequests);
+    const [failedInvocation] = await db.select().from(toolInvocations);
+    expect(failedRequest.status).toBe("failed");
+    expect(failedInvocation).toMatchObject({
+      status: "failed",
+      errorCode: "action_origin_run_cancelled",
+    });
+    const executedEvents = await db
+      .select()
+      .from(toolCallEvents)
+      .where(eq(toolCallEvents.reasonCode, "approved_action_executed"));
+    expect(executedEvents).toHaveLength(0);
+  });
+
+  it("fails an approved action without dispatch after its originating run finished normally", async () => {
+    const { company, agent, run } = await createRunFixture(db);
+    await db.insert(toolPolicies).values({
+      companyId: company.id,
+      name: "Review note writes",
+      policyType: "require_approval",
+      selectors: { toolName: "mcp-remote-fixture:update_note" },
+    });
+    const gateway = createTestToolGatewayService(db);
+    const session = await gateway.createSession({
+      companyId: company.id,
+      agentId: agent.id,
+      runId: run.id,
+    });
+
+    await expect(gateway.executeTool({
+      sessionToken: session.token,
+      tool: "mcp-remote-fixture:update_note",
+      parameters: { noteId: "n1", body: "must remain inert" },
+    })).rejects.toMatchObject({ reasonCode: "approval_required" });
+    const [actionRequest] = await db.select().from(toolActionRequests);
+    const finishedAt = new Date();
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "succeeded", finishedAt })
+      .where(eq(heartbeatRuns.id, run.id));
+
+    const resolution = await gateway.approveActionRequest({
+      companyId: company.id,
+      actionRequestId: actionRequest.id,
+      actor: { userId: "board-user" },
+    });
+    expect(resolution.status).toBe("failed");
+    const [failedInvocation] = await db.select().from(toolInvocations);
+    expect(failedInvocation).toMatchObject({
+      status: "failed",
+      errorCode: "action_origin_run_cancelled",
+    });
+    expect(await db
+      .select()
+      .from(toolCallEvents)
+      .where(eq(toolCallEvents.reasonCode, "approved_action_executed"))).toHaveLength(0);
   });
 
   it("refuses to approve an action request through a different interaction", async () => {
@@ -937,6 +1032,77 @@ describeEmbeddedPostgres("tool gateway service", () => {
       metadata: { findings: ["ignore_previous_instructions", "reveal_system_prompt"] },
     });
     expect(serialized).not.toContain(maliciousContent);
+  });
+
+  it("holds mutation activity until the raw plugin dispatcher settles after a caller timeout", async () => {
+    const { company, agent, run } = await createRunFixture(db);
+    let markStarted!: () => void;
+    const started = new Promise<void>((resolve) => { markStarted = resolve; });
+    let resolveDispatch!: (value: {
+      pluginId: string;
+      toolName: string;
+      result: { content: string; data: { ok: boolean } };
+    }) => void;
+    const rawDispatch = new Promise<{
+      pluginId: string;
+      toolName: string;
+      result: { content: string; data: { ok: boolean } };
+    }>((resolve) => { resolveDispatch = resolve; });
+    const gateway = createTestToolGatewayService(db, {
+      pluginToolDispatcher: {
+        initialize: async () => {},
+        teardown: () => {},
+        listToolsForAgent: () => [{
+          name: "fixture:read_status",
+          displayName: "Read status",
+          description: "Delayed read fixture.",
+          parametersSchema: { type: "object" },
+          pluginId: "fixture-plugin",
+        }],
+        getTool: () => null,
+        executeTool: () => {
+          markStarted();
+          return rawDispatch;
+        },
+        registerPluginTools: () => {},
+        unregisterPluginTools: () => {},
+        toolCount: () => 1,
+        getRegistry: () => { throw new Error("not implemented"); },
+      },
+    });
+    await db.insert(toolPolicies).values({
+      companyId: company.id,
+      name: "Allow delayed read fixture",
+      policyType: "allow",
+      selectors: { toolName: "fixture:read_status" },
+    });
+    const session = await gateway.createSession({
+      companyId: company.id,
+      agentId: agent.id,
+      runId: run.id,
+    });
+
+    const call = gateway.executeTool({
+      sessionToken: session.token,
+      tool: "fixture:read_status",
+      parameters: {},
+      timeoutMs: 1,
+    });
+    await started;
+    await expect(call).rejects.toMatchObject({ reasonCode: "tool_timeout" });
+    sealRunMutationActivity(db, run.id);
+    let drained = false;
+    const drain = waitForRunMutationActivityToDrain(db, run.id).then(() => { drained = true; });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(drained).toBe(false);
+
+    resolveDispatch({
+      pluginId: "fixture-plugin",
+      toolName: "read_status",
+      result: { content: "done", data: { ok: true } },
+    });
+    await drain;
+    expect(drained).toBe(true);
   });
 
   it("passes original sensitive arguments to plugin executors while redacting stored summaries", async () => {

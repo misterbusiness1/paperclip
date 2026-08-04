@@ -19,6 +19,12 @@ import { logger } from "./logger.js";
 import { boardAuthService } from "../services/board-auth.js";
 import { ensureHumanRoleDefaultGrants } from "../services/principal-access-compatibility.js";
 import { forbidden, unprocessable } from "../errors.js";
+import {
+  acquireRunMutationLease,
+  instrumentExpressRunMutationHandlers,
+  registerHttpRunMutation,
+  runWithRunMutationLease,
+} from "../services/run-mutation-activity.js";
 
 function hashToken(token: string) {
   return createHash("sha256").update(token).digest("hex");
@@ -28,13 +34,49 @@ function normalizeOptionalString(value: string | null | undefined) {
   return value?.trim() || null;
 }
 
-async function resolveLegacyRunResponsibleUserId(
+const NON_MUTATING_HTTP_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
+
+type AgentRunBinding = Pick<
+  typeof heartbeatRuns.$inferSelect,
+  | "id"
+  | "companyId"
+  | "agentId"
+  | "responsibleUserId"
+  | "status"
+  | "cancellationRequestedAt"
+  | "finishedAt"
+>;
+
+async function assertAgentRunBinding(
   db: Db,
-  input: { companyId: string; agentId: string; runId: string },
-) {
-  if (!isUuidLike(input.runId)) return null;
+  req: Request,
+  input: {
+    companyId: string;
+    agentId: string;
+    runId: string | null;
+    responsibleUserId?: string | null;
+  },
+): Promise<AgentRunBinding | null> {
+  const mutation = !NON_MUTATING_HTTP_METHODS.has(req.method.toUpperCase());
+  if (!input.runId) {
+    if (!mutation) return null;
+    throw forbidden("Agent run is not active", { code: "AGENT_RUN_NOT_ACTIVE" });
+  }
+
+  if (!isUuidLike(input.runId)) {
+    throw forbidden("Agent run is not active", { code: "AGENT_RUN_NOT_ACTIVE" });
+  }
+
   const run = await db
-    .select({ responsibleUserId: heartbeatRuns.responsibleUserId })
+    .select({
+      id: heartbeatRuns.id,
+      companyId: heartbeatRuns.companyId,
+      agentId: heartbeatRuns.agentId,
+      responsibleUserId: heartbeatRuns.responsibleUserId,
+      status: heartbeatRuns.status,
+      cancellationRequestedAt: heartbeatRuns.cancellationRequestedAt,
+      finishedAt: heartbeatRuns.finishedAt,
+    })
     .from(heartbeatRuns)
     .where(
       and(
@@ -44,7 +86,25 @@ async function resolveLegacyRunResponsibleUserId(
       ),
     )
     .then((rows) => rows[0] ?? null);
-  return normalizeOptionalString(run?.responsibleUserId);
+
+  const responsibleUserMatches = input.responsibleUserId === undefined
+    || normalizeOptionalString(run?.responsibleUserId) === normalizeOptionalString(input.responsibleUserId);
+  if (
+    !run
+    || run.id !== input.runId
+    || run.companyId !== input.companyId
+    || run.agentId !== input.agentId
+    || !responsibleUserMatches
+    || (mutation && (
+      (run.status !== "queued" && run.status !== "running")
+      || Boolean(run.cancellationRequestedAt)
+      || Boolean(run.finishedAt)
+    ))
+  ) {
+    throw forbidden("Agent run is not active", { code: "AGENT_RUN_NOT_ACTIVE" });
+  }
+
+  return run;
 }
 
 async function loadResponsibleUserMemberships(
@@ -139,7 +199,49 @@ interface ActorMiddlewareOptions {
 
 export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHandler {
   const boardAuth = boardAuthService(db);
-  return async (req, _res, next) => {
+  return async (req, res, next) => {
+    // Authentication can await several authoritative lookups. Observe an
+    // abnormal transport end before those awaits so a mutation lease admitted
+    // later cannot miss an already-fired close/abort event and dispatch work
+    // for a disconnected caller.
+    const mutationRequest = !NON_MUTATING_HTTP_METHODS.has(req.method.toUpperCase());
+    let mutationTransportSettled = false;
+    if (mutationRequest) {
+      const settleMutationTransport = () => {
+        mutationTransportSettled = true;
+      };
+      req.once("aborted", settleMutationTransport);
+      res.once("finish", settleMutationTransport);
+      res.once("close", settleMutationTransport);
+    }
+
+    const continueWithActor = (actor: Express.Request["actor"]) => {
+      const mutationRunId = actor.type === "agent"
+        && mutationRequest
+        ? normalizeOptionalString(actor.runId)
+        : null;
+      if (!mutationRunId) {
+        req.actor = actor;
+        next();
+        return;
+      }
+
+      const lease = acquireRunMutationLease(db, mutationRunId);
+      if (!lease) {
+        next(forbidden("Agent run is not active", { code: "AGENT_RUN_NOT_ACTIVE" }));
+        return;
+      }
+      instrumentExpressRunMutationHandlers(req.app);
+      registerHttpRunMutation(req, res, lease, mutationTransportSettled);
+      req.actor = actor;
+      try {
+        runWithRunMutationLease(db, lease, () => next());
+      } catch (error) {
+        lease.release();
+        next(error);
+      }
+    };
+
     req.actor =
       opts.deploymentMode === "local_trusted"
         ? {
@@ -298,19 +400,24 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
         return;
       }
 
+      const runBinding = await assertAgentRunBinding(db, req, {
+        companyId: claims.company_id,
+        agentId: claims.sub,
+        runId: claims.run_id,
+        responsibleUserId: claims.responsible_user_id === undefined
+          ? undefined
+          : normalizeOptionalString(claims.responsible_user_id),
+      });
+
       const onBehalfOfUserId = claims.responsible_user_id !== undefined
         ? normalizeOptionalString(claims.responsible_user_id)
-        : await resolveLegacyRunResponsibleUserId(db, {
-            companyId: claims.company_id,
-            agentId: claims.sub,
-            runId: claims.run_id,
-          });
+        : normalizeOptionalString(runBinding?.responsibleUserId);
       const onBehalfOfMemberships = await loadResponsibleUserMemberships(db, {
         companyId: claims.company_id,
         userId: onBehalfOfUserId,
       });
 
-      req.actor = {
+      continueWithActor({
         type: "agent",
         agentId: claims.sub,
         companyId: claims.company_id,
@@ -320,15 +427,9 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
         onBehalfOfUserId,
         onBehalfOfMemberships,
         source: "agent_jwt",
-      };
-      next();
+      });
       return;
     }
-
-    await db
-      .update(agentApiKeys)
-      .set({ lastUsedAt: new Date() })
-      .where(eq(agentApiKeys.id, key.id));
 
     const agentRecord = await db
       .select()
@@ -356,7 +457,27 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
       return;
     }
 
-    req.actor = {
+    const normalizedRunIdHeader = normalizeOptionalString(runIdHeader);
+    // Long-lived standard keys and tightly scoped task-bridge keys also serve
+    // documented, run-independent bootstrap/webhook flows. When a caller binds
+    // an API-key request to a run, enforce the same active fence as JWTs; an
+    // absent header remains explicitly run-independent and is still constrained
+    // by the key's normal route/scope authorization.
+    if (normalizedRunIdHeader) {
+      await assertAgentRunBinding(db, req, {
+        companyId: key.companyId,
+        agentId: key.agentId,
+        runId: normalizedRunIdHeader,
+        responsibleUserId,
+      });
+    }
+
+    await db
+      .update(agentApiKeys)
+      .set({ lastUsedAt: new Date() })
+      .where(eq(agentApiKeys.id, key.id));
+
+    continueWithActor({
       type: "agent",
       agentId: key.agentId,
       companyId: key.companyId,
@@ -367,11 +488,9 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
         companyId: key.companyId,
         userId: responsibleUserId,
       }),
-      runId: runIdHeader || undefined,
+      runId: normalizedRunIdHeader || undefined,
       source: "agent_key",
-    };
-
-    next();
+    });
   };
 }
 

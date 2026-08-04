@@ -24,7 +24,7 @@ import {
   type AdapterSandboxExecutionTarget,
 } from "./execution-target.js";
 import { createSandboxRunLogTailFactory } from "./sandbox-run-log-stream.js";
-import { runChildProcess } from "./server-utils.js";
+import { runChildProcess, type RunProcessResult } from "./server-utils.js";
 import { shellQuote } from "./ssh.js";
 
 const execFileAsync = promisify(execFile);
@@ -103,6 +103,24 @@ describe("sandbox adapter execution targets", () => {
       await new Promise((resolve) => setTimeout(resolve, 5));
     }
     throw new Error(message);
+  }
+
+  function isProcessGroupAlive(processGroupId: number): boolean {
+    try {
+      process.kill(-processGroupId, 0);
+      return true;
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code === "EPERM";
+    }
+  }
+
+  async function waitForProcessGroupExit(processGroupId: number, timeoutMs = 2_000): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (!isProcessGroupAlive(processGroupId)) return true;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    return !isProcessGroupAlive(processGroupId);
   }
 
   async function runProxyWithInput(command: string, input: string): Promise<{ stdout: string; stderr: string; code: number | null }> {
@@ -230,6 +248,8 @@ describe("sandbox adapter execution targets", () => {
       onLog: async () => {},
     });
     expect(bridge).not.toBeNull();
+    expect(bridge?.processGroupId).toBe(bridge?.pid);
+    expect(isProcessGroupAlive(bridge!.processGroupId)).toBe(true);
 
     try {
       const result = await runProxyWithInput(bridge!.agentCommand, "hello\n");
@@ -238,8 +258,88 @@ describe("sandbox adapter execution targets", () => {
       expect(result.stderr).toBe("err:hello\n");
     } finally {
       await bridge?.stop();
+      expect(await waitForProcessGroupExit(bridge!.processGroupId)).toBe(true);
     }
   });
+
+  it.skipIf(process.platform === "win32")(
+    "retries transient owned process-group stop failures for sandbox process sessions",
+    async () => {
+      const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-process-session-stop-retry-"));
+      cleanupDirs.push(rootDir);
+      const childPath = path.join(rootDir, "long-lived-acp-child.mjs");
+      await writeFile(childPath, "setInterval(() => {}, 1000);", "utf8");
+      const delegateRunner = createLocalSandboxRunner();
+      let managedStopAttempts = 0;
+      const runner = {
+        execute: async (input: Parameters<typeof delegateRunner.execute>[0]): Promise<RunProcessResult> => {
+          if (input.args?.[0] === "-e" && input.args[1]?.includes("posix_managed_process_group_stop")) {
+            managedStopAttempts += 1;
+            if (managedStopAttempts === 1) {
+              return {
+                exitCode: 125,
+                signal: null,
+                timedOut: false,
+                stdout: "",
+                stderr: "transient process-session stop failure",
+                pid: null,
+                startedAt: new Date().toISOString(),
+              };
+            }
+            if (managedStopAttempts === 2) {
+              return {
+                exitCode: 125,
+                signal: null,
+                timedOut: false,
+                stdout: "",
+                stderr: "kill EPERM",
+                pid: null,
+                startedAt: new Date().toISOString(),
+              };
+            }
+          }
+          return await delegateRunner.execute(input);
+        },
+      };
+      const target: AdapterSandboxExecutionTarget = {
+        kind: "remote",
+        transport: "sandbox",
+        providerKey: "local-test",
+        remoteCwd: rootDir,
+        timeoutMs: 30_000,
+        runner,
+      };
+      const bridge = await startAdapterExecutionTargetProcessSessionBridge({
+        runId: "run-process-session-stop-retry",
+        target,
+        runtimeRootDir: path.posix.join(rootDir, ".paperclip-runtime", "acpx"),
+        adapterKey: "acpx",
+        command: process.execPath,
+        args: [childPath],
+        cwd: rootDir,
+        env: {},
+        timeoutSec: 5,
+        onLog: async () => {},
+      });
+      expect(bridge).not.toBeNull();
+
+      try {
+        await expect(bridge!.stop()).rejects.toThrow("transient process-session stop failure");
+        expect(isProcessGroupAlive(bridge!.processGroupId)).toBe(true);
+        await expect(bridge!.stop()).resolves.toBeUndefined();
+        expect(managedStopAttempts).toBe(3);
+        expect(await waitForProcessGroupExit(bridge!.processGroupId)).toBe(true);
+      } finally {
+        if (isProcessGroupAlive(bridge!.processGroupId)) {
+          try {
+            process.kill(-bridge!.processGroupId, "SIGKILL");
+          } catch {
+            /* already gone */
+          }
+        }
+      }
+    },
+  );
 
   it("buffers sandbox process session output until the local proxy connects", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-process-session-buffer-"));

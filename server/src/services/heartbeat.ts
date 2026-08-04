@@ -3,7 +3,7 @@ import path from "node:path";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 import { createHash, randomUUID } from "node:crypto";
-import { and, asc, desc, eq, getTableColumns, gt, gte, inArray, isNull, lt, lte, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, getTableColumns, gt, gte, inArray, isNotNull, isNull, lt, lte, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
@@ -72,7 +72,15 @@ import { logger } from "../middleware/logger.js";
 import { publishLiveEvent } from "./live-events.js";
 import { normalizeResponsibleUserDenialCode } from "./responsible-user-denial-run-outcomes.js";
 import { getRunLogStore, type RunLogHandle } from "./run-log-store.js";
-import { getServerAdapter, listAdapterModelProfiles, runningProcesses } from "../adapters/index.js";
+import {
+  clearProcessCancellation,
+  clearRemoteProcessTerminationControl,
+  getServerAdapter,
+  getRemoteProcessTerminationControl,
+  listAdapterModelProfiles,
+  requestProcessCancellation,
+  runningProcesses,
+} from "../adapters/index.js";
 import type {
   AdapterExecutionResult,
   AdapterInvocationMeta,
@@ -84,8 +92,20 @@ import type {
   UsageSummary,
 } from "../adapters/index.js";
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
-import { parseObject, asBoolean, asNumber, appendWithByteCap, MAX_EXCERPT_BYTES } from "../adapters/utils.js";
+import {
+  parseObject,
+  asBoolean,
+  asNumber,
+  appendWithByteCap,
+  MAX_EXCERPT_BYTES,
+  isTrackedLocalChildProcessAdapter,
+} from "../adapters/utils.js";
 import { costService } from "./costs.js";
+import {
+  getCurrentRunMutationLease,
+  sealRunMutationActivity,
+  waitForRunMutationActivityToDrain,
+} from "./run-mutation-activity.js";
 import { trackAgentFirstHeartbeat } from "@paperclipai/shared/telemetry";
 import { getTelemetryClient } from "../telemetry.js";
 import { companySkillService } from "./company-skills.js";
@@ -156,7 +176,12 @@ import {
 import { buildPlanReviewContext } from "./plan-review-context.js";
 import { executionWorkspaceService, mergeExecutionWorkspaceConfig } from "./execution-workspaces.js";
 import { workspaceOperationService, type WorkspaceOperationRecorder } from "./workspace-operations.js";
-import { isProcessGroupAlive, terminateLocalService } from "./local-service-supervisor.js";
+import {
+  isProcessGroupAlive,
+  terminateLocalService,
+  type LocalServiceTerminationEvidence,
+} from "./local-service-supervisor.js";
+import type { SshProcessGroupTerminationEvidence } from "@paperclipai/adapter-utils/ssh";
 import {
   HEARTBEAT_RUN_SCRATCH_MARKER,
   buildHeartbeatRunScratchEnv,
@@ -237,6 +262,8 @@ import {
 } from "@paperclipai/adapter-utils";
 import {
   readPaperclipSkillSyncPreference,
+  UnconfirmedLocalProcessTerminationError,
+  UnconfirmedSshProcessTerminationError,
   UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON,
   UNMANAGED_BACKGROUND_TASK_STOP_REASON,
   writePaperclipSkillSyncPreference,
@@ -407,6 +434,13 @@ export class ConfigurationIncompleteFailure extends Error {
   }
 }
 
+class HeartbeatCancellationFenceObservedError extends Error {
+  constructor() {
+    super("Heartbeat cancellation fence observed after adapter execution");
+    this.name = "HeartbeatCancellationFenceObservedError";
+  }
+}
+
 function resolveCodexTransientFallbackMode(attempt: number): CodexTransientFallbackMode {
   if (attempt <= 1) return "same_session";
   if (attempt === 2) return "safer_invocation";
@@ -542,15 +576,6 @@ const ISSUE_RESPONSIBLE_USER_WAKE_REASONS = new Set([
   "execution_changes_requested",
   "approval_approved",
 ]);
-const SESSIONED_LOCAL_ADAPTERS = new Set([
-  "claude_local",
-  "codex_local",
-  "cursor",
-  "gemini_local",
-  "hermes_local",
-  "opencode_local",
-  "pi_local",
-]);
 // Routes and the scheduler construct separate heartbeatService instances, but
 // they must agree on in-process adapter executions when reaping stale runs.
 const activeRunExecutions = new Set<string>();
@@ -561,6 +586,24 @@ const activeRunExecutions = new Set<string>();
 // that must guarantee no run write is still in flight (graceful shutdown, and
 // tests tearing down a shared database) can await drainActiveRunExecutions().
 const activeRunExecutionPromises = new Set<Promise<void>>();
+const activeRunExecutionPromisesByRun = new Map<string, Promise<void>>();
+type HeartbeatRunAdmissionState = {
+  shutdownSuppressed: boolean;
+  inFlight: Set<Promise<unknown>>;
+};
+const heartbeatRunAdmissionStates = new WeakMap<object, HeartbeatRunAdmissionState>();
+
+function getHeartbeatRunAdmissionState(db: Db): HeartbeatRunAdmissionState {
+  const key = db as object;
+  const existing = heartbeatRunAdmissionStates.get(key);
+  if (existing) return existing;
+  const created: HeartbeatRunAdmissionState = {
+    shutdownSuppressed: false,
+    inFlight: new Set(),
+  };
+  heartbeatRunAdmissionStates.set(key, created);
+  return created;
+}
 const INLINE_BASE64_IMAGE_DATA_RE = /("type":"image","source":\{"type":"base64","data":")([A-Za-z0-9+/=]{1024,})(")/g;
 
 type RuntimeConfigSecretResolver = Pick<
@@ -1765,6 +1808,7 @@ const heartbeatRunListColumns = {
   triggerDetail: heartbeatRuns.triggerDetail,
   status: heartbeatRuns.status,
   startedAt: heartbeatRuns.startedAt,
+  cancellationRequestedAt: heartbeatRuns.cancellationRequestedAt,
   finishedAt: heartbeatRuns.finishedAt,
   error: heartbeatRuns.error,
   wakeupRequestId: heartbeatRuns.wakeupRequestId,
@@ -1914,6 +1958,7 @@ const heartbeatRunIssueSummaryColumns = {
   contextCommentId: sql<string | null>`${heartbeatRuns.contextSnapshot} ->> 'commentId'`.as("contextCommentId"),
   contextWakeCommentId: sql<string | null>`${heartbeatRuns.contextSnapshot} ->> 'wakeCommentId'`.as("contextWakeCommentId"),
   startedAt: heartbeatRuns.startedAt,
+  cancellationRequestedAt: heartbeatRuns.cancellationRequestedAt,
   finishedAt: heartbeatRuns.finishedAt,
   createdAt: heartbeatRuns.createdAt,
   agentId: heartbeatRuns.agentId,
@@ -4701,10 +4746,6 @@ function isSameTaskScope(left: string | null, right: string | null) {
   return (left ?? null) === (right ?? null);
 }
 
-function isTrackedLocalChildProcessAdapter(adapterType: string) {
-  return SESSIONED_LOCAL_ADAPTERS.has(adapterType);
-}
-
 function isHeartbeatRunTerminalStatus(
   status: string | null | undefined,
 ): status is (typeof HEARTBEAT_RUN_TERMINAL_STATUSES)[number] {
@@ -5069,24 +5110,187 @@ async function terminateHeartbeatRunProcess(input: {
   pid: number | null | undefined;
   processGroupId: number | null | undefined;
   graceMs?: number;
-}) {
+  suspendBeforeTerminate?: boolean;
+  confirmationTimeoutMs?: number;
+}): Promise<LocalServiceTerminationEvidence | null> {
   const pid = input.pid ?? null;
   const processGroupId = input.processGroupId ?? null;
-  if (typeof pid !== "number" && typeof processGroupId !== "number") return;
+  const validPid = typeof pid === "number" && Number.isInteger(pid) && pid > 1 ? pid : null;
+  const validProcessGroupId =
+    typeof processGroupId === "number" && Number.isInteger(processGroupId) && processGroupId > 1
+      ? processGroupId
+      : null;
+  if (validPid === null && validProcessGroupId === null) return null;
 
-  await terminateLocalService(
+  return await terminateLocalService(
     {
-      pid:
-        typeof pid === "number" && Number.isInteger(pid) && pid > 0
-          ? pid
-          : (processGroupId ?? 0),
-      processGroupId:
-        typeof processGroupId === "number" && Number.isInteger(processGroupId) && processGroupId > 0
-          ? processGroupId
-          : null,
+      pid: validPid ?? validProcessGroupId!,
+      processGroupId: validProcessGroupId,
     },
-    input.graceMs ? { forceAfterMs: input.graceMs } : undefined,
+    {
+      ...(input.graceMs ? { forceAfterMs: input.graceMs } : {}),
+      suspendBeforeTerminate: input.suspendBeforeTerminate,
+      confirmationTimeoutMs: input.confirmationTimeoutMs,
+    },
   );
+}
+
+type HeartbeatRunCancellationTerminationEvidence = {
+  pendingStartCancelled: boolean;
+  remoteControlAvailable: boolean;
+  local: LocalServiceTerminationEvidence | null;
+  remote: SshProcessGroupTerminationEvidence | null;
+};
+
+type CancellationPostTerminalWork = {
+  run: typeof heartbeatRuns.$inferSelect;
+  reason: string;
+  finishedAt: Date;
+  cancellationEvidence: {
+    requestedAt: string;
+    confirmedAt: string;
+    pendingStartCancelled: boolean;
+    executionDrained: boolean;
+    processTermination: {
+      local: LocalServiceTerminationEvidence | null;
+      remote: SshProcessGroupTerminationEvidence | null;
+    };
+  };
+  eventMessage: string;
+  eventPayload: Record<string, unknown>;
+  skipPostCancelAgentWork: boolean;
+  inFlight?: Promise<typeof heartbeatRuns.$inferSelect> | null;
+  phase:
+    | "publish_terminal"
+    | "update_wakeup"
+    | "append_event"
+    | "release_environment"
+    | "release_issue"
+    | "finalize_agent"
+    | "start_next"
+    | "complete";
+};
+
+const cancellationPostTerminalWorkByDb = new WeakMap<object, Map<string, CancellationPostTerminalWork>>();
+
+function cancellationPostTerminalWorkForDb(db: Db) {
+  const key = db as object;
+  let states = cancellationPostTerminalWorkByDb.get(key);
+  if (!states) {
+    states = new Map();
+    cancellationPostTerminalWorkByDb.set(key, states);
+  }
+  return states;
+}
+
+class UnconfirmedHeartbeatProcessTerminationError extends Error {
+  readonly code: "local_process_termination_unconfirmed" | "ssh_process_termination_unconfirmed";
+  readonly scope: "local" | "ssh";
+  readonly evidence: LocalServiceTerminationEvidence | SshProcessGroupTerminationEvidence | null;
+  readonly processPid!: number | null;
+  readonly processGroupId!: number | null;
+
+  constructor(input: {
+    scope: "local" | "ssh";
+    evidence: LocalServiceTerminationEvidence | SshProcessGroupTerminationEvidence | null;
+    processPid?: number | null;
+    processGroupId?: number | null;
+  }) {
+    super(input.scope === "local"
+      ? "Local process-group termination could not be confirmed"
+      : "SSH remote process-group termination could not be confirmed");
+    this.name = "UnconfirmedHeartbeatProcessTerminationError";
+    this.code = input.scope === "local"
+      ? "local_process_termination_unconfirmed"
+      : "ssh_process_termination_unconfirmed";
+    this.scope = input.scope;
+    this.evidence = input.evidence;
+    const processPid = typeof input.processPid === "number" && Number.isInteger(input.processPid) && input.processPid > 1
+      ? input.processPid
+      : null;
+    const processGroupId =
+      typeof input.processGroupId === "number" && Number.isInteger(input.processGroupId) && input.processGroupId > 1
+        ? input.processGroupId
+        : null;
+    // These identifiers are needed only for an internal retry and are omitted
+    // from structured error serialization/logging.
+    Object.defineProperties(this, {
+      processPid: { value: processPid, enumerable: false },
+      processGroupId: { value: processGroupId, enumerable: false },
+    });
+  }
+}
+
+async function terminateHeartbeatRunProcessForCancellation(input: {
+  run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "processPid" | "processGroupId">;
+  confirmationTimeoutMs?: number;
+  cancellationRequest?: { pendingStartCancelled: boolean };
+  executionDriver?: string | null;
+}): Promise<HeartbeatRunCancellationTerminationEvidence> {
+  const pending = requestProcessCancellation(input.run.id);
+  const running = runningProcesses.get(input.run.id);
+  const remoteControl = running?.terminateRemote ?? getRemoteProcessTerminationControl(input.run.id);
+  let remote: SshProcessGroupTerminationEvidence | null = null;
+  let remoteError: unknown = null;
+
+  if (remoteControl) {
+    try {
+      remote = await remoteControl({ confirmationTimeoutMs: input.confirmationTimeoutMs });
+    } catch (error) {
+      remoteError = error;
+    }
+  }
+
+  const local = running && (remoteControl || input.executionDriver === "local")
+    ? await terminateHeartbeatRunProcess({
+        pid: running.child.pid ?? input.run.processPid,
+        processGroupId: running.processGroupId ?? input.run.processGroupId,
+        graceMs: Math.max(1, running.graceSec) * 1000,
+        suspendBeforeTerminate: true,
+        confirmationTimeoutMs: input.confirmationTimeoutMs,
+      })
+    : input.executionDriver === "local" && (input.run.processPid || input.run.processGroupId)
+      ? await terminateHeartbeatRunProcess({
+          pid: input.run.processPid,
+          processGroupId: input.run.processGroupId,
+          suspendBeforeTerminate: true,
+          confirmationTimeoutMs: input.confirmationTimeoutMs,
+        })
+      : null;
+
+  if (remoteControl && (!remote?.confirmedExited || remoteError)) {
+    try {
+      remote = await remoteControl({ confirmationTimeoutMs: input.confirmationTimeoutMs });
+      remoteError = null;
+    } catch (error) {
+      remoteError = error;
+    }
+  }
+
+  if (local && !local.confirmedExited) {
+    throw new UnconfirmedHeartbeatProcessTerminationError({
+      scope: "local",
+      evidence: local,
+      processPid: running?.child.pid ?? input.run.processPid,
+      processGroupId: running?.processGroupId ?? input.run.processGroupId,
+    });
+  }
+  if (remoteControl && (remoteError || !remote?.confirmedExited)) {
+    throw new UnconfirmedHeartbeatProcessTerminationError({
+      scope: "ssh",
+      evidence: remote,
+    });
+  }
+
+  runningProcesses.delete(input.run.id);
+  return {
+    pendingStartCancelled:
+      input.cancellationRequest?.pendingStartCancelled === true
+      || pending.pendingStartCancelled,
+    remoteControlAvailable: Boolean(remoteControl),
+    local,
+    remote,
+  };
 }
 
 function buildProcessLossMessage(run: {
@@ -5402,6 +5606,37 @@ export function resolveHeartbeatSchedulingSuppression(
 }
 
 export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) {
+  const runAdmissionState = getHeartbeatRunAdmissionState(db);
+  const shutdownOwnedRunIds = new Set<string>();
+  const cancellationPostTerminalWorkByRunId = cancellationPostTerminalWorkForDb(db);
+  type ShutdownPostTerminalWork = {
+    run: typeof heartbeatRuns.$inferSelect;
+    agent: typeof agents.$inferSelect;
+    confirmedAt: Date;
+    message: string;
+    shutdownTermination: {
+      requestedAt: string;
+      confirmedAt: string;
+      pendingStartCancelled: boolean;
+      executionDrained: boolean;
+      processTermination: {
+        local: LocalServiceTerminationEvidence | null;
+        remote: SshProcessGroupTerminationEvidence | null;
+      };
+    };
+    phase:
+      | "publish_terminal"
+      | "update_wakeup"
+      | "classify"
+      | "release_environment"
+      | "enqueue_retry"
+      | "release_issue"
+      | "append_event"
+      | "finalize_agent";
+    classifiedRun: typeof heartbeatRuns.$inferSelect | null;
+    retryRun: typeof heartbeatRuns.$inferSelect | null | undefined;
+  };
+  const shutdownPostTerminalWorkByRunId = new Map<string, ShutdownPostTerminalWork>();
   const instanceSettings = instanceSettingsService(db);
   const getCurrentUserRedactionOptions = async () => ({
     enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
@@ -5444,11 +5679,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return cachedWorktreeRunExecutionOverride;
   };
   const getSchedulingSuppression = async () => {
+    if (runAdmissionState.shutdownSuppressed) {
+      return { suppressed: true as const, reason: "server_shutdown" as const };
+    }
     const override = await resolveWorktreeRunExecutionOverride();
     return resolveHeartbeatSchedulingSuppression(runtimeEnv, {
       allowWorktreeRunExecution: override.allowed,
     });
   };
+
+  function suppressRunAdmissionForShutdown() {
+    runAdmissionState.shutdownSuppressed = true;
+  }
+
+  async function waitForRunAdmissionIdle() {
+    while (runAdmissionState.inFlight.size > 0) {
+      await Promise.allSettled([...runAdmissionState.inFlight]);
+    }
+  }
   const getWorktreeExecutionCutoff = async () => {
     const override = await resolveWorktreeRunExecutionOverride();
     return override.allowed ? override.cutoff : null;
@@ -5478,7 +5726,35 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     cancelWorkForScope: cancelBudgetScopeWork,
   };
   const budgets = budgetService(db, budgetHooks);
-  const recovery = recoveryService(db, { enqueueWakeup });
+  const recovery = recoveryService(db, {
+    enqueueWakeup,
+    waitForRunExecutionDrain,
+    releaseTerminalRunResources: async (run) => {
+      await revokeHeartbeatRunGatewayTokens({
+        db,
+        companyId: run.companyId,
+        runId: run.id,
+      }).catch(() => {
+        logger.warn(
+          { runId: run.id },
+          "failed to revoke gateway tokens for source-resolved watchdog run",
+        );
+      });
+      await releaseEnvironmentLeasesForRun({
+        runId: run.id,
+        companyId: run.companyId,
+        agentId: run.agentId,
+        status: run.status,
+        failureReason: run.error ?? undefined,
+      });
+      await releaseRuntimeServicesForRun(run.id).catch(() => {
+        logger.warn(
+          { runId: run.id },
+          "failed to release runtime services for source-resolved watchdog run",
+        );
+      });
+    },
+  });
 
   function isPlanApprovalConfirmationPayload(payload: unknown) {
     const target = parseObject(parseObject(payload).target);
@@ -7557,16 +7833,28 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     status: string,
     patch?: Partial<typeof heartbeatRuns.$inferInsert>,
   ) {
+    const terminal = isHeartbeatRunTerminalStatus(status);
+    if (terminal) {
+      sealRunMutationActivity(db, runId);
+      await waitForRunMutationActivityToDrain(db, runId);
+    }
     const updated = await db
       .update(heartbeatRuns)
       .set({ status, ...patch, updatedAt: new Date() })
-      .where(eq(heartbeatRuns.id, runId))
+      .where(terminal
+        ? and(
+            eq(heartbeatRuns.id, runId),
+            isNull(heartbeatRuns.cancellationRequestedAt),
+            isNull(heartbeatRuns.finishedAt),
+          )
+        : eq(heartbeatRuns.id, runId))
       .returning()
       .then((rows) => rows[0] ?? null);
 
     if (updated) {
       if (isHeartbeatRunTerminalStatus(updated.status)) {
         clearHeartbeatRunRuntimeStatus(updated.id);
+        clearRemoteProcessTerminationControl(updated.id);
       }
       publishLiveEvent({
         companyId: updated.companyId,
@@ -7594,16 +7882,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     status: string,
     patch?: Partial<typeof heartbeatRuns.$inferInsert>,
   ) {
+    if (isHeartbeatRunTerminalStatus(status)) {
+      sealRunMutationActivity(db, runId);
+      await waitForRunMutationActivityToDrain(db, runId);
+    }
     const updated = await db
       .update(heartbeatRuns)
       .set({ status, ...patch, updatedAt: new Date() })
-      .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.status, "running")))
+      .where(and(
+        eq(heartbeatRuns.id, runId),
+        eq(heartbeatRuns.status, "running"),
+        isNull(heartbeatRuns.cancellationRequestedAt),
+        isNull(heartbeatRuns.finishedAt),
+      ))
       .returning()
       .then((rows) => rows[0] ?? null);
 
     if (updated) {
       if (isHeartbeatRunTerminalStatus(updated.status)) {
         clearHeartbeatRunRuntimeStatus(updated.id);
+        clearRemoteProcessTerminationControl(updated.id);
       }
       publishLiveEvent({
         companyId: updated.companyId,
@@ -8274,7 +8572,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         processStartedAt: Number.isNaN(startedAt.getTime()) ? new Date() : startedAt,
         updatedAt: new Date(),
       })
-      .where(eq(heartbeatRuns.id, runId))
+      .where(and(
+        eq(heartbeatRuns.id, runId),
+        eq(heartbeatRuns.status, "running"),
+        isNull(heartbeatRuns.cancellationRequestedAt),
+      ))
       .returning()
       .then((rows) => rows[0] ?? null);
   }
@@ -8801,6 +9103,51 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .from(heartbeatRuns)
       .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
       .where(eq(heartbeatRuns.status, "running"));
+    const nonAdoptableRunIds = activeRuns
+      .filter(({ run, adapterType }) => {
+        const environment = parseObject(parseObject(run.contextSnapshot).paperclipEnvironment);
+        const running = runningProcesses.get(run.id);
+        const remoteControl = running?.terminateRemote ?? getRemoteProcessTerminationControl(run.id);
+        // Live transport control is stronger evidence than a stale or missing
+        // context snapshot. SSH workloads cannot be adopted by the local
+        // hot-restart path and must go through confirmed graceful drain.
+        const driver = remoteControl ? "ssh" : readNonEmptyString(environment.driver);
+        const processPid =
+          typeof run.processPid === "number" && Number.isInteger(run.processPid) && run.processPid > 1
+            ? run.processPid
+            : null;
+        const processGroupId =
+          typeof run.processGroupId === "number" && Number.isInteger(run.processGroupId) && run.processGroupId > 1
+            ? run.processGroupId
+            : null;
+        const hasAdoptableProcessIdentity = process.platform === "win32"
+          ? processPid !== null
+          : processGroupId !== null;
+        const processTreeAlive = process.platform === "win32"
+          ? isProcessAlive(processPid)
+          : isProcessGroupAlive(processGroupId);
+        return Boolean(
+          run.cancellationRequestedAt
+          || run.finishedAt
+          || driver !== "local"
+          || !isTrackedLocalChildProcessAdapter(adapterType)
+          || !hasAdoptableProcessIdentity
+          || !processTreeAlive
+        );
+      })
+      .map(({ run }) => run.id);
+    if (nonAdoptableRunIds.length > 0) {
+      await removeHotRestartIntent();
+      logger.warn(
+        { signal, nonAdoptableRunIds },
+        "hot restart found active runs without complete local adoption proof; requiring confirmed graceful drain",
+      );
+      return {
+        mode: "active_run_drain_required" as const,
+        skipDrain: false as const,
+        activeRunIds: nonAdoptableRunIds,
+      };
+    }
     const snapshotRuns = activeRuns.map(toHotRestartIntentRun);
     const intentWithVersion = {
       ...intent,
@@ -8920,6 +9267,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         processGroupId: run.processGroupId ?? candidate.processGroupId,
       };
 
+      if (run.cancellationRequestedAt) {
+        classify(candidate, "skipped", "cancellation_pending", patch);
+        continue;
+      }
+
       if (run.status !== "running") {
         classify(candidate, "finalized_while_down", `run_status_${run.status}`, patch);
         continue;
@@ -8935,17 +9287,34 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         continue;
       }
 
+      const environment = parseObject(parseObject(run.contextSnapshot).paperclipEnvironment);
+      if (readNonEmptyString(environment.driver) !== "local") {
+        classify(candidate, "skipped", "execution_driver_not_local", patch);
+        continue;
+      }
+
       const processPid = run.processPid ?? candidate.processPid;
       const processGroupId = run.processGroupId ?? candidate.processGroupId;
       const processPidAlive = isProcessAlive(processPid);
       const processGroupAlive = isProcessGroupAlive(processGroupId);
-      if (!processPid && !processGroupId) {
-        classify(candidate, "lost", "missing_process_metadata", patch);
-        continue;
-      }
-      if (!processPidAlive && !processGroupAlive) {
-        classify(candidate, "lost", "process_not_alive", patch);
-        continue;
+      if (process.platform === "win32") {
+        if (!processPid) {
+          classify(candidate, "lost", "missing_process_metadata", patch);
+          continue;
+        }
+        if (!processPidAlive) {
+          classify(candidate, "lost", "process_not_alive", patch);
+          continue;
+        }
+      } else {
+        if (!processGroupId) {
+          classify(candidate, "lost", "missing_process_group_metadata", patch);
+          continue;
+        }
+        if (!processGroupAlive) {
+          classify(candidate, "lost", "process_group_not_alive", patch);
+          continue;
+        }
       }
 
       const resultJson = mergeHotRestartAdoptionResultJson(parseObject(run.resultJson), {
@@ -8965,7 +9334,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           errorCode: run.errorCode === DETACHED_PROCESS_ERROR_CODE ? null : run.errorCode,
           updatedAt: now,
         })
-        .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "running")))
+        .where(and(
+          eq(heartbeatRuns.id, run.id),
+          eq(heartbeatRuns.status, "running"),
+          isNull(heartbeatRuns.cancellationRequestedAt),
+        ))
         .returning()
         .then((rows) => rows[0] ?? null);
 
@@ -8997,7 +9370,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           processGroupId,
         },
       });
-      classify(candidate, "adopted", processPidAlive ? "process_pid_alive" : "process_group_alive", patch);
+      classify(
+        candidate,
+        "adopted",
+        process.platform === "win32" ? "process_pid_alive" : "process_group_alive",
+        patch,
+      );
     }
 
     const report = await writeHotRestartReport({
@@ -9038,6 +9416,100 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     };
   }
 
+  async function resumeShutdownPostTerminalWork(state: ShutdownPostTerminalWork) {
+    while (true) {
+      if (state.phase === "publish_terminal") {
+        clearHeartbeatRunRuntimeStatus(state.run.id);
+        publishLiveEvent({
+          companyId: state.run.companyId,
+          type: "heartbeat.run.status",
+          payload: {
+            runId: state.run.id,
+            agentId: state.run.agentId,
+            status: state.run.status,
+            invocationSource: state.run.invocationSource,
+            triggerDetail: state.run.triggerDetail,
+            error: state.run.error ?? null,
+            errorCode: state.run.errorCode ?? null,
+            startedAt: state.run.startedAt ? new Date(state.run.startedAt).toISOString() : null,
+            finishedAt: state.run.finishedAt ? new Date(state.run.finishedAt).toISOString() : null,
+          },
+        });
+        publishRunLifecyclePluginEvent(state.run);
+        clearProcessCancellation(state.run.id);
+        state.phase = "update_wakeup";
+        continue;
+      }
+
+      if (state.phase === "update_wakeup") {
+        await setWakeupStatus(state.run.wakeupRequestId, "cancelled", {
+          finishedAt: state.confirmedAt,
+          error: null,
+        });
+        state.phase = "classify";
+        continue;
+      }
+
+      if (state.phase === "classify") {
+        state.classifiedRun = await classifyAndPersistRunLiveness(
+          state.run,
+          parseObject(state.run.resultJson),
+        ) ?? state.run;
+        state.phase = "release_environment";
+        continue;
+      }
+
+      if (state.phase === "release_environment") {
+        const classified = state.classifiedRun ?? state.run;
+        await releaseEnvironmentLeasesForRun({
+          runId: classified.id,
+          companyId: classified.companyId,
+          agentId: classified.agentId,
+          status: classified.status,
+          failureReason: classified.error ?? undefined,
+        });
+        state.phase = "enqueue_retry";
+        continue;
+      }
+
+      if (state.phase === "enqueue_retry") {
+        const classified = state.classifiedRun ?? state.run;
+        state.retryRun = await enqueueProcessLossRetry(classified, state.agent, state.confirmedAt);
+        state.phase = state.retryRun ? "append_event" : "release_issue";
+        continue;
+      }
+
+      if (state.phase === "release_issue") {
+        await releaseIssueExecutionAndPromote(state.classifiedRun ?? state.run);
+        state.phase = "append_event";
+        continue;
+      }
+
+      if (state.phase === "append_event") {
+        const classified = state.classifiedRun ?? state.run;
+        await appendRunEvent(classified, await nextRunEventSeq(classified.id), {
+          eventType: "lifecycle",
+          stream: "system",
+          level: "warn",
+          message: state.message,
+          payload: {
+            signal: state.run.signal,
+            shutdownTermination: state.shutdownTermination,
+            ...(state.retryRun ? { retryRunId: state.retryRun.id } : {}),
+          },
+        });
+        state.phase = "finalize_agent";
+        continue;
+      }
+
+      await finalizeAgentStatus(state.run.agentId, "interrupted", state.message);
+      return {
+        interruptedRun: state.classifiedRun ?? state.run,
+        retryRun: state.retryRun ?? null,
+      };
+    }
+  }
+
   async function drainRunningRunsForShutdown(signal: "SIGINT" | "SIGTERM", now = new Date()) {
     const activeRuns = await db
       .select({
@@ -9050,82 +9522,247 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     const interruptedRunIds: string[] = [];
     const retryRunIds: string[] = [];
+    const shutdownErrors: unknown[] = [];
+
+    // A cancellation owned by another request/service instance may already
+    // have committed its terminal row while follow-up cleanup is still
+    // pending. Those rows are absent from activeRuns, but shutdown must not
+    // tear down the process until their retained phase has completed.
+    for (const [runId, state] of cancellationPostTerminalWorkByRunId) {
+      try {
+        await finishCancellationPostTerminalWork(runId);
+      } catch (error) {
+        shutdownErrors.push(error);
+        logger.error(
+          { err: error, runId, phase: state.phase },
+          "heartbeat cancellation post-terminal cleanup remains incomplete during shutdown",
+        );
+      }
+    }
+
+    // A prior attempt may have confirmed the process stop and committed the
+    // terminal row before later retry/bookkeeping work failed. Those rows no
+    // longer appear in the running-run query, so resume the retained phase
+    // explicitly and keep shutdown in its retry loop until every step lands.
+    for (const [runId, state] of shutdownPostTerminalWorkByRunId) {
+      try {
+        const completed = await resumeShutdownPostTerminalWork(state);
+        interruptedRunIds.push(completed.interruptedRun.id);
+        if (completed.retryRun) retryRunIds.push(completed.retryRun.id);
+        shutdownPostTerminalWorkByRunId.delete(runId);
+        shutdownOwnedRunIds.delete(runId);
+      } catch (error) {
+        shutdownErrors.push(error);
+        logger.error(
+          { err: error, runId, phase: state.phase },
+          "heartbeat shutdown post-terminal bookkeeping remains incomplete",
+        );
+      }
+    }
+    const activeRunIds = activeRuns.map(({ run }) => run.id);
+    const trackedExecutionRunIds = new Set(
+      activeRuns
+        .filter(({ run }) =>
+          activeRunExecutions.has(run.id) || activeRunExecutionPromisesByRun.has(run.id)
+        )
+        .map(({ run }) => run.id),
+    );
+    const newlyFencedRunIds = activeRunIds.length > 0
+      ? await db
+        .update(heartbeatRuns)
+        .set({ cancellationRequestedAt: now, updatedAt: now })
+        .where(and(
+          inArray(heartbeatRuns.id, activeRunIds),
+          eq(heartbeatRuns.status, "running"),
+          isNull(heartbeatRuns.cancellationRequestedAt),
+          isNull(heartbeatRuns.finishedAt),
+        ))
+        .returning({ id: heartbeatRuns.id })
+        .then((rows) => new Set(rows.map((row) => row.id)))
+      : new Set<string>();
+
+    for (const runId of newlyFencedRunIds) shutdownOwnedRunIds.add(runId);
+
+    for (const runId of activeRunIds) {
+      sealRunMutationActivity(db, runId);
+      requestProcessCancellation(runId);
+    }
 
     for (const { run, agent } of activeRuns) {
-      const running = runningProcesses.get(run.id);
+      if (!newlyFencedRunIds.has(run.id) && !shutdownOwnedRunIds.has(run.id)) {
+        try {
+          const cancelled = await cancelRunInternal(
+            run.id,
+            "Cancellation remained pending during graceful server shutdown",
+          );
+          if (!isHeartbeatRunTerminalStatus(cancelled.status)) {
+            const executionDrained = await waitForRunExecutionDrain(run.id);
+            if (!executionDrained) {
+              throw new Error("Heartbeat execution did not drain during graceful shutdown");
+            }
+            await cancelRunInternal(
+              run.id,
+              "Cancellation remained pending during graceful server shutdown",
+              { executionDrainAlreadyConfirmed: true },
+            );
+          }
+        } catch (error) {
+          shutdownErrors.push(error);
+          logger.error(
+            { err: error, runId: run.id },
+            "pre-existing heartbeat cancellation could not be confirmed during shutdown",
+          );
+        }
+        continue;
+      }
+
       try {
-        if (running) {
-          await terminateHeartbeatRunProcess({
-            pid: running.child.pid ?? run.processPid,
-            processGroupId: running.processGroupId ?? run.processGroupId,
-            graceMs: Math.max(1, running.graceSec) * 1000,
-          });
-        } else if (run.processPid || run.processGroupId) {
-          await terminateHeartbeatRunProcess({
-            pid: run.processPid,
-            processGroupId: run.processGroupId,
+        let current = await getRun(run.id);
+        if (!current || current.status !== "running" || !current.cancellationRequestedAt) continue;
+        let terminationEvidence = await terminateHeartbeatRunProcessForCancellation({
+          run: current,
+          executionDriver: heartbeatRunExecutionDriver(current),
+        });
+        const executionDrained = await waitForRunExecutionDrain(run.id);
+        if (!executionDrained) {
+          throw new Error("Heartbeat execution did not drain during graceful shutdown");
+        }
+
+        // Spawn metadata and remote control can arrive while the first stop is
+        // in flight. In particular, a fenced onSpawn write can reject, perform
+        // emergency cleanup, and persist the still-unconfirmed PID/PGID from
+        // executeRun's catch before the execution promise drains. Re-read and
+        // make one authoritative post-drain stop attempt instead of treating
+        // the stale pre-spawn snapshot as proof that nothing ever started.
+        const afterExecutionDrain = await getRun(run.id);
+        if (!afterExecutionDrain || afterExecutionDrain.status !== "running") continue;
+        if (!afterExecutionDrain.cancellationRequestedAt || afterExecutionDrain.finishedAt) {
+          throw new Error("Graceful shutdown cancellation fence changed before terminalization");
+        }
+        current = afterExecutionDrain;
+        const shutdownCancellationRequestedAt = afterExecutionDrain.cancellationRequestedAt;
+        const initiallyConfirmed = terminationEvidence.pendingStartCancelled
+          || terminationEvidence.remote?.confirmedExited === true
+          || terminationEvidence.local?.confirmedExited === true;
+        if (!initiallyConfirmed) {
+          terminationEvidence = await terminateHeartbeatRunProcessForCancellation({
+            run: current,
+            executionDriver: heartbeatRunExecutionDriver(current),
           });
         }
-      } finally {
-        runningProcesses.delete(run.id);
+        await waitForRunMutationActivityToDrain(db, run.id);
+        const executionDriver = heartbeatRunExecutionDriver(current);
+        const usesRemoteTransport = terminationEvidence.remoteControlAvailable
+          || executionDriver === "ssh";
+        const transportConfirmed = usesRemoteTransport
+          ? terminationEvidence.remote?.confirmedExited === true
+          : executionDriver === "local"
+            && terminationEvidence.local?.confirmedExited === true
+            && (process.platform === "win32" || terminationEvidence.local.target === "group");
+        const drainedBeforeObservedSpawn = Boolean(
+          executionDrained
+          && trackedExecutionRunIds.has(run.id)
+          && !terminationEvidence.remoteControlAvailable
+          && !current.processPid
+          && !current.processGroupId,
+        );
+        if (!terminationEvidence.pendingStartCancelled && !transportConfirmed && !drainedBeforeObservedSpawn) {
+          throw new Error("Graceful shutdown has no confirmable execution stop");
+        }
+
+        const confirmedAt = new Date();
+        const message = `Interrupted by graceful server shutdown (${signal}); retry queued for restart recovery`;
+        const shutdownTermination = {
+          requestedAt: shutdownCancellationRequestedAt.toISOString(),
+          confirmedAt: confirmedAt.toISOString(),
+          pendingStartCancelled: terminationEvidence.pendingStartCancelled,
+          executionDrained,
+          processTermination: {
+            local: terminationEvidence.local,
+            remote: terminationEvidence.remote,
+          },
+        };
+        const interrupted = await db
+          .update(heartbeatRuns)
+          .set({
+            status: "interrupted",
+            finishedAt: confirmedAt,
+            error: message,
+            errorCode: "server_shutdown_interrupted",
+            signal,
+            resultJson: mergeRunStopMetadataForAgent(agent, "interrupted", {
+              resultJson: {
+                ...parseObject(current.resultJson),
+                shutdownTermination,
+              },
+              errorCode: "server_shutdown_interrupted",
+              errorMessage: message,
+            }),
+            updatedAt: confirmedAt,
+          })
+          .where(and(
+            eq(heartbeatRuns.id, current.id),
+            eq(heartbeatRuns.status, "running"),
+            eq(heartbeatRuns.cancellationRequestedAt, shutdownCancellationRequestedAt),
+            isNull(heartbeatRuns.finishedAt),
+          ))
+          .returning()
+          .then((rows) => rows[0] ?? null);
+        if (!interrupted) continue;
+
+        const postTerminalWork: ShutdownPostTerminalWork = {
+          run: interrupted,
+          agent,
+          confirmedAt,
+          message,
+          shutdownTermination,
+          phase: "publish_terminal",
+          classifiedRun: null,
+          retryRun: undefined,
+        };
+        // Store the phase synchronously immediately after the terminal CAS so
+        // a later throw cannot make the retry loop forget required recovery.
+        shutdownPostTerminalWorkByRunId.set(interrupted.id, postTerminalWork);
+        const completed = await resumeShutdownPostTerminalWork(postTerminalWork);
+        interruptedRunIds.push(completed.interruptedRun.id);
+        if (completed.retryRun) retryRunIds.push(completed.retryRun.id);
+        shutdownPostTerminalWorkByRunId.delete(interrupted.id);
+        shutdownOwnedRunIds.delete(run.id);
+      } catch (error) {
+        const latest = await getRun(run.id).catch(() => null);
+        if (latest && isHeartbeatRunTerminalStatus(latest.status) && !shutdownPostTerminalWorkByRunId.has(run.id)) {
+          shutdownOwnedRunIds.delete(run.id);
+          logger.warn(
+            { err: error, runId: run.id, status: latest.status },
+            "heartbeat shutdown observed a terminal state committed by another owner",
+          );
+          continue;
+        }
+        shutdownErrors.push(error);
+        logger.error(
+          {
+            err: error,
+            runId: run.id,
+            postTerminalPhase: shutdownPostTerminalWorkByRunId.get(run.id)?.phase ?? null,
+          },
+          shutdownPostTerminalWorkByRunId.has(run.id)
+            ? "heartbeat shutdown post-terminal bookkeeping remains incomplete"
+            : "heartbeat shutdown remains fenced because process termination was not confirmed",
+        );
       }
-
-      const message = `Interrupted by graceful server shutdown (${signal}); retry queued for restart recovery`;
-      const interruptedStatus = await setRunStatusIfRunning(run.id, "interrupted", {
-        finishedAt: now,
-        error: message,
-        errorCode: "server_shutdown_interrupted",
-        signal,
-        resultJson: mergeRunStopMetadataForAgent(agent, "interrupted", {
-          resultJson: parseObject(run.resultJson),
-          errorCode: "server_shutdown_interrupted",
-          errorMessage: message,
-        }),
-      });
-      if (!interruptedStatus.updated || !interruptedStatus.run) continue;
-      let interrupted = interruptedStatus.run;
-      await setWakeupStatus(run.wakeupRequestId, "cancelled", {
-        finishedAt: now,
-        error: null,
-      });
-      interrupted = await classifyAndPersistRunLiveness(interrupted, parseObject(interrupted.resultJson)) ?? interrupted;
-
-      await releaseEnvironmentLeasesForRun({
-        runId: interrupted.id,
-        companyId: interrupted.companyId,
-        agentId: interrupted.agentId,
-        status: interrupted.status,
-        failureReason: interrupted.error ?? undefined,
-      });
-
-      const retry = await enqueueProcessLossRetry(interrupted, agent, now);
-      if (!retry) {
-        await releaseIssueExecutionAndPromote(interrupted);
-      } else {
-        retryRunIds.push(retry.id);
-      }
-
-      await appendRunEvent(interrupted, await nextRunEventSeq(interrupted.id), {
-        eventType: "lifecycle",
-        stream: "system",
-        level: "warn",
-        message,
-        payload: {
-          signal,
-          ...(run.processPid ? { processPid: run.processPid } : {}),
-          ...(run.processGroupId ? { processGroupId: run.processGroupId } : {}),
-          ...(retry ? { retryRunId: retry.id } : {}),
-        },
-      });
-
-      await finalizeAgentStatus(run.agentId, "interrupted", message);
-      interruptedRunIds.push(interrupted.id);
     }
 
     if (interruptedRunIds.length > 0) {
       logger.warn(
         { signal, interrupted: interruptedRunIds.length, interruptedRunIds, retryRunIds },
         "interrupted running heartbeat runs for graceful shutdown",
+      );
+    }
+
+    if (shutdownErrors.length > 0) {
+      throw new AggregateError(
+        shutdownErrors,
+        "One or more heartbeat runs remain fenced after unconfirmed graceful shutdown termination",
       );
     }
 
@@ -9339,6 +9976,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     gate: Extract<ScheduledRetryGate, { allowed: false }>,
     now: Date,
   ) {
+    sealRunMutationActivity(db, run.id);
+    await waitForRunMutationActivityToDrain(db, run.id);
     const cancelled = await db
       .update(heartbeatRuns)
       .set({
@@ -9352,6 +9991,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         and(
           eq(heartbeatRuns.id, run.id),
           eq(heartbeatRuns.status, "scheduled_retry"),
+          isNull(heartbeatRuns.cancellationRequestedAt),
+          isNull(heartbeatRuns.finishedAt),
           lte(heartbeatRuns.scheduledRetryAt, now),
         ),
       )
@@ -9477,6 +10118,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         and(
           eq(heartbeatRuns.id, dueRun.id),
           eq(heartbeatRuns.status, "scheduled_retry"),
+          isNull(heartbeatRuns.cancellationRequestedAt),
           lte(heartbeatRuns.scheduledRetryAt, now),
         ),
       )
@@ -10212,6 +10854,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .where(
         and(
           eq(heartbeatRuns.status, "scheduled_retry"),
+          isNull(heartbeatRuns.cancellationRequestedAt),
           lte(heartbeatRuns.scheduledRetryAt, now),
           cutoff ? gte(heartbeatRuns.createdAt, cutoff) : undefined,
         ),
@@ -10323,7 +10966,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           contextSnapshot,
           updatedAt: now,
         })
-        .where(and(eq(heartbeatRuns.id, scheduled.run.id), eq(heartbeatRuns.status, "scheduled_retry")))
+        .where(and(
+          eq(heartbeatRuns.id, scheduled.run.id),
+          eq(heartbeatRuns.status, "scheduled_retry"),
+          isNull(heartbeatRuns.cancellationRequestedAt),
+        ))
         .returning()
         .then((rows) => rows[0] ?? null);
       if (!row) return null;
@@ -10636,6 +11283,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
   async function claimQueuedRun(run: typeof heartbeatRuns.$inferSelect, companyAgents?: AgentOrgRow[]) {
     if (run.status !== "queued") return run;
+    if (run.cancellationRequestedAt) return null;
     const agent = await getAgent(run.agentId);
     if (!agent) {
       await cancelRunInternal(run.id, "Cancelled because the agent no longer exists");
@@ -10738,7 +11386,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         startedAt: run.startedAt ?? claimedAt,
         updatedAt: claimedAt,
       })
-      .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")))
+      .where(and(
+        eq(heartbeatRuns.id, run.id),
+        eq(heartbeatRuns.status, "queued"),
+        isNull(heartbeatRuns.cancellationRequestedAt),
+      ))
       .returning()
       .then((rows) => rows[0] ?? null);
     if (!claimed) return null;
@@ -11345,7 +11997,57 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .then((rows) => rows[0] ?? null);
   }
 
+  async function reconcilePendingRunCancellations() {
+    const cancelledRunIds: string[] = [];
+    const pendingRunIds: string[] = [];
+    for (const [runId] of cancellationPostTerminalWorkByRunId) {
+      try {
+        await finishCancellationPostTerminalWork(runId);
+        cancelledRunIds.push(runId);
+      } catch (error) {
+        pendingRunIds.push(runId);
+        logger.warn(
+          { err: error, runId },
+          "heartbeat cancellation terminal row is committed but cleanup remains pending",
+        );
+      }
+    }
+
+    const pendingRows = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(and(
+        inArray(heartbeatRuns.status, [...CANCELLABLE_HEARTBEAT_RUN_STATUSES]),
+        isNotNull(heartbeatRuns.cancellationRequestedAt),
+        isNull(heartbeatRuns.finishedAt),
+      ));
+    for (const row of pendingRows) {
+      try {
+        const reconciled = await cancelRunInternal(
+          row.id,
+          "Cancellation requested before execution shutdown was confirmed",
+        );
+        if (reconciled.status === "cancelled") cancelledRunIds.push(row.id);
+        else pendingRunIds.push(row.id);
+      } catch (error) {
+        pendingRunIds.push(row.id);
+        logger.warn(
+          { err: error, runId: row.id },
+          "heartbeat cancellation remains fenced pending confirmed execution shutdown",
+        );
+      }
+    }
+
+    return {
+      cancelled: cancelledRunIds.length,
+      cancelledRunIds,
+      pending: pendingRunIds.length,
+      pendingRunIds,
+    };
+  }
+
   async function reapOrphanedRuns(opts?: { staleThresholdMs?: number }) {
+    await reconcilePendingRunCancellations();
     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
     const now = new Date();
 
@@ -11386,12 +12088,65 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const reaped: string[] = [];
 
     for (const { run, adapterType, adapterConfig } of activeRuns) {
+      if (run.cancellationRequestedAt) continue;
       if (runningProcesses.has(run.id) || activeRunExecutions.has(run.id)) continue;
 
       // Apply staleness threshold to avoid false positives
       if (staleThresholdMs > 0) {
         const refTime = run.updatedAt ? new Date(run.updatedAt).getTime() : 0;
         if (now.getTime() - refTime < staleThresholdMs) continue;
+      }
+
+      const executionDriver = heartbeatRunExecutionDriver(run);
+      if (executionDriver === "ssh") {
+        try {
+          const cancelled = await cancelRunInternal(
+            run.id,
+            "SSH execution transport was lost; cancellation required confirmed remote shutdown",
+            { errorCode: "process_lost" },
+          );
+          if (cancelled.status === "cancelled") reaped.push(cancelled.id);
+        } catch (error) {
+          logger.warn(
+            { err: error, runId: run.id },
+            "lost SSH heartbeat remains fenced because remote shutdown was not confirmed",
+          );
+        }
+        continue;
+      }
+
+      if (executionDriver !== "local") {
+        const fencedAt = new Date();
+        const fencedRun = await db
+          .update(heartbeatRuns)
+          .set({ cancellationRequestedAt: fencedAt, updatedAt: fencedAt })
+          .where(and(
+            eq(heartbeatRuns.id, run.id),
+            eq(heartbeatRuns.status, "running"),
+            isNull(heartbeatRuns.cancellationRequestedAt),
+            isNull(heartbeatRuns.finishedAt),
+          ))
+          .returning()
+          .then((rows) => rows[0] ?? null);
+        if (fencedRun) {
+          sealRunMutationActivity(db, fencedRun.id);
+          requestProcessCancellation(fencedRun.id);
+          await appendRunEvent(fencedRun, await nextRunEventSeq(fencedRun.id), {
+            eventType: "lifecycle",
+            stream: "system",
+            level: "warn",
+            message: "Process-loss recovery remains fenced because the execution transport cannot be confirmed",
+            payload: {
+              executionDriverKnown: Boolean(executionDriver),
+              processIdentityRecorded: Boolean(run.processPid || run.processGroupId),
+            },
+          }).catch(() => undefined);
+        }
+        logger.warn(
+          { runId: run.id },
+          "orphaned heartbeat remains fenced without a confirmed execution transport",
+        );
+        continue;
       }
 
       const tracksLocalChild = isTrackedLocalChildProcessAdapter(adapterType);
@@ -11425,13 +12180,58 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         continue;
       }
 
+      const hasValidProcessGroupId =
+        typeof run.processGroupId === "number"
+        && Number.isInteger(run.processGroupId)
+        && run.processGroupId > 1;
+      if (process.platform !== "win32" && tracksLocalChild && !hasValidProcessGroupId) {
+        const fencedAt = new Date();
+        const fencedRun = await db
+          .update(heartbeatRuns)
+          .set({ cancellationRequestedAt: fencedAt, updatedAt: fencedAt })
+          .where(and(
+            eq(heartbeatRuns.id, run.id),
+            eq(heartbeatRuns.status, "running"),
+            isNull(heartbeatRuns.cancellationRequestedAt),
+            isNull(heartbeatRuns.finishedAt),
+          ))
+          .returning()
+          .then((rows) => rows[0] ?? null);
+        if (fencedRun) {
+          sealRunMutationActivity(db, fencedRun.id);
+          requestProcessCancellation(fencedRun.id);
+          await appendRunEvent(fencedRun, await nextRunEventSeq(fencedRun.id), {
+            eventType: "lifecycle",
+            stream: "system",
+            level: "warn",
+            message: "Process-loss recovery remains fenced because process-group metadata is unavailable",
+            payload: {
+              processGroupProofRequired: true,
+              processPidRecorded: Boolean(run.processPid),
+            },
+          }).catch(() => undefined);
+        }
+        logger.warn(
+          { runId: run.id },
+          "orphaned local heartbeat remains fenced without process-group exit proof",
+        );
+        continue;
+      }
+
       let descendantOnlyCleanup = false;
       if (processGroupAlive) {
         descendantOnlyCleanup = true;
-        await terminateHeartbeatRunProcess({
+        const cleanupEvidence = await terminateHeartbeatRunProcess({
           pid: run.processPid,
           processGroupId: run.processGroupId,
         });
+        if (!cleanupEvidence?.confirmedExited) {
+          logger.warn(
+            { runId: run.id },
+            "orphaned heartbeat process group could not be confirmed stopped",
+          );
+          continue;
+        }
       }
 
       const runContext = parseObject(run.contextSnapshot);
@@ -11443,7 +12243,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         readNonEmptyString(runContext.wakeReason) === "issue_monitor_due" &&
         monitorNextCheckAt !== undefined &&
         (!monitorNextCheckAt || monitorNextCheckAt.getTime() <= now.getTime());
-      const shouldRetry = (run.processLossRetryCount ?? 0) < 1 && (
+      // Resolved interaction continuations have their own bounded retry and
+      // escalation contract. Persisting process-group proof must not silently
+      // divert them into the generic one-shot process-loss retry.
+      const usesInteractionContinuationRetryPolicy =
+        isResolvedInteractionContinuationWakeContext(run.contextSnapshot);
+      const shouldRetry = !usesInteractionContinuationRetryPolicy
+        && (run.processLossRetryCount ?? 0) < 1 && (
         (tracksLocalChild && (!!run.processPid || !!run.processGroupId)) ||
         monitorDispatchLostWithoutFutureWake
       );
@@ -11459,7 +12265,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
         : null;
 
-      let finalizedRun = await setRunStatus(run.id, "failed", {
+      const finalizedWrite = await setRunStatusIfRunning(run.id, "failed", {
         error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
         errorCode: "process_lost",
         finishedAt: now,
@@ -11482,12 +12288,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             : result;
         })(),
       });
+      if (!finalizedWrite.updated || !finalizedWrite.run) continue;
+      let finalizedRun = finalizedWrite.run;
       await setWakeupStatus(run.wakeupRequestId, "failed", {
         finishedAt: now,
         error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
       });
-      if (!finalizedRun) finalizedRun = await getRun(run.id);
-      if (!finalizedRun) continue;
       finalizedRun = await classifyAndPersistRunLiveness(finalizedRun, parseObject(finalizedRun.resultJson)) ?? finalizedRun;
       await releaseEnvironmentLeasesForRun({
         runId: finalizedRun.id,
@@ -11549,6 +12355,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .innerJoin(companies, eq(companies.id, heartbeatRuns.companyId))
       .where(and(
         eq(heartbeatRuns.status, "queued"),
+        isNull(heartbeatRuns.cancellationRequestedAt),
         eq(companies.status, "active"),
         cutoff ? gte(heartbeatRuns.createdAt, cutoff) : undefined,
       ));
@@ -11679,7 +12486,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
   }
 
-  async function startNextQueuedRunForAgent(agentId: string) {
+  function startNextQueuedRunForAgent(agentId: string) {
+    const admission = startNextQueuedRunForAgentInternal(agentId);
+    runAdmissionState.inFlight.add(admission);
+    void admission.then(
+      () => runAdmissionState.inFlight.delete(admission),
+      () => runAdmissionState.inFlight.delete(admission),
+    );
+    return admission;
+  }
+
+  async function startNextQueuedRunForAgentInternal(agentId: string) {
     if ((await getSchedulingSuppression()).suppressed) return [];
     const cutoff = await getWorktreeExecutionCutoff();
 
@@ -11704,6 +12521,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .where(and(
           eq(heartbeatRuns.agentId, agentId),
           eq(heartbeatRuns.status, "queued"),
+          isNull(heartbeatRuns.cancellationRequestedAt),
           cutoff ? gte(heartbeatRuns.createdAt, cutoff) : undefined,
         ))
         .orderBy(asc(heartbeatRuns.createdAt));
@@ -11764,8 +12582,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // run rows/events, so awaiting this promise guarantees the run's writes
         // have landed before a caller (e.g. a test's afterEach) mutates the DB.
         activeRunExecutionPromises.add(execution);
+        activeRunExecutionPromisesByRun.set(claimedRun.id, execution);
         void execution.finally(() => {
           activeRunExecutionPromises.delete(execution);
+          if (activeRunExecutionPromisesByRun.get(claimedRun.id) === execution) {
+            activeRunExecutionPromisesByRun.delete(claimedRun.id);
+          }
         });
       }
       return claimedRuns;
@@ -11780,7 +12602,30 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   // writing rows/events (graceful shutdown, deterministic test teardown).
   async function drainActiveRunExecutions() {
     while (activeRunExecutionPromises.size > 0) {
-      await Promise.all([...activeRunExecutionPromises]);
+      await Promise.allSettled([...activeRunExecutionPromises]);
+    }
+  }
+
+  async function waitForRunExecutionDrain(runId: string, timeoutMs = 15_000) {
+    const execution = activeRunExecutionPromisesByRun.get(runId);
+    if (!execution) {
+      const deadline = Date.now() + timeoutMs;
+      while (activeRunExecutions.has(runId) && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      return !activeRunExecutions.has(runId);
+    }
+
+    let timeout: NodeJS.Timeout | null = null;
+    try {
+      return await Promise.race([
+        execution.then(() => true),
+        new Promise<false>((resolve) => {
+          timeout = setTimeout(() => resolve(false), timeoutMs);
+        }),
+      ]);
+    } finally {
+      if (timeout) clearTimeout(timeout);
     }
   }
 
@@ -11806,17 +12651,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     try {
     const agent = await getAgent(run.agentId);
     if (!agent) {
-      await setRunStatus(runId, "failed", {
+      const failedRun = await setRunStatus(runId, "failed", {
         error: "Agent not found",
         errorCode: "agent_not_found",
         finishedAt: new Date(),
       });
+      if (!failedRun) return;
       await setWakeupStatus(run.wakeupRequestId, "failed", {
         finishedAt: new Date(),
         error: "Agent not found",
       });
-      const failedRun = await getRun(runId);
-      if (failedRun) await releaseIssueExecutionAndPromote(failedRun);
+      await releaseIssueExecutionAndPromote(failedRun);
       return;
     }
 
@@ -13126,7 +13971,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           "execution-start aborted: agent not invokable",
         );
         const abortReason = "Cancelled: agent not invokable at execution-start";
-        await setRunStatus(run.id, "cancelled", {
+        const cancelledRun = await setRunStatus(run.id, "cancelled", {
           finishedAt: new Date(),
           error: abortReason,
           errorCode: "agent_not_invokable",
@@ -13138,11 +13983,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             }),
           } : {}),
         });
+        if (!cancelledRun) return;
         await setWakeupStatus(run.wakeupRequestId, "cancelled", {
           finishedAt: new Date(),
           error: abortReason,
         });
-        await releaseIssueExecutionAndPromote(run);
+        await releaseIssueExecutionAndPromote(cancelledRun);
         return;
       }
 
@@ -13573,8 +14419,41 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         adapterFinalizeOutcome = status;
       };
 
+      const assertPostAdapterRunActive = async () => {
+        const active = await db
+          .select({
+            status: heartbeatRuns.status,
+            cancellationRequestedAt: heartbeatRuns.cancellationRequestedAt,
+            finishedAt: heartbeatRuns.finishedAt,
+          })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, run.id))
+          .then((rows) => rows[0] ?? null);
+        if (
+          active?.status !== "running"
+          || active.cancellationRequestedAt
+          || active.finishedAt
+        ) {
+          throw new HeartbeatCancellationFenceObservedError();
+        }
+      };
+
       let adapterResult: Awaited<ReturnType<typeof adapter.execute>>;
       try {
+        const preDispatchRun = await db
+          .select({
+            status: heartbeatRuns.status,
+            cancellationRequestedAt: heartbeatRuns.cancellationRequestedAt,
+          })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, run.id))
+          .then((rows) => rows[0] ?? null);
+        if (
+          preDispatchRun?.status !== "running"
+          || preDispatchRun.cancellationRequestedAt
+        ) {
+          throw new Error("Heartbeat process start cancelled before adapter dispatch");
+        }
         const adapterContext = { ...context };
         const runtimeMcpServers = await buildPaperclipRuntimeMcpServers({
           db,
@@ -13592,6 +14471,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         });
         if (managedMcpConfig) {
           adapterContext.paperclipManagedMcp = managedMcpConfig;
+        }
+        const finalDispatchRun = await db
+          .select({
+            status: heartbeatRuns.status,
+            cancellationRequestedAt: heartbeatRuns.cancellationRequestedAt,
+          })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, run.id))
+          .then((rows) => rows[0] ?? null);
+        if (
+          finalDispatchRun?.status !== "running"
+          || finalDispatchRun.cancellationRequestedAt
+        ) {
+          throw new Error("Heartbeat process start cancelled before adapter dispatch");
         }
         adapterResult = await adapter.execute({
           runId: run.id,
@@ -13612,17 +14505,35 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             await recordCurrentHeartbeatRunRuntimeProgress(run, progress, issueId);
           },
           onSpawn: async (meta) => {
-            await persistRunProcessMetadata(run.id, {
-              pid: meta.pid,
-              processGroupId:
-                "processGroupId" in meta && typeof meta.processGroupId === "number"
-                  ? meta.processGroupId
-                  : null,
-              startedAt: meta.startedAt,
-            });
+            const processGroupId =
+              "processGroupId" in meta && typeof meta.processGroupId === "number"
+                ? meta.processGroupId
+                : null;
+            let persisted: typeof heartbeatRuns.$inferSelect | null = null;
+            try {
+              persisted = await persistRunProcessMetadata(run.id, {
+                pid: meta.pid,
+                processGroupId,
+                startedAt: meta.startedAt,
+              });
+            } catch (error) {
+              await terminateHeartbeatRunProcessForCancellation({
+                run: { id: run.id, processPid: meta.pid, processGroupId },
+                executionDriver: selectedEnvironment.driver,
+              });
+              throw error;
+            }
+            if (!persisted) {
+              await terminateHeartbeatRunProcessForCancellation({
+                run: { id: run.id, processPid: meta.pid, processGroupId },
+                executionDriver: selectedEnvironment.driver,
+              });
+              throw new Error("Heartbeat child process metadata was rejected after cancellation");
+            }
           },
           authToken: authToken ?? undefined,
         });
+        await assertPostAdapterRunActive();
         // Adapter returned cleanly, which means its workspace-restore finally
         // block also ran without throwing. Record the workspace_finalize
         // barrier so dependents that share this executionWorkspace can wake.
@@ -13636,15 +14547,35 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // state. Best-effort record finalize=failed so the dependent readiness
         // check keeps the gate closed instead of waking on stale local state,
         // and surface the original error to the caller.
-        try {
-          await recordWorkspaceFinalize("failed", {
-            errorMessage: adapterErr instanceof Error ? adapterErr.message : String(adapterErr),
-          });
-        } catch (recordErr) {
-          logger.warn(
-            { err: recordErr, runId: run.id, executionWorkspaceId: persistedExecutionWorkspace?.id ?? null },
-            "failed to record workspace_finalize=failed operation; dependents may remain gated",
-          );
+        const canRecordFailure = !(adapterErr instanceof HeartbeatCancellationFenceObservedError)
+          && await db
+            .select({
+              status: heartbeatRuns.status,
+              cancellationRequestedAt: heartbeatRuns.cancellationRequestedAt,
+              finishedAt: heartbeatRuns.finishedAt,
+            })
+            .from(heartbeatRuns)
+            .where(eq(heartbeatRuns.id, run.id))
+            .then((rows) => {
+              const current = rows[0] ?? null;
+              return Boolean(
+                current?.status === "running"
+                && !current.cancellationRequestedAt
+                && !current.finishedAt,
+              );
+            })
+            .catch(() => false);
+        if (canRecordFailure) {
+          try {
+            await recordWorkspaceFinalize("failed", {
+              errorMessage: adapterErr instanceof Error ? adapterErr.message : String(adapterErr),
+            });
+          } catch (recordErr) {
+            logger.warn(
+              { err: recordErr, runId: run.id, executionWorkspaceId: persistedExecutionWorkspace?.id ?? null },
+              "failed to record workspace_finalize=failed operation; dependents may remain gated",
+            );
+          }
         }
         throw adapterErr;
       } finally {
@@ -13661,6 +14592,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           );
         }
       }
+      await assertPostAdapterRunActive();
       const adapterManagedRuntimeServices = adapterResult.runtimeServices
         ? await persistAdapterManagedRuntimeServices({
             db,
@@ -14025,6 +14957,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         },
       );
     } catch (err) {
+      const unconfirmedTransportTermination =
+        err instanceof UnconfirmedLocalProcessTerminationError
+        || err instanceof UnconfirmedSshProcessTerminationError
+        || err instanceof UnconfirmedHeartbeatProcessTerminationError
+          ? err
+          : null;
+      const cancellationFenceObserved = err instanceof HeartbeatCancellationFenceObservedError;
       const message = redactCurrentUserText(
         err instanceof Error ? err.message : "Unknown adapter failure",
         await getCurrentUserRedactionOptions(),
@@ -14038,7 +14977,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         ?? configurationIncompleteFailure?.code
         ?? recordedResponsibleUserDenialCode
         ?? "adapter_failed";
-      logger.error({ err, runId }, "heartbeat execution failed");
+      if (!unconfirmedTransportTermination && !cancellationFenceObserved) {
+        logger.error({ err, runId }, "heartbeat execution failed");
+      }
 
       let logSummary: { bytes: number; sha256?: string; compressed: boolean } | null = null;
       if (handle) {
@@ -14055,6 +14996,123 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       await flushOutputProgress({ force: true }).catch((flushErr) => {
         logger.warn({ err: flushErr, runId }, "failed to flush run output progress after error");
       });
+
+      if (unconfirmedTransportTermination) {
+        const requestedAt = new Date();
+        const evidence = unconfirmedTransportTermination.evidence;
+        const terminationScope = evidence?.scope
+          ?? (unconfirmedTransportTermination instanceof UnconfirmedHeartbeatProcessTerminationError
+            ? unconfirmedTransportTermination.scope
+            : unconfirmedTransportTermination instanceof UnconfirmedLocalProcessTerminationError
+              ? "local"
+              : "ssh");
+        const errorCode = unconfirmedTransportTermination.code;
+        const sanitizedTermination = evidence
+          ? {
+              kind: evidence.kind,
+              scope: evidence.scope,
+              target: evidence.target,
+              suspendSent: evidence.suspendSent,
+              termSent: evidence.termSent,
+              forceKilled: evidence.forceKilled,
+              confirmedExited: evidence.confirmedExited,
+              outcome: evidence.outcome,
+            }
+          : {
+              kind: "process_group_termination" as const,
+              scope: terminationScope,
+              target: "group" as const,
+              suspendSent: false,
+              termSent: false,
+              forceKilled: false,
+              confirmedExited: false,
+              outcome: "unconfirmed" as const,
+            };
+        // Install the in-memory fence even if the database is temporarily
+        // unavailable. This process must reject new run-bound mutations and
+        // retain the environment lease rather than terminalize on uncertainty.
+        sealRunMutationActivity(db, run.id);
+        requestProcessCancellation(run.id);
+        const safetyIdentifiers: Partial<Pick<
+          typeof heartbeatRuns.$inferInsert,
+          "processPid" | "processGroupId"
+        >> = {};
+        if (
+          unconfirmedTransportTermination instanceof UnconfirmedLocalProcessTerminationError
+          || (
+            unconfirmedTransportTermination instanceof UnconfirmedHeartbeatProcessTerminationError
+            && unconfirmedTransportTermination.scope === "local"
+          )
+        ) {
+          if (unconfirmedTransportTermination.processPid !== null) {
+            safetyIdentifiers.processPid = unconfirmedTransportTermination.processPid;
+          }
+          if (unconfirmedTransportTermination.processGroupId !== null) {
+            safetyIdentifiers.processGroupId = unconfirmedTransportTermination.processGroupId;
+          }
+        }
+        const fencedWrite = await (async () => {
+          // Acquire the durable fence without overwriting an earlier
+          // cancellation timestamp, then persist any local retry identifiers
+          // even when that fence already existed.
+          await db
+            .update(heartbeatRuns)
+            .set({ cancellationRequestedAt: requestedAt, updatedAt: requestedAt })
+            .where(and(
+              eq(heartbeatRuns.id, run.id),
+              eq(heartbeatRuns.status, "running"),
+              isNull(heartbeatRuns.cancellationRequestedAt),
+              isNull(heartbeatRuns.finishedAt),
+            ));
+          return await db
+            .update(heartbeatRuns)
+            .set({ ...safetyIdentifiers, updatedAt: requestedAt })
+            .where(and(
+              eq(heartbeatRuns.id, run.id),
+              eq(heartbeatRuns.status, "running"),
+              isNull(heartbeatRuns.finishedAt),
+            ))
+            .returning()
+            .then((rows) => rows[0] ?? null);
+        })()
+          .catch((fenceError) => {
+            logger.warn(
+              { err: fenceError, runId: run.id, errorCode },
+              "failed to persist heartbeat termination uncertainty fence",
+            );
+            return null;
+          });
+        const fenced = fencedWrite ?? await getRun(run.id).catch(() => null);
+        if (
+          fenced?.status === "running"
+          && fenced.cancellationRequestedAt
+          && !fenced.finishedAt
+        ) {
+          await appendRunEvent(fenced, seq++, {
+            eventType: "lifecycle",
+            stream: "system",
+            level: "warn",
+            message: terminationScope === "ssh"
+              ? "SSH execution remains fenced pending confirmed remote process-group exit"
+              : "Local execution remains fenced pending confirmed process-group exit",
+            payload: {
+              errorCode,
+              processTermination: sanitizedTermination,
+            },
+          }).catch(() => undefined);
+        }
+        logger.warn(
+          {
+            runId: run.id,
+            errorCode,
+            processTermination: sanitizedTermination,
+          },
+          terminationScope === "ssh"
+            ? "heartbeat execution remains fenced because SSH termination was not confirmed"
+            : "heartbeat execution remains fenced because local termination was not confirmed",
+        );
+        return;
+      }
 
       const failedRunWrite = await setRunStatusIfRunning(run.id, "failed", {
         error: message,
@@ -14249,13 +15307,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           }
         } finally {
           const latestRun = await getRun(run.id).catch(() => null);
-          await releaseEnvironmentLeasesForRun({
-            runId: run.id,
-            companyId: run.companyId,
-            agentId: run.agentId,
-            status: latestRun?.status,
-            failureReason: latestRun?.error ?? undefined,
-          });
+          // A fenced run with unconfirmed process termination is deliberately
+          // nonterminal. Keep its environment lease active so the workspace
+          // cannot be reused while the workload may still be alive. The later
+          // confirmed cancellation/reaper path owns terminal lease release.
+          if (latestRun && isHeartbeatRunTerminalStatus(latestRun.status)) {
+            await releaseEnvironmentLeasesForRun({
+              runId: run.id,
+              companyId: run.companyId,
+              agentId: run.agentId,
+              status: latestRun.status,
+              failureReason: latestRun.error ?? undefined,
+            });
+          }
           await releaseRuntimeServicesForRun(run.id).catch(() => undefined);
           if (runScratch && latestRun && isHeartbeatRunTerminalStatus(latestRun.status)) {
             const scratchForCleanup = runScratch;
@@ -14310,7 +15374,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             }
           }
           activeRunExecutions.delete(run.id);
-          await startNextQueuedRunForAgent(run.agentId);
+          if (!latestRun?.cancellationRequestedAt) {
+            await startNextQueuedRunForAgent(run.agentId);
+          }
         }
   }
 
@@ -15135,7 +16201,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     await startNextQueuedRunForAgent(promotedRun.agentId);
   }
 
-  async function enqueueWakeup(agentId: string, opts: WakeupOptions = {}) {
+  function enqueueWakeup(agentId: string, opts: WakeupOptions = {}) {
+    const admission = enqueueWakeupInternal(agentId, opts);
+    runAdmissionState.inFlight.add(admission);
+    void admission.then(
+      () => runAdmissionState.inFlight.delete(admission),
+      () => runAdmissionState.inFlight.delete(admission),
+    );
+    return admission;
+  }
+
+  async function enqueueWakeupInternal(agentId: string, opts: WakeupOptions = {}) {
     const source = opts.source ?? "on_demand";
     const triggerDetail = opts.triggerDetail ?? null;
     const contextSnapshot: Record<string, unknown> = { ...(opts.contextSnapshot ?? {}) };
@@ -15510,6 +16586,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           const reason = issueCancelled
             ? "Cancelled because the issue was cancelled before the scheduled retry became due"
             : "Cancelled because the issue was reassigned before the scheduled retry became due";
+          sealRunMutationActivity(db, scheduledRun.id);
+          await waitForRunMutationActivityToDrain(db, scheduledRun.id);
           const cancelled = await tx
             .update(heartbeatRuns)
             .set({
@@ -15519,7 +16597,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               errorCode: issueCancelled ? "issue_cancelled" : "issue_reassigned",
               updatedAt: now,
             })
-            .where(and(eq(heartbeatRuns.id, scheduledRun.id), eq(heartbeatRuns.status, "scheduled_retry")))
+            .where(and(
+              eq(heartbeatRuns.id, scheduledRun.id),
+              eq(heartbeatRuns.status, "scheduled_retry"),
+              isNull(heartbeatRuns.cancellationRequestedAt),
+              isNull(heartbeatRuns.finishedAt),
+            ))
             .returning()
             .then((rows) => rows[0] ?? null);
 
@@ -15621,6 +16704,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           issue.assigneeAgentId &&
           activeExecutionRun.agentId !== issue.assigneeAgentId
         ) {
+          sealRunMutationActivity(db, activeExecutionRun.id);
+          await waitForRunMutationActivityToDrain(db, activeExecutionRun.id);
           const cancelled = await tx
             .update(heartbeatRuns)
             .set({
@@ -15634,6 +16719,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               and(
                 eq(heartbeatRuns.id, activeExecutionRun.id),
                 eq(heartbeatRuns.status, activeExecutionRun.status),
+                isNull(heartbeatRuns.cancellationRequestedAt),
+                isNull(heartbeatRuns.finishedAt),
               ),
             )
             .returning({ id: heartbeatRuns.id });
@@ -15936,12 +17023,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             shouldQueueFollowupForRunningIssueWake({ contextSnapshot: enrichedContextSnapshot, wakeCommentId }) &&
             activeExecutionRun.status === "running" &&
             isSameExecutionAgent;
-          const availableActiveExecutionRun = isSameExecutionAgent
+          const cancellationPending = Boolean(activeExecutionRun.cancellationRequestedAt);
+          const availableActiveExecutionRun = cancellationPending
+            ? activeExecutionRun
+            : isSameExecutionAgent
             ? filterZombieCoalesceTarget(activeExecutionRun, liveRunExecutions)
             : activeExecutionRun;
 
           if (
             isSameExecutionAgent
+            && !cancellationPending
             && !shouldDeferFollowupWake
             && !shouldQueueFollowupForRunningWake
             && availableActiveExecutionRun
@@ -15956,27 +17047,32 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 contextSnapshot: mergedContextSnapshot,
                 updatedAt: new Date(),
               })
-              .where(eq(heartbeatRuns.id, availableActiveExecutionRun.id))
+              .where(and(
+                eq(heartbeatRuns.id, availableActiveExecutionRun.id),
+                isNull(heartbeatRuns.cancellationRequestedAt),
+              ))
               .returning()
-              .then((rows) => rows[0] ?? availableActiveExecutionRun);
+              .then((rows) => rows[0] ?? null);
 
-            await tx.insert(agentWakeupRequests).values({
-              companyId: agent.companyId,
-              agentId,
-              source,
-              triggerDetail,
-              reason: "issue_execution_same_name",
-              payload,
-              status: "coalesced",
-              coalescedCount: 1,
-              requestedByActorType: opts.requestedByActorType ?? null,
-              requestedByActorId: opts.requestedByActorId ?? null,
-              idempotencyKey: opts.idempotencyKey ?? null,
-              runId: mergedRun.id,
-              finishedAt: new Date(),
-            });
+            if (mergedRun) {
+              await tx.insert(agentWakeupRequests).values({
+                companyId: agent.companyId,
+                agentId,
+                source,
+                triggerDetail,
+                reason: "issue_execution_same_name",
+                payload,
+                status: "coalesced",
+                coalescedCount: 1,
+                requestedByActorType: opts.requestedByActorType ?? null,
+                requestedByActorId: opts.requestedByActorId ?? null,
+                idempotencyKey: opts.idempotencyKey ?? null,
+                runId: mergedRun.id,
+                finishedAt: new Date(),
+              });
 
-            return { kind: "coalesced" as const, run: mergedRun };
+              return { kind: "coalesced" as const, run: mergedRun };
+            }
           }
 
           if (availableActiveExecutionRun) {
@@ -16265,13 +17361,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .orderBy(desc(heartbeatRuns.createdAt));
 
     const sameScopeQueuedRun = activeRuns.find(
-      (candidate) => candidate.status === "queued" && isSameTaskScope(runTaskKey(candidate), taskKey),
+      (candidate) =>
+        candidate.status === "queued"
+        && !candidate.cancellationRequestedAt
+        && isSameTaskScope(runTaskKey(candidate), taskKey),
     );
     const sameScopeScheduledRetryRun = activeRuns.find(
-      (candidate) => candidate.status === "scheduled_retry" && isSameTaskScope(runTaskKey(candidate), taskKey),
+      (candidate) =>
+        candidate.status === "scheduled_retry"
+        && !candidate.cancellationRequestedAt
+        && isSameTaskScope(runTaskKey(candidate), taskKey),
     );
     const sameScopeRunningRun = activeRuns.find(
-      (candidate) => candidate.status === "running" && isSameTaskScope(runTaskKey(candidate), taskKey),
+      (candidate) =>
+        candidate.status === "running"
+        && !candidate.cancellationRequestedAt
+        && isSameTaskScope(runTaskKey(candidate), taskKey),
     );
     const shouldQueueFollowupForRunningWake =
       Boolean(sameScopeRunningRun) &&
@@ -16292,32 +17397,42 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         coalescedTargetRun.contextSnapshot,
         enrichedContextSnapshot,
       );
-      const mergedRun = await db
-        .update(heartbeatRuns)
-        .set({
-          contextSnapshot: mergedContextSnapshot,
-          updatedAt: new Date(),
-        })
-        .where(eq(heartbeatRuns.id, coalescedTargetRun.id))
-        .returning()
-        .then((rows) => rows[0] ?? coalescedTargetRun);
+      const mergedRun = await db.transaction(async (tx) => {
+        const merged = await tx
+          .update(heartbeatRuns)
+          .set({
+            contextSnapshot: mergedContextSnapshot,
+            updatedAt: new Date(),
+          })
+          .where(and(
+            eq(heartbeatRuns.id, coalescedTargetRun.id),
+            isNull(heartbeatRuns.cancellationRequestedAt),
+          ))
+          .returning()
+          .then((rows) => rows[0] ?? null);
+        if (!merged) return null;
 
-      await db.insert(agentWakeupRequests).values({
-        companyId: agent.companyId,
-        agentId,
-        source,
-        triggerDetail,
-        reason,
-        payload,
-        status: "coalesced",
-        coalescedCount: 1,
-        requestedByActorType: opts.requestedByActorType ?? null,
-        requestedByActorId: opts.requestedByActorId ?? null,
-        idempotencyKey: opts.idempotencyKey ?? null,
-        runId: mergedRun.id,
-        finishedAt: new Date(),
+        await tx.insert(agentWakeupRequests).values({
+          companyId: agent.companyId,
+          agentId,
+          source,
+          triggerDetail,
+          reason,
+          payload,
+          status: "coalesced",
+          coalescedCount: 1,
+          requestedByActorType: opts.requestedByActorType ?? null,
+          requestedByActorId: opts.requestedByActorId ?? null,
+          idempotencyKey: opts.idempotencyKey ?? null,
+          runId: merged.id,
+          finishedAt: new Date(),
+        });
+        return merged;
       });
-      return mergedRun;
+
+      if (mergedRun) {
+        return mergedRun;
+      }
     }
 
     const queueOutcome = await db.transaction(async (tx) => {
@@ -16531,114 +17646,426 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     eventPayload?: Record<string, unknown>;
   };
 
-  async function cancelRunInternal(runId: string, reason = "Cancelled by control plane", options: CancelRunOptions = {}) {
-    const run = await getRun(runId);
+  type CancelRunInternalOptions = CancelRunOptions & {
+    skipPostCancelAgentWork?: boolean;
+    executionDrainAlreadyConfirmed?: boolean;
+  };
+
+  const deferredSelfCancellationRuns = new Set<string>();
+
+  function heartbeatRunExecutionDriver(
+    run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "contextSnapshot">,
+  ) {
+    const running = runningProcesses.get(run.id);
+    if (running?.terminateRemote || getRemoteProcessTerminationControl(run.id)) return "ssh";
+    const environment = parseObject(parseObject(run.contextSnapshot).paperclipEnvironment);
+    return readNonEmptyString(environment.driver);
+  }
+
+  function heartbeatRunUsesSshTransport(
+    run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "contextSnapshot">,
+  ) {
+    return heartbeatRunExecutionDriver(run) === "ssh";
+  }
+
+  async function resumeCancellationPostTerminalWork(state: CancellationPostTerminalWork) {
+    while (state.phase !== "complete") {
+      if (state.phase === "publish_terminal") {
+        clearHeartbeatRunRuntimeStatus(state.run.id);
+        publishLiveEvent({
+          companyId: state.run.companyId,
+          type: "heartbeat.run.status",
+          payload: {
+            runId: state.run.id,
+            agentId: state.run.agentId,
+            status: state.run.status,
+            invocationSource: state.run.invocationSource,
+            triggerDetail: state.run.triggerDetail,
+            error: state.run.error ?? null,
+            errorCode: state.run.errorCode ?? null,
+            startedAt: state.run.startedAt ? new Date(state.run.startedAt).toISOString() : null,
+            finishedAt: state.run.finishedAt ? new Date(state.run.finishedAt).toISOString() : null,
+          },
+        });
+        publishRunLifecyclePluginEvent(state.run);
+        clearProcessCancellation(state.run.id);
+        state.phase = "update_wakeup";
+        continue;
+      }
+
+      if (state.phase === "update_wakeup") {
+        await setWakeupStatus(state.run.wakeupRequestId, "cancelled", {
+          finishedAt: state.finishedAt,
+          error: state.reason,
+        });
+        state.phase = "append_event";
+        continue;
+      }
+
+      if (state.phase === "append_event") {
+        await appendRunEvent(state.run, await nextRunEventSeq(state.run.id), {
+          eventType: "lifecycle",
+          stream: "system",
+          level: "warn",
+          message: state.eventMessage,
+          payload: {
+            ...state.eventPayload,
+            cancellation: state.cancellationEvidence,
+          },
+        });
+        state.phase = "release_environment";
+        continue;
+      }
+
+      if (state.phase === "release_environment") {
+        await releaseEnvironmentLeasesForRun({
+          runId: state.run.id,
+          companyId: state.run.companyId,
+          agentId: state.run.agentId,
+          status: state.run.status,
+          failureReason: state.run.error ?? undefined,
+        });
+        state.phase = "release_issue";
+        continue;
+      }
+
+      if (state.phase === "release_issue") {
+        await releaseIssueExecutionAndPromote(state.run);
+        state.phase = state.skipPostCancelAgentWork ? "complete" : "finalize_agent";
+        continue;
+      }
+
+      if (state.phase === "finalize_agent") {
+        await finalizeAgentStatus(state.run.agentId, "cancelled");
+        state.phase = "start_next";
+        continue;
+      }
+
+      if (state.phase === "start_next") {
+        await startNextQueuedRunForAgent(state.run.agentId);
+        state.phase = "complete";
+      }
+    }
+    return state.run;
+  }
+
+  async function finishCancellationPostTerminalWork(runId: string) {
+    const state = cancellationPostTerminalWorkByRunId.get(runId);
+    if (!state) return null;
+    if (state.inFlight) return await state.inFlight;
+    const work = resumeCancellationPostTerminalWork(state);
+    state.inFlight = work;
+    try {
+      const completed = await work;
+      if (cancellationPostTerminalWorkByRunId.get(runId) === state) {
+        cancellationPostTerminalWorkByRunId.delete(runId);
+      }
+      return completed;
+    } finally {
+      if (state.inFlight === work) state.inFlight = null;
+    }
+  }
+
+  async function cancelRunInternal(runId: string, reason = "Cancelled by control plane", options: CancelRunInternalOptions = {}) {
+    const pendingPostTerminalWork = await finishCancellationPostTerminalWork(runId);
+    if (pendingPostTerminalWork) return pendingPostTerminalWork;
+    let run = await getRun(runId);
     if (!run) throw notFound("Heartbeat run not found");
     if (!CANCELLABLE_HEARTBEAT_RUN_STATUSES.includes(run.status as (typeof CANCELLABLE_HEARTBEAT_RUN_STATUSES)[number])) return run;
-    const agent = await getAgent(run.agentId);
-    const errorCode = options.errorCode ?? "cancelled";
-    const resultJson = agent
-      ? {
-          ...mergeRunStopMetadataForAgent(agent, "cancelled", {
-            resultJson: parseObject(run.resultJson),
-            errorCode,
-            errorMessage: reason,
-          }),
-          ...(options.resultJson ?? {}),
+
+    let cancellationRequestedAt = run.cancellationRequestedAt;
+    if (!cancellationRequestedAt) {
+      const requestedAt = new Date();
+      const fenced = await db
+        .update(heartbeatRuns)
+        .set({ cancellationRequestedAt: requestedAt, updatedAt: requestedAt })
+        .where(and(
+          eq(heartbeatRuns.id, run.id),
+          inArray(heartbeatRuns.status, [...CANCELLABLE_HEARTBEAT_RUN_STATUSES]),
+          isNull(heartbeatRuns.cancellationRequestedAt),
+          isNull(heartbeatRuns.finishedAt),
+        ))
+        .returning()
+        .then((rows) => rows[0] ?? null);
+      if (fenced) {
+        run = fenced;
+        cancellationRequestedAt = requestedAt;
+      } else {
+        const current = await getRun(run.id);
+        if (!current) throw notFound("Heartbeat run not found");
+        if (!CANCELLABLE_HEARTBEAT_RUN_STATUSES.includes(current.status as (typeof CANCELLABLE_HEARTBEAT_RUN_STATUSES)[number])) {
+          return current;
         }
-      : options.resultJson;
-
-    const running = runningProcesses.get(run.id);
-    try {
-      if (running) {
-        await terminateHeartbeatRunProcess({
-          pid: running.child.pid ?? run.processPid,
-          processGroupId: running.processGroupId ?? run.processGroupId,
-          graceMs: Math.max(1, running.graceSec) * 1000,
-        });
-      } else if (run.processPid || run.processGroupId) {
-        await terminateHeartbeatRunProcess({
-          pid: run.processPid,
-          processGroupId: run.processGroupId,
-        });
+        if (!current.cancellationRequestedAt) {
+          throw new Error("Heartbeat cancellation fence could not be acquired");
+        }
+        run = current;
+        cancellationRequestedAt = current.cancellationRequestedAt;
       }
-    } finally {
-      runningProcesses.delete(run.id);
     }
 
-    const finishedAt = new Date();
-    const cancelled = await setRunStatus(run.id, "cancelled", {
-      finishedAt,
-      error: reason,
-      errorCode,
-      ...(resultJson ? { resultJson } : {}),
+    // The database fence is authoritative across processes. Mirror it into
+    // this process synchronously, before the first post-fence await, so an
+    // authentication/dispatch continuation that observed the old row can no
+    // longer acquire a mutation lease.
+    sealRunMutationActivity(db, run.id);
+
+    // Mirror the durable fence in memory before the first post-fence await.
+    // In particular, token revocation can yield long enough for an SSH client
+    // to close; its close handler must see this request and retain the remote
+    // process-group control until cancellation has been confirmed.
+    const cancellationRequest = requestProcessCancellation(run.id);
+
+    // A run-bound HTTP mutation can itself request cancellation (for example,
+    // an agent PATCHing its issue to cancelled). Waiting here would deadlock on
+    // that request's own lease. Keep the durable/in-memory fences installed and
+    // resume termination plus terminalization only after the response releases
+    // the lease; all other pre-fence leases are drained by the resumed call.
+    const selfLease = getCurrentRunMutationLease(db, run.id);
+    if (selfLease) {
+      if (!deferredSelfCancellationRuns.has(run.id)) {
+        deferredSelfCancellationRuns.add(run.id);
+        void selfLease.released
+          .then(() => cancelRunInternal(run.id, reason, options))
+          .catch((error) => {
+            logger.warn(
+              { err: error, runId: run.id },
+              "heartbeat self-cancellation remains fenced after deferred request drain",
+            );
+          })
+          .finally(() => {
+            deferredSelfCancellationRuns.delete(run.id);
+          });
+      }
+      return run;
+    }
+
+    await revokeHeartbeatRunGatewayTokens({
+      db,
+      companyId: run.companyId,
+      runId: run.id,
+    }).catch((error) => {
+      logger.warn(
+        { err: error, companyId: run.companyId, runId: run.id },
+        "failed to revoke heartbeat-run gateway tokens during cancellation",
+      );
     });
 
-    await setWakeupStatus(run.wakeupRequestId, "cancelled", {
-      finishedAt,
-      error: reason,
+    const activeExecution = activeRunExecutionPromisesByRun.get(run.id) ?? null;
+    let terminationEvidence = await terminateHeartbeatRunProcessForCancellation({
+      run,
+      cancellationRequest,
+      executionDriver: heartbeatRunExecutionDriver(run),
     });
+    let executionDriver = heartbeatRunExecutionDriver(run);
+    let usesRemoteTransport = terminationEvidence.remoteControlAvailable || executionDriver === "ssh";
+    let hasConfirmedTransportStop = usesRemoteTransport
+      ? terminationEvidence.remote?.confirmedExited === true
+      : executionDriver === "local"
+        && terminationEvidence.local?.confirmedExited === true
+        && (process.platform === "win32" || terminationEvidence.local.target === "group");
 
-    if (cancelled) {
-      await appendRunEvent(cancelled, 1, {
-        eventType: "lifecycle",
-        stream: "system",
-        level: "warn",
-        message: options.eventMessage ?? "run cancelled",
-        ...(options.eventPayload ? { payload: options.eventPayload } : {}),
+    if (
+      run.status === "running"
+      && !terminationEvidence.pendingStartCancelled
+      && !hasConfirmedTransportStop
+      && !options.executionDrainAlreadyConfirmed
+      && activeExecution
+    ) {
+      void activeExecution
+        .then(
+          () => cancelRunInternal(run.id, reason, { ...options, executionDrainAlreadyConfirmed: true }),
+          () => cancelRunInternal(run.id, reason, { ...options, executionDrainAlreadyConfirmed: true }),
+        )
+        .catch((error) => {
+          logger.warn(
+            { err: error, runId: run.id },
+            "heartbeat cancellation remains fenced after deferred execution drain",
+          );
+        });
+      return run;
+    }
+
+    const executionDrained = options.executionDrainAlreadyConfirmed
+      || await waitForRunExecutionDrain(run.id);
+    if (!executionDrained) {
+      throw new Error("Heartbeat execution did not drain after process-group termination");
+    }
+
+    // The execution may have persisted spawn/control metadata while this
+    // caller was waiting for its promise to drain. Refresh and retry the stop
+    // before deciding that the execution never spawned.
+    const afterExecutionDrain = await getRun(run.id);
+    if (!afterExecutionDrain) throw notFound("Heartbeat run not found");
+    if (isHeartbeatRunTerminalStatus(afterExecutionDrain.status)) {
+      clearProcessCancellation(run.id);
+      return afterExecutionDrain;
+    }
+    if (!afterExecutionDrain.cancellationRequestedAt || afterExecutionDrain.finishedAt) {
+      throw new Error("Heartbeat cancellation fence changed before terminalization");
+    }
+    run = afterExecutionDrain;
+    cancellationRequestedAt = afterExecutionDrain.cancellationRequestedAt;
+    if (!terminationEvidence.pendingStartCancelled && !hasConfirmedTransportStop) {
+      terminationEvidence = await terminateHeartbeatRunProcessForCancellation({
+        run,
+        cancellationRequest,
+        executionDriver: heartbeatRunExecutionDriver(run),
       });
-      await releaseIssueExecutionAndPromote(cancelled);
+      executionDriver = heartbeatRunExecutionDriver(run);
+      usesRemoteTransport = terminationEvidence.remoteControlAvailable || executionDriver === "ssh";
+      hasConfirmedTransportStop = usesRemoteTransport
+        ? terminationEvidence.remote?.confirmedExited === true
+        : executionDriver === "local"
+          && terminationEvidence.local?.confirmedExited === true
+          && (process.platform === "win32" || terminationEvidence.local.target === "group");
+    }
+    const executionDrainedBeforeAnyObservedSpawn = Boolean(
+      options.executionDrainAlreadyConfirmed
+      && !terminationEvidence.remoteControlAvailable
+      && !run.processPid
+      && !run.processGroupId,
+    );
+    const hasConfirmableExecution = Boolean(
+      terminationEvidence.pendingStartCancelled
+      || hasConfirmedTransportStop
+      || executionDrainedBeforeAnyObservedSpawn,
+    );
+    if (run.status === "running" && !hasConfirmableExecution) {
+      throw new Error("Running heartbeat cancellation has no confirmable execution handle");
+    }
+    await waitForRunMutationActivityToDrain(db, run.id);
+
+    const cancellationConfirmedAt = new Date();
+    const cancellationEvidence = {
+      requestedAt: cancellationRequestedAt.toISOString(),
+      confirmedAt: cancellationConfirmedAt.toISOString(),
+      pendingStartCancelled: terminationEvidence.pendingStartCancelled,
+      executionDrained,
+      processTermination: {
+        local: terminationEvidence.local,
+        remote: terminationEvidence.remote,
+      },
+    };
+    const errorCode = options.errorCode ?? "cancelled";
+    const resultJsonSeed = {
+      ...parseObject(run.resultJson),
+      ...(options.resultJson ?? {}),
+      cancellation: cancellationEvidence,
+    };
+    const agent = await getAgent(run.agentId);
+    const resultJson = agent
+      ? mergeRunStopMetadataForAgent(agent, "cancelled", {
+          resultJson: resultJsonSeed,
+          errorCode,
+          errorMessage: reason,
+        })
+      : resultJsonSeed;
+
+    const finishedAt = cancellationConfirmedAt;
+    const cancelled = await db
+      .update(heartbeatRuns)
+      .set({
+        status: "cancelled",
+        finishedAt,
+        error: reason,
+        errorCode,
+        resultJson,
+        updatedAt: finishedAt,
+      })
+      .where(and(
+        eq(heartbeatRuns.id, run.id),
+        inArray(heartbeatRuns.status, [...CANCELLABLE_HEARTBEAT_RUN_STATUSES]),
+        eq(heartbeatRuns.cancellationRequestedAt, cancellationRequestedAt),
+        isNull(heartbeatRuns.finishedAt),
+      ))
+      .returning()
+      .then((rows) => rows[0] ?? null);
+
+    if (!cancelled) {
+      const current = await getRun(run.id);
+      if (current && isHeartbeatRunTerminalStatus(current.status)) {
+        clearProcessCancellation(run.id);
+        return current;
+      }
+      throw new Error("Heartbeat cancellation terminal state could not be persisted");
     }
 
-    await finalizeAgentStatus(run.agentId, "cancelled");
-    await startNextQueuedRunForAgent(run.agentId);
-    return cancelled;
+    const postTerminalWork: CancellationPostTerminalWork = {
+      run: cancelled,
+      reason,
+      finishedAt,
+      cancellationEvidence,
+      eventMessage: options.eventMessage ?? "run cancelled",
+      eventPayload: options.eventPayload ?? {},
+      skipPostCancelAgentWork: options.skipPostCancelAgentWork === true,
+      phase: "publish_terminal",
+    };
+    // Store synchronously immediately after the terminal CAS. A later
+    // bookkeeping failure must remain resumable even though the run no longer
+    // appears in the nonterminal cancellation query.
+    cancellationPostTerminalWorkByRunId.set(cancelled.id, postTerminalWork);
+    return await finishCancellationPostTerminalWork(cancelled.id) ?? cancelled;
+  }
+
+  async function fenceAndCancelRunsInternal(
+    runIds: string[],
+    reason: string,
+    options: CancelRunInternalOptions = {},
+  ) {
+    const uniqueRunIds = [...new Set(runIds)].filter((runId) => runId.length > 0);
+    if (uniqueRunIds.length === 0) return 0;
+
+    const requestedAt = new Date();
+    await db
+      .update(heartbeatRuns)
+      .set({ cancellationRequestedAt: requestedAt, updatedAt: requestedAt })
+      .where(and(
+        inArray(heartbeatRuns.id, uniqueRunIds),
+        inArray(heartbeatRuns.status, [...CANCELLABLE_HEARTBEAT_RUN_STATUSES]),
+        isNull(heartbeatRuns.cancellationRequestedAt),
+        isNull(heartbeatRuns.finishedAt),
+      ));
+
+    // Install every in-memory fence before awaiting termination for any one
+    // run. A single unconfirmable process must not leave later batch members
+    // able to spawn or mutate.
+    for (const runId of uniqueRunIds) {
+      sealRunMutationActivity(db, runId);
+      requestProcessCancellation(runId);
+    }
+
+    const errors: unknown[] = [];
+    for (const runId of uniqueRunIds) {
+      try {
+        await cancelRunInternal(runId, reason, options);
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    if (errors.length > 0) {
+      throw new AggregateError(errors, "One or more heartbeat cancellations remain fenced but unconfirmed");
+    }
+    return uniqueRunIds.length;
   }
 
   async function cancelActiveForAgentInternal(agentId: string, reason = "Cancelled due to agent pause", errorCode = "cancelled") {
-    const agent = await getAgent(agentId);
     const runs = await db
       .select()
       .from(heartbeatRuns)
       .where(and(eq(heartbeatRuns.agentId, agentId), inArray(heartbeatRuns.status, [...CANCELLABLE_HEARTBEAT_RUN_STATUSES])));
 
-    for (const run of runs) {
-      await setRunStatus(run.id, "cancelled", {
-        finishedAt: new Date(),
-        error: reason,
+    return fenceAndCancelRunsInternal(
+      runs.map((run) => run.id),
+      reason,
+      {
         errorCode,
-        ...(agent ? {
-          resultJson: mergeRunStopMetadataForAgent(agent, "cancelled", {
-            resultJson: parseObject(run.resultJson),
-            errorCode,
-            errorMessage: reason,
-          }),
-        } : {}),
-      });
-
-      await setWakeupStatus(run.wakeupRequestId, "cancelled", {
-        finishedAt: new Date(),
-        error: reason,
-      });
-
-      const running = runningProcesses.get(run.id);
-      if (running) {
-        await terminateHeartbeatRunProcess({
-          pid: running.child.pid ?? run.processPid,
-          processGroupId: running.processGroupId ?? run.processGroupId,
-          graceMs: Math.max(1, running.graceSec) * 1000,
-        });
-        runningProcesses.delete(run.id);
-      } else if (run.processPid || run.processGroupId) {
-        await terminateHeartbeatRunProcess({
-          pid: run.processPid,
-          processGroupId: run.processGroupId,
-        });
-      }
-      await releaseIssueExecutionAndPromote(run);
-    }
-
-    return runs.length;
+        // Bulk cancellation can run while the per-agent start lock is held.
+        // Avoid recursively trying to acquire that lock or promoting queued
+        // work between rows; the caller already owns the agent-level flow.
+        skipPostCancelAgentWork: true,
+      },
+    );
   }
 
   async function cancelPendingWakeupsForAgentsInternal(agentIds: string[], reason: string) {
@@ -16675,11 +18102,27 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
   async function cancelInvocationsForAgentsInternal(agentIds: string[], reason: string) {
     const uniqueAgentIds = [...new Set(agentIds)].filter((agentId) => agentId.length > 0);
+    const runIds = uniqueAgentIds.length > 0
+      ? await db
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(and(
+          inArray(heartbeatRuns.agentId, uniqueAgentIds),
+          inArray(heartbeatRuns.status, [...CANCELLABLE_HEARTBEAT_RUN_STATUSES]),
+        ))
+        .then((rows) => rows.map((row) => row.id))
+      : [];
     let runsCancelled = 0;
-    for (const agentId of uniqueAgentIds) {
-      runsCancelled += await cancelActiveForAgentInternal(agentId, reason);
+    let cancellationError: unknown = null;
+    try {
+      runsCancelled = await fenceAndCancelRunsInternal(runIds, reason, {
+        skipPostCancelAgentWork: true,
+      });
+    } catch (error) {
+      cancellationError = error;
     }
     const wakeupsCancelled = await cancelPendingWakeupsForAgentsInternal(uniqueAgentIds, reason);
+    if (cancellationError) throw cancellationError;
     return {
       agentIds: uniqueAgentIds,
       runsCancelled,
@@ -16689,8 +18132,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
   async function cancelBudgetScopeWork(scope: BudgetEnforcementScope) {
     if (scope.scopeType === "agent") {
-      await cancelActiveForAgentInternal(scope.scopeId, "Cancelled due to budget pause");
+      let cancellationError: unknown = null;
+      try {
+        await cancelActiveForAgentInternal(scope.scopeId, "Cancelled due to budget pause");
+      } catch (error) {
+        cancellationError = error;
+      }
       await cancelPendingWakeupsForBudgetScope(scope);
+      if (cancellationError) throw cancellationError;
       return;
     }
 
@@ -16708,11 +18157,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           .then((rows) => rows.map((row) => row.id))
         : await listProjectScopedRunIds(scope.companyId, scope.scopeId);
 
-    for (const runId of runIds) {
-      await cancelRunInternal(runId, "Cancelled due to budget pause");
+    let cancellationError: unknown = null;
+    try {
+      await fenceAndCancelRunsInternal(runIds, "Cancelled due to budget pause");
+    } catch (error) {
+      cancellationError = error;
     }
-
     await cancelPendingWakeupsForBudgetScope(scope);
+    if (cancellationError) throw cancellationError;
   }
 
   return {
@@ -16975,7 +18427,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     reportRunActivity: clearDetachedRunWarning,
 
+    suppressRunAdmissionForShutdown,
+    waitForRunAdmissionIdle,
     prepareHotRestartShutdown,
+    reconcilePendingRunCancellations,
     reconcileHotRestartAdoption,
     reapOrphanedRuns,
     // Override-aware scheduling-suppression check (honors the worktree
