@@ -603,7 +603,7 @@ describeEmbeddedPostgres("agent active-assignment capacity guardrail", () => {
     app.use(errorHandler);
 
     const res = await request(app)
-      .post(\`/api/issues/\${criticalIssue.id}/checkout\`)
+      .post(`/api/issues/${criticalIssue.id}/checkout`)
       .send({
         agentId,
         expectedStatuses: ["todo"],
