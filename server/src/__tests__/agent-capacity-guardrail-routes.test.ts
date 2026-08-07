@@ -585,4 +585,56 @@ describeEmbeddedPostgres("agent active-assignment capacity guardrail", () => {
       cap: AGENT_ACTIVE_ASSIGNMENT_HARD_CAP,
     });
   });
+  it("passes a critical checkout override through HTTP and records audit evidence", async () => {
+    const companyId = await seedCompany();
+    const managerId = await seedAgent(companyId, { role: "manager" });
+    const agentId = await seedAgent(companyId, { reportsTo: managerId });
+    await seedActiveIssues(companyId, agentId, AGENT_ACTIVE_ASSIGNMENT_HARD_CAP);
+    const [criticalIssue] = await db
+      .insert(issues)
+      .values({ companyId, title: "Critical checkout", status: "todo", priority: "critical" })
+      .returning({ id: issues.id });
+    const overrideReason = "Sev1 checkout outage, on-call owns this";
+
+    const app = express();
+    app.use(express.json());
+    app.use(actorMiddleware(db, { deploymentMode: "local_trusted" }));
+    app.use("/api", issueRoutes(db, {} as any));
+    app.use(errorHandler);
+
+    const res = await request(app)
+      .post(\`/api/issues/\${criticalIssue.id}/checkout\`)
+      .send({
+        agentId,
+        expectedStatuses: ["todo"],
+        capacityOverride: { reason: overrideReason },
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body).toMatchObject({
+      id: criticalIssue.id,
+      assigneeAgentId: agentId,
+      status: "in_progress",
+    });
+    expect(await countActiveAssignments(db, companyId, agentId)).toBe(
+      AGENT_ACTIVE_ASSIGNMENT_HARD_CAP + 1,
+    );
+
+    const overrides = (await activityActions(companyId)).filter(
+      (row) => row.action === AGENT_CAPACITY_ACTIVITY_ACTIONS.overridden,
+    );
+    expect(overrides).toHaveLength(1);
+    expect(overrides[0].details).toMatchObject({
+      actorType: "agent",
+      actorId: agentId,
+      targetAgentId: agentId,
+      issueId: criticalIssue.id,
+      activeCount: AGENT_ACTIVE_ASSIGNMENT_HARD_CAP,
+      projectedCount: AGENT_ACTIVE_ASSIGNMENT_HARD_CAP + 1,
+      overrideReason,
+      mutation: "issue.checkout",
+      priority: "critical",
+    });
+  });
+
 });
