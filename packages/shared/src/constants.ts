@@ -213,6 +213,26 @@ export const INBOX_MINE_ISSUE_STATUS_FILTER = INBOX_MINE_ISSUE_STATUSES.join(","
 
 export const ISSUE_PRIORITIES = ["critical", "high", "medium", "low"] as const;
 export type IssuePriority = (typeof ISSUE_PRIORITIES)[number];
+
+/**
+ * Statuses that count against an agent's active-assignment capacity.
+ * Deliberately excludes `backlog` and `blocked`: those are parked, not active work,
+ * so draining an issue into either one always reduces measured load.
+ */
+export const AGENT_ACTIVE_ASSIGNMENT_STATUSES = ["todo", "in_progress", "in_review"] as const;
+export type AgentActiveAssignmentStatus = (typeof AGENT_ACTIVE_ASSIGNMENT_STATUSES)[number];
+
+/** Active-assignment count at which a manager escalation episode opens. */
+export const AGENT_ACTIVE_ASSIGNMENT_WARN_THRESHOLD = 45;
+/** Hard cap: an assignment that would take an agent above this count is rejected. */
+export const AGENT_ACTIVE_ASSIGNMENT_HARD_CAP = 50;
+/** Minimum length of the reason string required to exceed the hard cap. */
+export const AGENT_CAPACITY_OVERRIDE_MIN_REASON_LENGTH = 12;
+/** Only this priority may carry a capacity override ("P1" in policy language). */
+export const AGENT_CAPACITY_OVERRIDE_PRIORITY = "critical" as const;
+/** Origin kind for the manager escalation issue opened at the warn threshold. */
+export const AGENT_CAPACITY_ESCALATION_ORIGIN_KIND = "agent_capacity_escalation";
+
 export const ISSUE_WORK_MODES = ["standard", "ask", "planning", "skill_test"] as const;
 export type IssueWorkMode = (typeof ISSUE_WORK_MODES)[number];
 export const ISSUE_HARNESS_KINDS = ["skill_test"] as const;
@@ -292,6 +312,7 @@ export const ISSUE_ORIGIN_KINDS = [
   "stranded_issue_recovery",
   "task_watchdog",
   TASK_WATCHDOG_PRODUCT_BUG_ORIGIN_KIND,
+  AGENT_CAPACITY_ESCALATION_ORIGIN_KIND,
 ] as const;
 export type BuiltInIssueOriginKind = (typeof ISSUE_ORIGIN_KINDS)[number];
 export type PluginIssueOriginKind = `plugin:${string}`;

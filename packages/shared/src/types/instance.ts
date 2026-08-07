@@ -53,6 +53,12 @@ export interface InstanceExperimentalSettings {
   enableCases: boolean;
   enableConferenceRoomChat: boolean;
   enableTaskWatchdogs: boolean;
+  /**
+   * Enforce the per-agent active-assignment capacity guardrail.
+   * When false the guardrail still evaluates and records activity evidence,
+   * but never rejects an assignment (observe mode). It is never silently off.
+   */
+  enableActiveAssignmentCapacityGuardrail: boolean;
   enableIssuePlanDecompositions: boolean;
   enableExperimentalFileViewer: boolean;
   enableCloudSync: boolean;

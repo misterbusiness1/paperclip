@@ -212,6 +212,8 @@ export function normalizeExperimentalSettings(raw: unknown): InstanceExperimenta
       enableIssuePlanDecompositions: parsed.data.enableIssuePlanDecompositions ?? false,
       enableExperimentalFileViewer: parsed.data.enableExperimentalFileViewer ?? false,
       enableTaskWatchdogs: parsed.data.enableTaskWatchdogs ?? false,
+      enableActiveAssignmentCapacityGuardrail:
+        parsed.data.enableActiveAssignmentCapacityGuardrail ?? false,
       enableCloudSync: parsed.data.enableCloudSync ?? false,
       enableExternalObjects: parsed.data.enableExternalObjects ?? false,
       enableSmokeLab: parsed.data.enableSmokeLab ?? false,
@@ -242,6 +244,7 @@ export function normalizeExperimentalSettings(raw: unknown): InstanceExperimenta
     enableCases: false,
     enableConferenceRoomChat: false,
     enableTaskWatchdogs: false,
+    enableActiveAssignmentCapacityGuardrail: false,
     enableIssuePlanDecompositions: false,
     enableExperimentalFileViewer: false,
     enableCloudSync: false,
