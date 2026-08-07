@@ -1,5 +1,5 @@
 import { Buffer } from "node:buffer";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { and, asc, desc, eq, gt, gte, inArray, isNull, like, lt, ne, notInArray, or, sql, type SQL } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
@@ -92,6 +92,13 @@ import { resolveIssueGoalId, resolveNextIssueGoalId } from "./issue-goal-fallbac
 import { getRunLogStore } from "./run-log-store.js";
 import { getDefaultCompanyGoal } from "./goals.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
+import {
+  assertAgentCapacityForAssignment,
+  isCapacityGuardedAssignment,
+  lockAgentCapacitySlot,
+  scheduleAgentCapacityEpisodeReconcile,
+  type AgentCapacityOverride,
+} from "./agent-capacity.js";
 import {
   summarizeIssueWatchdog,
   upsertIssueWatchdogForIssue,
@@ -606,6 +613,7 @@ type IssueCreateInput = Omit<typeof issues.$inferInsert, "companyId"> & {
   idempotencyKey?: string | null;
   allowDuplicate?: boolean;
   onDeduplicated?: (reason: "idempotency_key" | "recent_open_title") => void;
+  capacityOverride?: AgentCapacityOverride | null;
 };
 type IssueChildCreateInput = IssueCreateInput & {
   acceptanceCriteria?: string[];
@@ -3762,6 +3770,50 @@ export function issueService(db: Db) {
     return title.trim().replace(/\s+/g, " ").toLowerCase();
   }
 
+  /**
+   * Capacity guard for the checkout claim paths. A checkout that keeps the same
+   * owner is not a new assignment, so a saturated agent can still resume work it
+   * already holds; only claiming an issue it does not own is guarded.
+   */
+  async function guardCheckoutCapacity(
+    tx: any,
+    input: {
+      issueId: string;
+      companyId: string;
+      agentId: string;
+      capacityOverride?: AgentCapacityOverride | null;
+      runId: string | null;
+    },
+  ) {
+    const previous = await tx
+      .select({ assigneeAgentId: issues.assigneeAgentId, priority: issues.priority })
+      .from(issues)
+      .where(eq(issues.id, input.issueId))
+      .then((rows: Array<{ assigneeAgentId: string | null; priority: string }>) => rows[0] ?? null);
+    if (!previous) return;
+    if (
+      !isCapacityGuardedAssignment({
+        previousAssigneeAgentId: previous.assigneeAgentId,
+        nextAssigneeAgentId: input.agentId,
+        nextStatus: "in_progress",
+      })
+    ) {
+      return;
+    }
+    await lockAgentCapacitySlot(tx as unknown as Db, input.companyId, input.agentId);
+    await assertAgentCapacityForAssignment(db, tx as unknown as Db, {
+      companyId: input.companyId,
+      agentId: input.agentId,
+      issueId: input.issueId,
+      priority: previous.priority,
+      override: input.capacityOverride ?? null,
+      mutation: "issue.checkout",
+      actorType: "agent",
+      actorId: input.agentId,
+      runId: input.runId,
+    });
+  }
+
   async function getIssueByUuid(id: string) {
     const row = await db
       .select()
@@ -6150,6 +6202,7 @@ export function issueService(db: Db) {
         idempotencyKey: rawIdempotencyKey,
         allowDuplicate,
         onDeduplicated,
+        capacityOverride,
         ...issueData
       } = data;
       const isolatedWorkspacesEnabled = (await instanceSettings.getExperimental()).enableIsolatedWorkspaces;
@@ -6170,7 +6223,7 @@ export function issueService(db: Db) {
       if (data.status === "in_progress" && !data.assigneeAgentId && !data.assigneeUserId) {
         throw unprocessable("in_progress issues require an assignee");
       }
-      return db.transaction(async (tx) => {
+      const created = await db.transaction(async (tx) => {
         const idempotencyKey = rawIdempotencyKey?.trim() || null;
         const normalizedTitle = normalizeCreateIssueTitle(issueData.title);
         if (allowDuplicate === false) {
@@ -6387,6 +6440,9 @@ export function issueService(db: Db) {
         });
 
         const values = {
+          // Allocate the id before the capacity decision so an authorized
+          // override can name the exact issue in its atomic audit evidence.
+          id: issueData.id ?? randomUUID(),
           ...issueData,
           responsibleUserId,
           requestDepth: clampIssueRequestDepth(issueData.requestDepth),
@@ -6423,6 +6479,27 @@ export function issueService(db: Db) {
             assigneeUserId: values.assigneeUserId ?? null,
           }),
         );
+
+        if (
+          isCapacityGuardedAssignment({
+            previousAssigneeAgentId: null,
+            nextAssigneeAgentId: values.assigneeAgentId,
+            nextStatus: values.status,
+          })
+        ) {
+          await lockAgentCapacitySlot(tx as unknown as Db, companyId, values.assigneeAgentId as string);
+          await assertAgentCapacityForAssignment(db, tx as unknown as Db, {
+            companyId,
+            agentId: values.assigneeAgentId as string,
+            issueId: values.id as string,
+            priority: values.priority,
+            override: capacityOverride ?? null,
+            mutation: "issue.create",
+            actorType: issueData.createdByAgentId ? "agent" : issueData.createdByUserId ? "user" : "system",
+            actorId: issueData.createdByAgentId ?? issueData.createdByUserId ?? "system",
+            runId: actorRunId ?? null,
+          });
+        }
 
         const [issue] = await tx.insert(issues).values(values).returning();
         if (idempotencyKey) {
@@ -6462,6 +6539,12 @@ export function issueService(db: Db) {
         const [withRelations] = await withIssueRelationSummaries(companyId, [enriched], tx);
         return withRelations;
       });
+      void scheduleAgentCapacityEpisodeReconcile(db, {
+        companyId,
+        agentId: created?.assigneeAgentId ?? null,
+        runId: actorRunId ?? null,
+      });
+      return created;
     },
 
     update: async (
@@ -6471,6 +6554,8 @@ export function issueService(db: Db) {
         blockedByIssueIds?: string[];
         actorAgentId?: string | null;
         actorUserId?: string | null;
+        actorRunId?: string | null;
+        capacityOverride?: AgentCapacityOverride | null;
       },
       dbOrTx: any = db,
     ) => {
@@ -6486,6 +6571,8 @@ export function issueService(db: Db) {
         blockedByIssueIds,
         actorAgentId,
         actorUserId,
+        actorRunId,
+        capacityOverride,
         ...issueData
       } = data;
       const isolatedWorkspacesEnabled = (await instanceSettings.getExperimental()).enableIsolatedWorkspaces;
@@ -6632,6 +6719,28 @@ export function issueService(db: Db) {
           projectGoalId: nextProjectGoalId,
           defaultGoalId: defaultCompanyGoal?.id ?? null,
         });
+        const nextStatus = patch.status ?? existing.status;
+        if (
+          isCapacityGuardedAssignment({
+            previousAssigneeAgentId: existing.assigneeAgentId,
+            nextAssigneeAgentId: nextAssigneeAgentId,
+            nextStatus,
+          })
+        ) {
+          await lockAgentCapacitySlot(tx as unknown as Db, existing.companyId, nextAssigneeAgentId as string);
+          await assertAgentCapacityForAssignment(db, tx as unknown as Db, {
+            companyId: existing.companyId,
+            agentId: nextAssigneeAgentId as string,
+            issueId: id,
+            priority: patch.priority ?? existing.priority,
+            override: capacityOverride ?? null,
+            mutation: "issue.update",
+            actorType: actorAgentId ? "agent" : actorUserId ? "user" : "system",
+            actorId: actorAgentId ?? actorUserId ?? "system",
+            runId: actorRunId ?? null,
+          });
+        }
+
         const updated = await tx
           .update(issues)
           .set(patch)
@@ -6714,7 +6823,24 @@ export function issueService(db: Db) {
         return enriched;
       };
 
-      return dbOrTx === db ? db.transaction(runUpdate) : runUpdate(dbOrTx);
+      if (dbOrTx !== db) {
+        // Joining a caller-owned transaction: a reconcile here would read
+        // uncommitted state, so the owning caller is responsible for it.
+        return runUpdate(dbOrTx);
+      }
+      const updated = await db.transaction(runUpdate);
+      // Reconcile both sides: the new owner may have crossed the warn
+      // threshold, and the previous owner may have dropped back below it.
+      for (const agentId of new Set(
+        [existing.assigneeAgentId, updated?.assigneeAgentId ?? null].filter(Boolean) as string[],
+      )) {
+        void scheduleAgentCapacityEpisodeReconcile(db, {
+          companyId: existing.companyId,
+          agentId,
+          runId: actorRunId ?? null,
+        });
+      }
+      return updated;
     },
 
     clearExecutionWorkspaceEnvironmentSelection: async (companyId: string, environmentId: string) => {
@@ -6784,7 +6910,13 @@ export function issueService(db: Db) {
         return enriched;
       }),
 
-    checkout: async (id: string, agentId: string, expectedStatuses: string[], checkoutRunId: string | null) => {
+    checkout: async (
+      id: string,
+      agentId: string,
+      expectedStatuses: string[],
+      checkoutRunId: string | null,
+      options: { capacityOverride?: AgentCapacityOverride | null } = {},
+    ) => {
       const issueCompany = await db
         .select({ companyId: issues.companyId })
         .from(issues)
@@ -6826,29 +6958,47 @@ export function issueService(db: Db) {
       const executionLockCondition = checkoutRunId
         ? or(isNull(issues.executionRunId), eq(issues.executionRunId, checkoutRunId))
         : isNull(issues.executionRunId);
-      const updated = await db
-        .update(issues)
-        .set({
-          assigneeAgentId: agentId,
-          assigneeUserId: null,
-          checkoutRunId,
-          executionRunId: checkoutRunId,
-          status: "in_progress",
-          startedAt: now,
-          updatedAt: now,
-        })
-        .where(
-          and(
-            eq(issues.id, id),
-            inArray(issues.status, expectedStatuses),
-            or(isNull(issues.assigneeAgentId), sameRunAssigneeCondition),
-            executionLockCondition,
-          ),
-        )
-        .returning()
-        .then((rows) => rows[0] ?? null);
+      // The claim runs inside a transaction so the capacity lock, the capacity
+      // count, and the compare-and-swap all commit as one unit. Without the
+      // transaction the advisory lock would be released before the write and
+      // concurrent claimants could each read the same under-cap count.
+      const updated = await db.transaction(async (tx) => {
+        await guardCheckoutCapacity(tx, {
+          issueId: id,
+          companyId: issueCompany.companyId,
+          agentId,
+          capacityOverride: options.capacityOverride ?? null,
+          runId: checkoutRunId,
+        });
+        return tx
+          .update(issues)
+          .set({
+            assigneeAgentId: agentId,
+            assigneeUserId: null,
+            checkoutRunId,
+            executionRunId: checkoutRunId,
+            status: "in_progress",
+            startedAt: now,
+            updatedAt: now,
+          })
+          .where(
+            and(
+              eq(issues.id, id),
+              inArray(issues.status, expectedStatuses),
+              or(isNull(issues.assigneeAgentId), sameRunAssigneeCondition),
+              executionLockCondition,
+            ),
+          )
+          .returning()
+          .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
+      });
 
       if (updated) {
+        void scheduleAgentCapacityEpisodeReconcile(db, {
+          companyId: issueCompany.companyId,
+          agentId,
+          runId: checkoutRunId,
+        });
         const [enriched] = await withIssueLabels(db, [updated]);
         return enriched;
       }
@@ -6925,7 +7075,8 @@ export function issueService(db: Db) {
         current.executionRunId !== checkoutRunId &&
         (current.assigneeAgentId === agentId || current.assigneeAgentId == null)
       ) {
-        const stale = await isTerminalOrMissingHeartbeatRun(current.executionRunId);
+        const staleExecutionRunId = current.executionRunId;
+        const stale = await isTerminalOrMissingHeartbeatRun(staleExecutionRunId);
         if (stale) {
           const now = new Date();
           const adoptionSet: Record<string, unknown> = {
@@ -6940,20 +7091,34 @@ export function issueService(db: Db) {
           if (current.status !== "in_progress") {
             adoptionSet.startedAt = now;
           }
-          const adopted = await db
-            .update(issues)
-            .set(adoptionSet)
-            .where(
-              and(
-                eq(issues.id, id),
-                inArray(issues.status, expectedStatuses),
-                eq(issues.executionRunId, current.executionRunId),
-                or(isNull(issues.assigneeAgentId), eq(issues.assigneeAgentId, agentId)),
-              ),
-            )
-            .returning()
-            .then((rows) => rows[0] ?? null);
+          const adopted = await db.transaction(async (tx) => {
+            await guardCheckoutCapacity(tx, {
+              issueId: id,
+              companyId: issueCompany.companyId,
+              agentId,
+              capacityOverride: options.capacityOverride ?? null,
+              runId: checkoutRunId,
+            });
+            return tx
+              .update(issues)
+              .set(adoptionSet)
+              .where(
+                and(
+                  eq(issues.id, id),
+                  inArray(issues.status, expectedStatuses),
+                  eq(issues.executionRunId, staleExecutionRunId),
+                  or(isNull(issues.assigneeAgentId), eq(issues.assigneeAgentId, agentId)),
+                ),
+              )
+              .returning()
+              .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
+          });
           if (adopted) {
+            void scheduleAgentCapacityEpisodeReconcile(db, {
+              companyId: issueCompany.companyId,
+              agentId,
+              runId: checkoutRunId,
+            });
             const [enriched] = await withIssueLabels(db, [adopted]);
             return enriched;
           }
@@ -7125,8 +7290,8 @@ export function issueService(db: Db) {
       });
     },
 
-    release: async (id: string, actorAgentId?: string, actorRunId?: string | null) =>
-      db.transaction(async (tx) => {
+    release: async (id: string, actorAgentId?: string, actorRunId?: string | null) => {
+      const released = await db.transaction(async (tx) => {
         await tx.execute(
           sql`select ${issues.id} from ${issues} where ${issues.id} = ${id} for update`,
         );
@@ -7176,17 +7341,28 @@ export function issueService(db: Db) {
           .then((rows) => rows[0] ?? null);
         if (!updated) return null;
         const [enriched] = await withIssueLabels(tx, [updated]);
-        return enriched;
-      }),
+        return { issue: enriched, previousAssigneeAgentId: existing.assigneeAgentId };
+      });
+      if (!released) return null;
+      // Release always reduces the previous owner's active load.
+      void scheduleAgentCapacityEpisodeReconcile(db, {
+        companyId: released.issue.companyId,
+        agentId: released.previousAssigneeAgentId,
+        runId: actorRunId ?? null,
+      });
+      return released.issue;
+    },
 
-    adminForceRelease: async (id: string, options: { clearAssignee?: boolean } = {}) =>
-      db.transaction(async (tx) => {
+    adminForceRelease: async (id: string, options: { clearAssignee?: boolean } = {}) => {
+      const forced = await db.transaction(async (tx) => {
         await tx.execute(
           sql`select ${issues.id} from ${issues} where ${issues.id} = ${id} for update`,
         );
         const existing = await tx
           .select({
             id: issues.id,
+            companyId: issues.companyId,
+            assigneeAgentId: issues.assigneeAgentId,
             checkoutRunId: issues.checkoutRunId,
             executionRunId: issues.executionRunId,
           })
@@ -7217,12 +7393,23 @@ export function issueService(db: Db) {
         const [enriched] = await withIssueLabels(tx, [updated]);
         return {
           issue: enriched,
+          previousAssigneeAgentId: existing.assigneeAgentId,
+          companyId: existing.companyId,
           previous: {
             checkoutRunId: existing.checkoutRunId,
             executionRunId: existing.executionRunId,
           },
         };
-      }),
+      });
+      if (!forced) return null;
+      if (options.clearAssignee) {
+        void scheduleAgentCapacityEpisodeReconcile(db, {
+          companyId: forced.companyId,
+          agentId: forced.previousAssigneeAgentId,
+        });
+      }
+      return { issue: forced.issue, previous: forced.previous };
+    },
 
     listLabels: (companyId: string) =>
       db.select().from(labels).where(eq(labels.companyId, companyId)).orderBy(asc(labels.name), asc(labels.id)),

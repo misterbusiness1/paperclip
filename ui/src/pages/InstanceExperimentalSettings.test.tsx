@@ -65,6 +65,7 @@ function defaultExperimentalSettings(): InstanceExperimentalSettingsPayload {
   return {
     enableEnvironments: false,
     enableIsolatedWorkspaces: false,
+    enableActiveAssignmentCapacityGuardrail: false,
     enableStreamlinedLeftNavigation: true,
     enableApps: false,
     enablePipelines: false,

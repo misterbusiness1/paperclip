@@ -120,6 +120,7 @@ import {
   routineService,
   workProductService,
 } from "../services/index.js";
+import { setAgentCapacityEscalationDeps } from "../services/agent-capacity.js";
 import { buildPlanReviewContext } from "../services/plan-review-context.js";
 import { hydrateSuccessfulRunHandoffLiveness } from "../services/successful-run-handoff-state.js";
 import {
@@ -2581,6 +2582,14 @@ export function issueRoutes(
     pluginWorkerManager: opts.pluginWorkerManager,
   });
   const enqueueRecoveryActionWakeup = opts.recoveryActionEnqueueWakeup ?? heartbeat.wakeup;
+  // Capacity escalations create an issue and wake its owner. Registered here
+  // rather than imported by the capacity service, which `issueService` imports.
+  setAgentCapacityEscalationDeps({
+    createIssue: (companyId, data) => svc.create(companyId, data as Parameters<typeof svc.create>[1]),
+    updateIssue: (issueId, patch) => svc.update(issueId, patch as Parameters<typeof svc.update>[1]),
+    wakeup: (agentId, wakeupOpts) =>
+      heartbeat.wakeup(agentId, wakeupOpts as Parameters<typeof heartbeat.wakeup>[1]),
+  });
   const feedback = feedbackService(db);
   const companiesSvc = companyService(db);
   let searchSvc = opts.searchService ?? null;
@@ -8849,7 +8858,9 @@ export function issueRoutes(
 
     const checkoutRunId = requireAgentRunId(req, res);
     if (req.actor.type === "agent" && !checkoutRunId) return;
-    const updated = await svc.checkout(id, req.body.agentId, req.body.expectedStatuses, checkoutRunId);
+    const updated = await svc.checkout(id, req.body.agentId, req.body.expectedStatuses, checkoutRunId, {
+      capacityOverride: req.body.capacityOverride,
+    });
     const actor = getActorInfo(req);
     if (updated?.harnessKind === "skill_test") {
       await companySkillsSvc.markTestRunRunning(updated.companyId, updated.id);

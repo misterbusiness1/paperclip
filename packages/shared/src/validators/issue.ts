@@ -11,6 +11,7 @@ import {
   ISSUE_COMMENT_AUTHOR_TYPES,
   ISSUE_COMMENT_METADATA_ROW_TYPES,
   ISSUE_COMMENT_PRESENTATION_KINDS,
+  AGENT_CAPACITY_OVERRIDE_MIN_REASON_LENGTH,
   ISSUE_COMMENT_PRESENTATION_TONES,
   ISSUE_HARNESS_KINDS,
   ISSUE_MONITOR_SCHEDULED_BY,
@@ -375,6 +376,15 @@ function withCreateIssueStatusDefault<T extends z.ZodRawShape>(schema: z.ZodObje
   }, schema);
 }
 
+/**
+ * Reason-bearing override for the per-agent active-assignment cap.
+ * The server additionally requires the resulting issue to be `critical` priority
+ * ("P1"); anything less is rejected with `agent_capacity_override_invalid`.
+ */
+export const agentCapacityOverrideSchema = z.object({
+  reason: z.string().trim().min(AGENT_CAPACITY_OVERRIDE_MIN_REASON_LENGTH),
+}).strict();
+
 const createIssueBaseSchema = z.object({
   projectId: z.string().uuid().optional().nullable(),
   projectWorkspaceId: z.string().uuid().optional().nullable(),
@@ -390,6 +400,7 @@ const createIssueBaseSchema = z.object({
   priority: z.enum(ISSUE_PRIORITIES).optional().default("medium"),
   assigneeAgentId: z.string().uuid().optional().nullable(),
   assigneeUserId: z.string().optional().nullable(),
+  capacityOverride: agentCapacityOverrideSchema.optional().nullable(),
   requestDepth: issueRequestDepthInputSchema.optional().default(0),
   createdByUserId: z.string().optional().nullable(),
   responsibleUserId: z.string().optional().nullable(),
@@ -482,6 +493,7 @@ export type IssueExecutionWorkspaceSettings = z.infer<typeof issueExecutionWorks
 export const checkoutIssueSchema = z.object({
   agentId: z.string().uuid(),
   expectedStatuses: z.array(z.enum(ISSUE_STATUSES)).nonempty(),
+  capacityOverride: agentCapacityOverrideSchema.optional().nullable(),
 });
 
 export type CheckoutIssue = z.infer<typeof checkoutIssueSchema>;
