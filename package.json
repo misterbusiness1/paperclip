@@ -81,7 +81,7 @@
       "acpx@0.12.0": "patches/acpx@0.12.0.patch"
     },
     "overrides": {
-      "rollup": ">=4.59.0",
+      "rollup": ">=4.59.0 <5",
       "react": "^19.2.7",
       "react-dom": "^19.2.7",
       "lexical": "0.46.0",
@@ -93,7 +93,22 @@
       "@lexical/react": "0.46.0",
       "@lexical/rich-text": "0.46.0",
       "@lexical/selection": "0.46.0",
-      "@lexical/utils": "0.46.0"
+      "@lexical/utils": "0.46.0",
+      "fast-uri": ">=3.1.5 <4",
+      "hono": ">=4.12.25 <5",
+      "ip-address": ">=10.3.1 <11",
+      "js-yaml": ">=4.3.1 <5",
+      "nanoid@<4.0.0": ">=3.3.18 <4",
+      "nanoid@>=4.0.0 <6.0.0": ">=5.1.16 <6",
+      "path-to-regexp": ">=8.4.0 <9",
+      "picomatch": ">=4.0.4 <5",
+      "postcss": ">=8.5.18 <9",
+      "react-router": ">=7.18.2 <8",
+      "tar": ">=7.5.19 <8",
+      "undici": ">=7.29.0 <8",
+      "vite": ">=6.4.3 <7",
+      "brace-expansion@<2.0.0": "1.1.18",
+      "brace-expansion@>=2.0.0 <3.0.0": "2.1.4"
     }
   }
 }
