@@ -24,6 +24,19 @@ test("release workflow delegates stable and canary verification to the reusable 
   assert.doesNotMatch(releaseWorkflow, /verify_(?:canary|stable):[\s\S]*?pnpm test:run(?:\n|$)/);
 });
 
+test("release workflow publishes packages only from the canonical repository", () => {
+  const releaseWorkflow = readWorkflow("release.yml");
+
+  assert.match(
+    releaseWorkflow,
+    /publish_canary:\n\s+if: github\.event_name == 'push' && github\.repository == 'paperclipai\/paperclip'/,
+  );
+  assert.match(
+    releaseWorkflow,
+    /publish_stable:\n\s+if: github\.event_name == 'workflow_dispatch' && !inputs\.dry_run && github\.repository == 'paperclipai\/paperclip'/,
+  );
+});
+
 test("release verify workflow covers the same split test surface as stable PR verification", () => {
   const verifyWorkflow = readWorkflow("release-verify.yml");
 
