@@ -1,3 +1,6 @@
+import { mkdtemp, stat } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -36,20 +39,49 @@ vi.mock("../services/index.js", () => ({
   workspaceOperationService: () => mockWorkspaceOperationService,
 }));
 
+vi.mock("../services/environment-runtime.js", () => ({
+  environmentRuntimeService: () => ({
+    destroyReusableSandboxLeases: vi.fn().mockResolvedValue(null),
+  }),
+}));
+
+vi.mock("../services/workspace-runtime.js", async (importOriginal) => {
+  const actual = await importOriginal<Record<string, unknown>>();
+  return {
+    ...actual,
+    stopRuntimeServicesForExecutionWorkspace: vi.fn().mockResolvedValue(null),
+  };
+});
+
+const mockDb = {
+  update: vi.fn(() => ({
+    set: vi.fn(() => ({
+      where: vi.fn(async () => undefined),
+    })),
+  })),
+  select: vi.fn(() => ({
+    from: vi.fn(() => ({
+      where: vi.fn(() => ({
+        then: vi.fn(async (resolve: (rows: unknown[]) => unknown) => resolve([])),
+      })),
+    })),
+  })),
+};
+
 function createApp(actor: Record<string, unknown> = {
   type: "board",
   userId: "local-board",
   companyIds: ["company-1"],
   source: "session",
   isInstanceAdmin: false,
-}) {
+}, db: any = ({} as any)) {
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
     (req as any).actor = actor;
     next();
   });
-  app.use("/api", executionWorkspaceRoutes({} as any));
+  app.use("/api", executionWorkspaceRoutes(db));
   app.use(errorHandler);
   return app;
 }
@@ -388,5 +420,50 @@ describe.sequential("execution workspace routes", () => {
         source: "execution_workspace.quarantine_restore",
       }),
     }));
+  });
+
+  it("archives a shared local_fs workspace without flipping to cleanup_failed or deleting the directory", async () => {
+    const sharedDir = await mkdtemp(path.join(tmpdir(), "oxfa-26683-shared-"));
+    const existing = {
+      id: "workspace-shared-1",
+      companyId: "company-1",
+      status: "active",
+      mode: "shared_workspace",
+      providerType: "local_fs",
+      providerRef: null,
+      cwd: sharedDir,
+      branchName: null,
+      repoUrl: null,
+      baseRef: null,
+      projectId: null,
+      projectWorkspaceId: null,
+      sourceIssueId: null,
+      metadata: { createdByRuntime: false },
+    };
+    mockExecutionWorkspaceService.getById.mockResolvedValue(existing);
+    mockExecutionWorkspaceService.getCloseReadiness.mockResolvedValue({
+      state: "ready",
+      blockingReasons: [],
+      plannedActions: [{ kind: "archive_record" }],
+    });
+    mockExecutionWorkspaceService.update.mockResolvedValue({
+      ...existing,
+      status: "archived",
+      cleanupReason: null,
+    });
+
+    const res = await request(createApp(undefined, mockDb))
+      .patch("/api/execution-workspaces/workspace-shared-1")
+      .send({ status: "archived" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe("archived");
+    expect(res.body.cleanupReason).toBeNull();
+    expect(mockExecutionWorkspaceService.update).toHaveBeenCalledTimes(1);
+    expect(mockExecutionWorkspaceService.update).toHaveBeenCalledWith(
+      "workspace-shared-1",
+      expect.objectContaining({ status: "archived", cleanupReason: null }),
+    );
+    await expect(stat(sharedDir)).resolves.toBeTruthy();
   });
 });
