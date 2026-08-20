@@ -3,7 +3,13 @@
 import { act } from "react";
 import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { ApprovalPayloadRenderer, approvalLabel, isEmailReplyPayload } from "./ApprovalPayload";
+import {
+  ApprovalPayloadRenderer,
+  approvalDecisionBrief,
+  approvalExcerpt,
+  approvalLabel,
+  isEmailReplyPayload,
+} from "./ApprovalPayload";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
@@ -15,6 +21,45 @@ describe("approvalLabel", () => {
         title: "Reply with an ASCII frog",
       }),
     ).toBe("Board Approval: Reply with an ASCII frog");
+  });
+});
+
+describe("approvalDecisionBrief", () => {
+  it("normalizes explicit reasoning, benefits, and tradeoffs without duplicates", () => {
+    expect(
+      approvalDecisionBrief({
+        recommendedAction: "Approve the bounded test.",
+        rationale: "It isolates the decision.",
+        benefits: ["Fast feedback", "Fast feedback", "  Reversible  "],
+        risks: ["May miss a long-tail case"],
+        tradeoffs: "Requires one follow-up check",
+        nextActionOnApproval: "Run the dry test.",
+      }),
+    ).toEqual({
+      recommendation: "Approve the bounded test.",
+      reasoning: "It isolates the decision.",
+      pros: ["Fast feedback", "Reversible"],
+      cons: ["May miss a long-tail case", "Requires one follow-up check"],
+      nextAction: "Run the dry test.",
+    });
+  });
+
+  it("uses the summary as reasoning when no explicit rationale is supplied", () => {
+    expect(approvalDecisionBrief({ summary: "A concise decision summary." }).reasoning).toBe(
+      "A concise decision summary.",
+    );
+  });
+});
+
+describe("approvalExcerpt", () => {
+  it("removes lightweight markdown and truncates at a word boundary", () => {
+    expect(approvalExcerpt("**Approve:** [Run the bounded check](https://example.test) now.", 32)).toBe(
+      "Approve: Run the bounded check…",
+    );
+  });
+
+  it("preserves order numbers and comparison symbols", () => {
+    expect(approvalExcerpt("Order #90210: margin > cost")).toBe("Order #90210: margin > cost");
   });
 });
 

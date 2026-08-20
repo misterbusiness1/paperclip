@@ -17,6 +17,76 @@ function firstNonEmptyString(...values: unknown[]): string | null {
   return null;
 }
 
+function uniqueStrings(...values: unknown[]): string[] {
+  const items = values.flatMap((value) => (Array.isArray(value) ? value : [value]));
+  const seen = new Set<string>();
+
+  return items.flatMap((value) => {
+    if (typeof value !== "string") return [];
+    const item = value.trim();
+    const key = item.toLocaleLowerCase();
+    if (!item || seen.has(key)) return [];
+    seen.add(key);
+    return [item];
+  });
+}
+
+export function approvalDecisionBrief(payload?: Record<string, unknown> | null) {
+  return {
+    recommendation: firstNonEmptyString(
+      payload?.recommendedAction,
+      payload?.recommendation,
+      payload?.proposedAction,
+    ),
+    reasoning: firstNonEmptyString(
+      payload?.reasoning,
+      payload?.rationale,
+      payload?.justification,
+      payload?.decisionReasoning,
+      payload?.summary,
+      payload?.intent,
+      payload?.guidance,
+      payload?.description,
+      payload?.strategy,
+      payload?.plan,
+      payload?.capabilities,
+    ),
+    pros: uniqueStrings(
+      payload?.pros,
+      payload?.benefits,
+      payload?.reasonsToApprove,
+      payload?.advantages,
+      payload?.upside,
+    ),
+    cons: uniqueStrings(
+      payload?.cons,
+      payload?.risks,
+      payload?.reasonsNotToApprove,
+      payload?.tradeoffs,
+      payload?.drawbacks,
+      payload?.downside,
+    ),
+    nextAction: firstNonEmptyString(payload?.nextActionOnApproval),
+  };
+}
+
+export function approvalExcerpt(value: string | null, maxLength = 240): string | null {
+  if (!value) return null;
+  const plain = value
+    .replace(/!\[([^\]]*)\]\([^)]*\)/g, "$1")
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
+    .replace(/^\s{0,3}(?:#{1,6}|>|[-+])\s+/gm, "")
+    .replace(/[`*_~]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (plain.length <= maxLength) return plain;
+
+  const clipped = plain.slice(0, maxLength + 1);
+  const wordBoundary = clipped.lastIndexOf(" ");
+  const end = wordBoundary > maxLength / 2 ? wordBoundary : maxLength;
+  return `${plain.slice(0, end).trimEnd()}…`;
+}
+
 export function approvalSubject(payload?: Record<string, unknown> | null): string | null {
   return firstNonEmptyString(
     payload?.title,
@@ -285,7 +355,7 @@ export function EmailReplyPayload({ payload }: { payload: Record<string, unknown
             </div>
           )}
         </div>
-        <div className="max-h-[28rem] overflow-y-auto whitespace-pre-wrap px-4 py-3.5 leading-6 text-foreground">
+        <div className="max-h-96 overflow-y-auto whitespace-pre-wrap px-4 py-3.5 leading-6 text-foreground">
           {body}
         </div>
       </div>

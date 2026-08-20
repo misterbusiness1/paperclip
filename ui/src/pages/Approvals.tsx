@@ -13,8 +13,10 @@ import { ShieldCheck } from "lucide-react";
 import { ApprovalCard } from "../components/ApprovalCard";
 import { PageSkeleton } from "../components/PageSkeleton";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 
 type StatusFilter = "pending" | "all";
+const PAGE_SIZE = 20;
 
 export function Approvals() {
   const { selectedCompanyId } = useCompany();
@@ -25,10 +27,15 @@ export function Approvals() {
   const pathSegment = location.pathname.split("/").pop() ?? "pending";
   const statusFilter: StatusFilter = pathSegment === "all" ? "all" : "pending";
   const [actionError, setActionError] = useState<string | null>(null);
+  const [visibleCount, setVisibleCount] = useState(PAGE_SIZE);
 
   useEffect(() => {
     setBreadcrumbs([{ label: "Approvals" }]);
   }, [setBreadcrumbs]);
+
+  useEffect(() => {
+    setVisibleCount(PAGE_SIZE);
+  }, [statusFilter]);
 
   const { data, isLoading, error } = useQuery({
     queryKey: queryKeys.approvals.list(selectedCompanyId!),
@@ -74,6 +81,8 @@ export function Approvals() {
   const pendingCount = (data ?? []).filter(
     (a) => a.status === "pending" || a.status === "revision_requested",
   ).length;
+  const visible = filtered.slice(0, visibleCount);
+  const remaining = filtered.length - visible.length;
 
   if (!selectedCompanyId) {
     return <p className="text-sm text-muted-foreground">Select a company first.</p>;
@@ -88,7 +97,7 @@ export function Approvals() {
       <div className="flex items-center justify-between">
         <Tabs value={statusFilter} onValueChange={(v) => navigate(`/approvals/${v}`)}>
           <PageTabBar items={[
-            { value: "pending", label: <>Pending{pendingCount > 0 && (
+            { value: "pending", label: <>To decide{pendingCount > 0 && (
               <Badge variant="ghost" className={cn(
                 "ml-1.5 px-1.5 text-(length:--text-nano)",
                 "bg-yellow-500/20 text-yellow-500"
@@ -96,7 +105,7 @@ export function Approvals() {
                 {pendingCount}
               </Badge>
             )}</> },
-            { value: "all", label: "All" },
+            { value: "all", label: "All decisions" },
           ]} />
         </Tabs>
       </div>
@@ -108,28 +117,39 @@ export function Approvals() {
         <div className="flex flex-col items-center justify-center py-16 text-center">
           <ShieldCheck className="h-8 w-8 text-muted-foreground/30 mb-3" />
           <p className="text-sm text-muted-foreground">
-            {statusFilter === "pending" ? "No pending approvals." : "No approvals yet."}
+            {statusFilter === "pending" ? "Nothing needs a decision." : "No decisions yet."}
           </p>
         </div>
       )}
 
       {filtered.length > 0 && (
-        <div className="grid gap-3">
-          {filtered.map((approval) => (
-            <ApprovalCard
-              key={approval.id}
-              approval={approval}
-              requesterAgent={approval.requestedByAgentId ? (agents ?? []).find((a) => a.id === approval.requestedByAgentId) ?? null : null}
-              onApprove={() => approveMutation.mutate(approval.id)}
-              onReject={() => rejectMutation.mutate(approval.id)}
-              detailLink={`/approvals/${approval.id}`}
-              isPending={approveMutation.isPending || rejectMutation.isPending}
-              pendingAction={
-                approveMutation.isPending ? "approve" : rejectMutation.isPending ? "reject" : null
-              }
-            />
-          ))}
-        </div>
+        <>
+          <div className="grid gap-3">
+            {visible.map((approval) => {
+              const approving = approveMutation.isPending && approveMutation.variables === approval.id;
+              const rejecting = rejectMutation.isPending && rejectMutation.variables === approval.id;
+              return (
+                <ApprovalCard
+                  key={approval.id}
+                  approval={approval}
+                  requesterAgent={approval.requestedByAgentId ? (agents ?? []).find((a) => a.id === approval.requestedByAgentId) ?? null : null}
+                  onApprove={() => approveMutation.mutate(approval.id)}
+                  onReject={() => rejectMutation.mutate(approval.id)}
+                  detailLink={`/approvals/${approval.id}`}
+                  isPending={approving || rejecting}
+                  pendingAction={approving ? "approve" : rejecting ? "reject" : null}
+                />
+              );
+            })}
+          </div>
+          {remaining > 0 && (
+            <div className="flex justify-center pt-2">
+              <Button variant="outline" size="sm" onClick={() => setVisibleCount((count) => count + PAGE_SIZE)}>
+                Show {Math.min(PAGE_SIZE, remaining)} more
+              </Button>
+            </div>
+          )}
+        </>
       )}
     </div>
   );
