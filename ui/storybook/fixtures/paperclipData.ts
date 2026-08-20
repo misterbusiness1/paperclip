@@ -1103,6 +1103,7 @@ export const storybookApprovals: Approval[] = [
       title: "Publish the Storybook preview for design review",
       summary: "Build the static Storybook and attach the generated URL to the release issue.",
       recommendedAction: "Approve publishing the preview for internal board review.",
+      pros: ["Reviewers can verify the UI without running the app locally."],
       nextActionOnApproval: "Run build-storybook, upload the static artifact, and request QA visual review.",
       risks: [
         "Stories may expose stale fixture copy if not maintained with UI changes.",
