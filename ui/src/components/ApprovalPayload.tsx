@@ -26,6 +26,16 @@ export function approvalSubject(payload?: Record<string, unknown> | null): strin
   );
 }
 
+export function isEmailReplyPayload(payload?: Record<string, unknown> | null): boolean {
+  if (!payload) return false;
+  const hasBody = typeof payload.body === "string" && payload.body.trim().length > 0;
+  const hasEnvelope =
+    typeof payload.subject === "string" ||
+    typeof payload.recipient === "string" ||
+    typeof payload.channel === "string";
+  return hasBody && hasEnvelope;
+}
+
 /** Build a contextual label for an approval, e.g. "Hire Agent: Designer" */
 export function approvalLabel(type: string, payload?: Record<string, unknown> | null): string {
   const base = typeLabel[type] ?? type;
@@ -229,6 +239,88 @@ function BoardApprovalPayloadContent({ payload }: { payload: Record<string, unkn
   );
 }
 
+function EmailHeaderRow({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex gap-2 text-sm">
+      <span className="w-16 shrink-0 pt-0.5 text-(length:--text-micro) font-medium uppercase tracking-(--tracking-label) text-muted-foreground">
+        {label}
+      </span>
+      <span className="min-w-0 break-words leading-6 text-foreground/90">{value}</span>
+    </div>
+  );
+}
+
+export function EmailReplyPayload({ payload }: { payload: Record<string, unknown> }) {
+  const channel = firstNonEmptyString(payload.channel);
+  const recipient = firstNonEmptyString(payload.recipient);
+  const subject = firstNonEmptyString(payload.subject);
+  const orderRef = firstNonEmptyString(payload.threadOrOrderRef);
+  const gate = firstNonEmptyString(payload.gate);
+  const body = firstNonEmptyString(payload.body) ?? "";
+  const intent = firstNonEmptyString(payload.intent);
+  const recommendedAction = firstNonEmptyString(payload.recommendedAction);
+  const risks = Array.isArray(payload.risks)
+    ? payload.risks
+        .filter((value): value is string => typeof value === "string")
+        .map((value) => value.trim())
+        .filter(Boolean)
+    : [];
+
+  return (
+    <div className="mt-4 space-y-3.5 text-sm">
+      <div className="overflow-hidden rounded-lg border border-border/60 bg-background/60">
+        <div className="space-y-1 border-b border-border/60 bg-muted/30 px-3.5 py-2.5">
+          {channel && <EmailHeaderRow label="From" value={channel} />}
+          {recipient && <EmailHeaderRow label="To" value={recipient} />}
+          {subject && <EmailHeaderRow label="Subject" value={subject} />}
+          {orderRef && <EmailHeaderRow label="Ref" value={orderRef} />}
+          {gate && (
+            <div className="flex gap-2">
+              <span className="w-16 shrink-0 pt-0.5 text-(length:--text-micro) font-medium uppercase tracking-(--tracking-label) text-muted-foreground">
+                Gate
+              </span>
+              <span className="rounded bg-muted px-1.5 py-0.5 text-(length:--text-micro) font-medium text-muted-foreground">
+                {gate}
+              </span>
+            </div>
+          )}
+        </div>
+        <div className="max-h-[28rem] overflow-y-auto whitespace-pre-wrap px-4 py-3.5 leading-6 text-foreground">
+          {body}
+        </div>
+      </div>
+
+      {intent && (
+        <div className="space-y-1">
+          <p className="text-(length:--text-micro) font-medium uppercase tracking-(--tracking-label) text-muted-foreground">Intent</p>
+          <p className="leading-6 text-foreground/90">{intent}</p>
+        </div>
+      )}
+      {recommendedAction && (
+        <div className="rounded-lg border border-amber-500/20 bg-amber-500/10 px-3.5 py-3">
+          <p className="text-(length:--text-micro) font-medium uppercase tracking-(--tracking-label) text-amber-700 dark:text-amber-300">
+            Recommended action
+          </p>
+          <p className="mt-1 leading-6 text-foreground">{recommendedAction}</p>
+        </div>
+      )}
+      {risks.length > 0 && (
+        <div className="space-y-1.5">
+          <p className="text-(length:--text-micro) font-medium uppercase tracking-(--tracking-label) text-muted-foreground">Risks</p>
+          <ul className="space-y-1 text-sm text-muted-foreground">
+            {risks.map((risk) => (
+              <li key={risk} className="flex items-start gap-2">
+                <span className="mt-2 h-1.5 w-1.5 rounded-full bg-muted-foreground/60" />
+                <span className="leading-6">{risk}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function ApprovalPayloadRenderer({
   type,
   payload,
@@ -241,6 +333,7 @@ export function ApprovalPayloadRenderer({
   if (type === "hire_agent") return <HireAgentPayload payload={payload} />;
   if (type === "budget_override_required") return <BudgetOverridePayload payload={payload} />;
   if (type === "request_board_approval") {
+    if (isEmailReplyPayload(payload)) return <EmailReplyPayload payload={payload} />;
     return <BoardApprovalPayload payload={payload} hideTitle={hidePrimaryTitle} />;
   }
   return <CeoStrategyPayload payload={payload} />;
