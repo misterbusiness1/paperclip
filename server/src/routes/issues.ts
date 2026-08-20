@@ -193,6 +193,8 @@ import {
   type TrustPresetResolution,
 } from "../services/trust-preset-resolver.js";
 import { externalObjectService } from "../services/external-objects.js";
+import type { PluginToolDispatcher } from "../services/plugin-tool-dispatcher.js";
+import { createGitHubPrHeadCheckService } from "../services/github-pr-head-checks.js";
 
 const MAX_ISSUE_COMMENT_LIMIT = 500;
 const updateIssueRouteSchema = updateIssueSchema.extend({
@@ -2560,6 +2562,7 @@ export function issueRoutes(
     searchService?: CompanySearchService;
     searchRateLimiter?: CompanySearchRateLimiter;
     pluginWorkerManager?: PluginWorkerManager;
+    toolDispatcher?: PluginToolDispatcher;
     taskWatchdogEnqueueWakeup?: TaskWatchdogServiceDeps["enqueueWakeup"] | null;
     recoveryActionEnqueueWakeup?: (
       agentId: string,
@@ -2606,6 +2609,7 @@ export function issueRoutes(
   const recoveryActionsSvc = issueRecoveryActionService(db);
   const executionWorkspacesSvc = executionWorkspaceServiceDirect(db);
   const workProductsSvc = workProductService(db);
+  const githubPrHeadChecks = createGitHubPrHeadCheckService(opts.toolDispatcher);
   const documentsSvc = documentService(db);
   const companySkillsSvc = companySkillService(db);
   const documentAnnotationsSvc = documentAnnotationService(db);
@@ -5401,7 +5405,10 @@ export function issueRoutes(
     const currentExecutionWorkspace = issue.executionWorkspaceId
       ? await executionWorkspacesSvc.getById(issue.executionWorkspaceId)
       : null;
-    const workProducts = await workProductsSvc.listForIssue(issue.id);
+    const workProducts = await githubPrHeadChecks.enrichForIssue(
+      issue,
+      await workProductsSvc.listForIssue(issue.id),
+    );
     res.json({
       ...issue,
       ...inboxArchiveFields,
@@ -5713,7 +5720,10 @@ export function issueRoutes(
     const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
     if (!issue) return;
     if (!(await assertIssueReadAllowed(req, res, issue))) return;
-    const workProducts = await workProductsSvc.listForIssue(issue.id);
+    const workProducts = await githubPrHeadChecks.enrichForIssue(
+      issue,
+      await workProductsSvc.listForIssue(issue.id),
+    );
     res.json(workProducts);
   });
 
