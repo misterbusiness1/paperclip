@@ -59,14 +59,6 @@ RUN test -f server/dist/index.js || (echo "ERROR: server build output missing" &
 FROM base AS production
 ARG USER_UID=1000
 ARG USER_GID=1000
-# Real version for this build, computed from `git describe` on the CI runner
-# (the image has no .git, so the server cannot derive it at runtime). Empty for
-# local `docker build`, which just leaves the server on its normal fallbacks.
-ARG PAPERCLIP_BUILD_VERSION=""
-# The exact commit this image was built from, for the same reason: server-info
-# falls back to PAPERCLIP_BUILD_COMMIT when git is unavailable, which feeds the
-# /api/health `commit` field that deploy tooling verifies. Empty locally.
-ARG PAPERCLIP_BUILD_COMMIT=""
 # Refreshes the tool layer below when it changes (CI stamps an ISO week, so
 # the @latest CLI tools advance weekly). Without it the cached layer would
 # freeze the tools until an unrelated cache bust.
@@ -88,6 +80,11 @@ COPY scripts/docker-entrypoint.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
 COPY --chown=node:node --from=build /app /app
+
+# Real version and commit for this build. Keep these declarations after the
+# expensive tool layer so changing an app stamp cannot refresh @latest CLIs.
+ARG PAPERCLIP_BUILD_VERSION=""
+ARG PAPERCLIP_BUILD_COMMIT=""
 
 ENV NODE_ENV=production \
   HOME=/paperclip \
