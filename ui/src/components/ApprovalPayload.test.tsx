@@ -2,7 +2,9 @@
 
 import { act } from "react";
 import { createRoot } from "react-dom/client";
+import type { Approval } from "@paperclipai/shared";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { ApprovalCard } from "./ApprovalCard";
 import {
   ApprovalPayloadRenderer,
   approvalDecisionBrief,
@@ -60,6 +62,41 @@ describe("approvalExcerpt", () => {
 
   it("preserves order numbers and comparison symbols", () => {
     expect(approvalExcerpt("Order #90210: margin > cost")).toBe("Order #90210: margin > cost");
+  });
+});
+
+describe("ApprovalCard", () => {
+  it("labels missing legacy benefits instead of hiding or inventing them", () => {
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+
+    act(() => {
+      root.render(
+        <ApprovalCard
+          approval={{
+            id: "approval-legacy",
+            companyId: "company-1",
+            type: "request_board_approval",
+            requestedByAgentId: null,
+            requestedByUserId: null,
+            status: "pending",
+            payload: { title: "Legacy decision" },
+            decisionNote: null,
+            decidedByUserId: null,
+            decidedAt: null,
+            createdAt: new Date("2026-03-11T09:00:00.000Z"),
+            updatedAt: new Date("2026-03-11T09:00:00.000Z"),
+          } satisfies Approval}
+          requesterAgent={null}
+        />,
+      );
+    });
+
+    expect(container.textContent).toContain("BenefitNot supplied.");
+    expect(container.textContent).toContain("TradeoffNot supplied.");
+    act(() => root.unmount());
+    container.remove();
   });
 });
 

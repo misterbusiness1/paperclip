@@ -41,7 +41,8 @@ export function ApprovalCard({
   const reasoning = approvalExcerpt(brief.reasoning, 220);
   const benefit = approvalExcerpt(brief.pros[0] ?? null, 160);
   const tradeoff = approvalExcerpt(brief.cons[0] ?? null, 160);
-  const hasBrief = Boolean(recommendation || reasoning || benefit || tradeoff);
+  const showMissingDecisionFields = approval.type === "request_board_approval";
+  const hasBrief = showMissingDecisionFields || Boolean(recommendation || reasoning || benefit || tradeoff);
   const showResolutionButtons =
     Boolean(onApprove && onReject) &&
     approval.type !== "budget_override_required" &&
@@ -91,20 +92,24 @@ export function ApprovalCard({
               <p className="mt-1 text-sm leading-5 text-foreground">{reasoning}</p>
             </div>
           )}
-          {benefit && (
+          {(benefit || showMissingDecisionFields) && (
             <div>
               <p className="text-(length:--text-micro) font-medium uppercase tracking-(--tracking-label) text-muted-foreground">
                 Benefit
               </p>
-              <p className="mt-1 text-sm leading-5 text-foreground">{benefit}</p>
+              <p className={cn("mt-1 text-sm leading-5", benefit ? "text-foreground" : "text-muted-foreground")}>
+                {benefit ?? "Not supplied."}
+              </p>
             </div>
           )}
-          {tradeoff && (
+          {(tradeoff || showMissingDecisionFields) && (
             <div>
               <p className="text-(length:--text-micro) font-medium uppercase tracking-(--tracking-label) text-muted-foreground">
                 Tradeoff
               </p>
-              <p className="mt-1 text-sm leading-5 text-foreground">{tradeoff}</p>
+              <p className={cn("mt-1 text-sm leading-5", tradeoff ? "text-foreground" : "text-muted-foreground")}>
+                {tradeoff ?? "Not supplied."}
+              </p>
             </div>
           )}
         </div>
