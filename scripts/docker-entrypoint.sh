@@ -31,21 +31,38 @@ if [ "$(id -g node)" -ne "$PGID" ]; then
 fi
 
 # Ensure the app home is owned by the runtime user BEFORE dropping
-# privileges -- not only after a UID/GID remap. A freshly mounted volume
-# (Docker named volume, Railway volume, Kubernetes PV) arrives root-owned
-# and shadows the image's build-time chown, so with the default UID the old
-# remap-only condition dropped privileges onto an unwritable home and the
-# server crashed on its first mkdir. The probe is a first-mismatch find
-# over the WHOLE tree (uid and gid): a root-owned mount or descendant
-# (init containers, backup restores, files written before a remap) is
-# found immediately and repaired recursively, a GID-only remap is caught,
-# and a fully-correct tree costs one metadata-only walk with no chown.
+# privileges -- not only after a UID/GID remap. Repair each writable mount
+# independently and prune every nested mount from its parent traversal. This
+# preserves intentionally read-only credential/config mounts while still
+# repairing fresh volumes, restored descendants, and GID-only remaps.
 home_dir="${PAPERCLIP_HOME:-/paperclip}"
-if [ -d "$home_dir" ] && [ -n "$(find "$home_dir" \( ! -user node -o ! -group node \) -print -quit 2>/dev/null)" ]; then
-    # Credential/config bind mounts may be intentionally read-only. Writable
-    # descendants are still repaired before chown reports those mount errors.
-    chown -R node:node "$home_dir" 2>/dev/null ||
-        echo "docker-entrypoint.sh: some read-only paths under $home_dir were left unchanged" >&2
+if [ -d "$home_dir" ]; then
+    mount_table="$(findmnt --target "$home_dir" --submounts --noheadings --raw --output TARGET,VFS-OPTIONS)"
+
+    repair_tree_ownership() {
+        tree=$1
+        set -- "$tree"
+        while read -r mount_target mount_options; do
+            case "$mount_target" in
+                "$tree"/*) set -- "$@" -path "$mount_target" -prune -o ;;
+            esac
+        done <<EOF
+$mount_table
+EOF
+        set -- "$@" \( ! -user node -o ! -group node \) -exec chown node:node {} +
+        find "$@"
+    }
+
+    repair_tree_ownership "$home_dir"
+    while read -r mount_target mount_options; do
+        case "$mount_target:$mount_options" in
+            "$home_dir"/*:rw|"$home_dir"/*:rw,*|"$home_dir"/*:*,rw|"$home_dir"/*:*,rw,*)
+                repair_tree_ownership "$mount_target"
+                ;;
+        esac
+    done <<EOF
+$mount_table
+EOF
 fi
 
 exec gosu node "$@"

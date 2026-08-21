@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { eq } from "drizzle-orm";
 import {
   agents,
   approvals,
@@ -636,5 +637,73 @@ describeEmbeddedPostgres("budgetService release gate enforcement", () => {
       pauseReason: null,
     });
     expect(overviewAfterResume.activeIncidents).toHaveLength(0);
+  });
+
+  it("enforces budget scope integrity and cascades deleted scopes", async () => {
+    const { companyId, agentId, projectId } = await createBudgetFixture();
+
+    await expect(
+      db.insert(budgetPolicies).values({
+        companyId,
+        scopeType: "agent",
+        scopeId: randomUUID(),
+        metric: "billed_cents",
+        windowKind: "calendar_month_utc",
+        amount: 100,
+      }),
+    ).rejects.toThrow();
+
+    const [approval] = await db
+      .insert(approvals)
+      .values({
+        companyId,
+        type: "budget_override_required",
+        status: "pending",
+        payload: {},
+      })
+      .returning();
+    const [agentPolicy] = await db
+      .insert(budgetPolicies)
+      .values({
+        companyId,
+        scopeType: "agent",
+        scopeId: agentId,
+        metric: "billed_cents",
+        windowKind: "calendar_month_utc",
+        amount: 100,
+      })
+      .returning();
+    await db.insert(budgetIncidents).values({
+      companyId,
+      policyId: agentPolicy!.id,
+      scopeType: "agent",
+      scopeId: agentId,
+      metric: "billed_cents",
+      windowKind: "calendar_month_utc",
+      windowStart: new Date("2026-08-01T00:00:00Z"),
+      windowEnd: new Date("2026-09-01T00:00:00Z"),
+      thresholdType: "hard",
+      amountLimit: 100,
+      amountObserved: 120,
+      approvalId: approval!.id,
+    });
+    await db.insert(budgetPolicies).values({
+      companyId,
+      scopeType: "project",
+      scopeId: projectId,
+      metric: "billed_cents",
+      windowKind: "lifetime",
+      amount: 100,
+    });
+
+    await db.delete(agents).where(eq(agents.id, agentId));
+    expect(await db.select().from(budgetPolicies).where(eq(budgetPolicies.scopeId, agentId))).toHaveLength(0);
+    expect(await db.select().from(budgetIncidents).where(eq(budgetIncidents.scopeId, agentId))).toHaveLength(0);
+    expect(await db.select().from(approvals).where(eq(approvals.id, approval!.id))).toMatchObject([
+      { status: "rejected", decisionNote: "Budget scope was deleted." },
+    ]);
+
+    await db.delete(projects).where(eq(projects.id, projectId));
+    expect(await db.select().from(budgetPolicies).where(eq(budgetPolicies.scopeId, projectId))).toHaveLength(0);
   });
 });
