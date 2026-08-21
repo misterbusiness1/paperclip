@@ -1620,6 +1620,8 @@ export function createToolGatewayService(
             title: `Approve high-risk tool action: ${input.tool.name}`,
             summary: `${input.tool.name} is classified as ${input.tool.risk} and requires formal board approval before execution.`,
             recommendedAction: "Approve only if the reviewed arguments match the intended operation.",
+            reasoning: "Proceed only when this exact high-risk action and its reviewed arguments are necessary.",
+            pros: ["Approval permits this reviewed action once without granting broader standing access."],
             risks: [
               "The tool may perform irreversible or externally visible side effects.",
               "Execution will use the stored reviewed arguments exactly once.",

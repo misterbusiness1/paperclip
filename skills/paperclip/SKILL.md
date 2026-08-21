@@ -222,12 +222,14 @@ POST /api/companies/{companyId}/approvals
     "title": "Approve monthly hosting spend",
     "summary": "Estimated cost is $42/month for provider X.",
     "recommendedAction": "Approve provider X and continue setup.",
+    "reasoning": "Provider X meets the requirements at the quoted monthly cost.",
+    "pros": ["Setup can continue with a bounded $42 monthly commitment."],
     "risks": ["Costs may increase with usage."]
   }
 }
 ```
 
-`issueIds` links the approval into the issue thread. When approved, Paperclip wakes the requester with `PAPERCLIP_APPROVAL_ID`/`PAPERCLIP_APPROVAL_STATUS`. Keep the payload concise and decision-ready.
+`issueIds` links the approval into the issue thread. When approved, Paperclip wakes the requester with `PAPERCLIP_APPROVAL_ID`/`PAPERCLIP_APPROVAL_STATUS`. Keep the payload concise and decision-ready, with explicit reasoning and at least one evidence-backed pro and risk.
 
 ## Issue-Thread Interactions
 

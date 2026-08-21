@@ -732,6 +732,11 @@ describeEmbeddedPostgres("tool gateway service", () => {
       type: "request_board_approval",
       status: "pending",
       requestedByAgentId: agent.id,
+      payload: {
+        reasoning: expect.any(String),
+        pros: [expect.any(String)],
+        risks: expect.any(Array),
+      },
     });
     const [link] = await db.select().from(issueApprovals).where(and(
       eq(issueApprovals.issueId, session.issueId!),
