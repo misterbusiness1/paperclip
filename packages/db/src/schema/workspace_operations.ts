@@ -63,5 +63,6 @@ export const workspaceOperations = pgTable(
       table.issueId,
       table.startedAt,
     ),
+    issueIdx: index("workspace_operations_issue_idx").on(table.issueId),
   }),
 );

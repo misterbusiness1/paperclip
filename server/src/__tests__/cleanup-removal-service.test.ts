@@ -6,7 +6,15 @@ import {
   agents,
   companies,
   companySkills,
+  costEvents,
   createDb,
+  decisionBundles,
+  decisionQueueItems,
+  decisionQueues,
+  decisionRetention,
+  decisions,
+  decisionTriage,
+  decisionTriageEvents,
   documents,
   documentRevisions,
   heartbeatRunEvents,
@@ -44,6 +52,14 @@ describeEmbeddedPostgres("cleanup removal services", () => {
   }, 20_000);
 
   afterEach(async () => {
+    await db.delete(decisionTriageEvents);
+    await db.delete(decisionQueueItems);
+    await db.delete(decisionQueues);
+    await db.delete(decisionRetention);
+    await db.delete(decisionTriage);
+    await db.delete(decisions);
+    await db.delete(decisionBundles);
+    await db.delete(costEvents);
     await db.delete(heartbeatRunEvents);
     await db.delete(activityLog);
     await db.delete(issueReadStates);
@@ -259,6 +275,104 @@ describeEmbeddedPostgres("cleanup removal services", () => {
     await expect(db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId))).resolves.toHaveLength(0);
     await expect(db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, runId))).resolves.toHaveLength(0);
     await expect(db.select().from(companies).where(eq(companies.id, otherCompanyId))).resolves.toHaveLength(1);
+  });
+
+  it("removes run-linked cost events before deleting company-owned runs", async () => {
+    const { agentId, companyId, issueId, runId } = await seedFixture();
+
+    await db.insert(costEvents).values({
+      companyId,
+      agentId,
+      issueId,
+      heartbeatRunId: runId,
+      provider: "test",
+      model: "test-model",
+      costCents: 1,
+      occurredAt: new Date(),
+    });
+
+    const removed = await companyService(db).remove(companyId);
+
+    expect(removed?.id).toBe(companyId);
+    await expect(db.select().from(costEvents).where(eq(costEvents.companyId, companyId))).resolves.toHaveLength(0);
+    await expect(db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId))).resolves.toHaveLength(0);
+  });
+
+  it("removes run-linked decision rows before deleting company-owned runs", async () => {
+    const { agentId, companyId, issueId, runId } = await seedFixture();
+    const queueId = randomUUID();
+    const bundleId = randomUUID();
+
+    await db.insert(decisionQueues).values({
+      id: queueId,
+      companyId,
+      key: "review",
+      title: "Review",
+      createdByType: "system",
+      createdByRunId: runId,
+    });
+    await db.insert(decisionQueueItems).values({
+      companyId,
+      queueId,
+      sourceKind: "issue",
+      sourceId: issueId,
+      addedByType: "system",
+      addedByRunId: runId,
+    });
+    await db.insert(decisionTriage).values({
+      companyId,
+      sourceKind: "issue",
+      sourceId: issueId,
+      setByType: "agent",
+      setByAgentId: agentId,
+      setByRunId: runId,
+    });
+    await db.insert(decisionTriageEvents).values({
+      companyId,
+      queueId,
+      action: "added",
+      actorType: "system",
+      actorRunId: runId,
+    });
+    await db.insert(decisionRetention).values({
+      companyId,
+      sourceKind: "issue",
+      sourceId: issueId,
+      sourceActivityAt: new Date(),
+      archivedAt: new Date(),
+      archivedByType: "system",
+      archivedByRunId: runId,
+    });
+    await db.insert(decisionBundles).values({
+      id: bundleId,
+      companyId,
+      title: "Bundle",
+      summary: "Summary",
+      originAgentId: agentId,
+      originIssueId: issueId,
+      originRunId: runId,
+    });
+    await db.insert(decisions).values({
+      companyId,
+      bundleId,
+      originAgentId: agentId,
+      originIssueId: issueId,
+      originRunId: runId,
+      title: "Decision",
+      body: "Body",
+      options: [],
+      expiresAt: new Date(Date.now() + 60_000),
+      signedSpec: "signed",
+      targetSnapshots: {},
+    });
+
+    const removed = await companyService(db).remove(companyId);
+
+    expect(removed?.id).toBe(companyId);
+    await expect(db.select().from(decisionQueues).where(eq(decisionQueues.companyId, companyId))).resolves.toHaveLength(0);
+    await expect(db.select().from(decisionRetention).where(eq(decisionRetention.companyId, companyId))).resolves.toHaveLength(0);
+    await expect(db.select().from(decisions).where(eq(decisions.companyId, companyId))).resolves.toHaveLength(0);
+    await expect(db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId))).resolves.toHaveLength(0);
   });
 
   it("removes routines before deleting company agents", async () => {

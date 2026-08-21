@@ -45,6 +45,7 @@ export const secretAccessEvents = pgTable(
       table.createdAt,
     ),
     consumerIdx: index("secret_access_events_consumer_idx").on(table.companyId, table.consumerType, table.consumerId),
+    issueIdx: index("secret_access_events_issue_idx").on(table.issueId),
     runIdx: index("secret_access_events_run_idx").on(table.heartbeatRunId),
   }),
 );

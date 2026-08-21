@@ -17,6 +17,7 @@ export const issueAttachments = pgTable(
   },
   (table) => ({
     companyIssueIdx: index("issue_attachments_company_issue_idx").on(table.companyId, table.issueId),
+    issueIdx: index("issue_attachments_issue_idx").on(table.issueId),
     issueCommentIdx: index("issue_attachments_issue_comment_idx").on(table.issueCommentId),
     assetUq: uniqueIndex("issue_attachments_asset_uq").on(table.assetId),
   }),

@@ -39,6 +39,7 @@ export const environmentLeases = pgTable(
       table.executionWorkspaceId,
     ),
     companyIssueIdx: index("environment_leases_company_issue_idx").on(table.companyId, table.issueId),
+    issueIdx: index("environment_leases_issue_idx").on(table.issueId),
     heartbeatRunIdx: index("environment_leases_heartbeat_run_idx").on(table.heartbeatRunId),
     companyLastUsedIdx: index("environment_leases_company_last_used_idx").on(table.companyId, table.lastUsedAt),
     providerLeaseIdx: index("environment_leases_provider_lease_idx").on(table.providerLeaseId),

@@ -26,6 +26,8 @@ export const issueReferenceMentions = pgTable(
       table.companyId,
       table.targetIssueId,
     ),
+    sourceIssueIdx: index("issue_reference_mentions_source_issue_idx").on(table.sourceIssueId),
+    targetIssueIdx: index("issue_reference_mentions_target_issue_idx").on(table.targetIssueId),
     companyIssuePairIdx: index("issue_reference_mentions_company_issue_pair_idx").on(
       table.companyId,
       table.sourceIssueId,

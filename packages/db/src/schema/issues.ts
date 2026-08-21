@@ -91,6 +91,7 @@ export const issues = pgTable(
     ),
     responsibleUserIdx: index("issues_company_responsible_user_idx").on(table.companyId, table.responsibleUserId),
     parentIdx: index("issues_company_parent_idx").on(table.companyId, table.parentId),
+    parentIdIdx: index("issues_parent_id_idx").on(table.parentId),
     projectIdx: index("issues_company_project_idx").on(table.companyId, table.projectId),
     originIdx: index("issues_company_origin_idx").on(table.companyId, table.originKind, table.originId),
     projectWorkspaceIdx: index("issues_company_project_workspace_idx").on(table.companyId, table.projectWorkspaceId),

@@ -21,6 +21,7 @@ export const issueDocuments = pgTable(
       table.key,
     ),
     documentUq: uniqueIndex("issue_documents_document_uq").on(table.documentId),
+    issueIdx: index("issue_documents_issue_idx").on(table.issueId),
     companyIssueUpdatedIdx: index("issue_documents_company_issue_updated_idx").on(
       table.companyId,
       table.issueId,

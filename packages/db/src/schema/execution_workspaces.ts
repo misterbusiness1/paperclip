@@ -56,6 +56,7 @@ export const executionWorkspaces = pgTable(
       table.companyId,
       table.sourceIssueId,
     ),
+    sourceIssueIdx: index("execution_workspaces_source_issue_idx").on(table.sourceIssueId),
     companyLastUsedIdx: index("execution_workspaces_company_last_used_idx").on(
       table.companyId,
       table.lastUsedAt,

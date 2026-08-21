@@ -58,6 +58,8 @@ export const issueRecoveryActions = pgTable(
       table.companyId,
       table.recoveryIssueId,
     ),
+    sourceIssueIdx: index("issue_recovery_actions_source_issue_idx").on(table.sourceIssueId),
+    recoveryIssueIdx: index("issue_recovery_actions_recovery_issue_idx").on(table.recoveryIssueId),
     activeSourceIdx: uniqueIndex("issue_recovery_actions_active_source_uq")
       .on(table.companyId, table.sourceIssueId)
       .where(sql`${table.status} in ('active', 'escalated')`),

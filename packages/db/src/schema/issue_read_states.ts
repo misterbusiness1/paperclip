@@ -15,6 +15,7 @@ export const issueReadStates = pgTable(
   },
   (table) => ({
     companyIssueIdx: index("issue_read_states_company_issue_idx").on(table.companyId, table.issueId),
+    issueIdx: index("issue_read_states_issue_idx").on(table.issueId),
     companyUserIdx: index("issue_read_states_company_user_idx").on(table.companyId, table.userId),
     companyIssueUserUnique: uniqueIndex("issue_read_states_company_issue_user_idx").on(
       table.companyId,

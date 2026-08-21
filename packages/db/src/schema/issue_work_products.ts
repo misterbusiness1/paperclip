@@ -48,6 +48,7 @@ export const issueWorkProducts = pgTable(
       table.issueId,
       table.type,
     ),
+    issueIdx: index("issue_work_products_issue_idx").on(table.issueId),
     companyExecutionWorkspaceTypeIdx: index("issue_work_products_company_execution_workspace_type_idx").on(
       table.companyId,
       table.executionWorkspaceId,
