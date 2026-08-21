@@ -113,6 +113,18 @@ describe("docker-entrypoint.sh", () => {
     expect(calls).toContain("gosu node echo ENTRYPOINT-CMD-RAN");
   });
 
+  it("continues when read-only bind mounts make recursive chown report an error", async () => {
+    installStubs({ uid: 0, gid: 0, homeMismatch: true });
+    writeStub("chown", `echo "chown $*" >> "${logFile}"\nexit 1`);
+
+    const { stdout, stderr, calls } = await runEntrypoint({ PAPERCLIP_HOME: stubDir });
+
+    expect(stdout).toContain("ENTRYPOINT-CMD-RAN");
+    expect(stderr).toContain("some read-only paths");
+    expect(calls).toContain(`chown -R node:node ${stubDir}`);
+    expect(calls).toContain("gosu node echo ENTRYPOINT-CMD-RAN");
+  });
+
   it("repairs ownership on a GID-only remap (stale group on persisted descendants)", async () => {
     installStubs({ uid: 0, gid: 0, homeMismatch: true });
 

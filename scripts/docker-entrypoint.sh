@@ -42,7 +42,10 @@ fi
 # and a fully-correct tree costs one metadata-only walk with no chown.
 home_dir="${PAPERCLIP_HOME:-/paperclip}"
 if [ -d "$home_dir" ] && [ -n "$(find "$home_dir" \( ! -user node -o ! -group node \) -print -quit 2>/dev/null)" ]; then
-    chown -R node:node "$home_dir"
+    # Credential/config bind mounts may be intentionally read-only. Writable
+    # descendants are still repaired before chown reports those mount errors.
+    chown -R node:node "$home_dir" 2>/dev/null ||
+        echo "docker-entrypoint.sh: some read-only paths under $home_dir were left unchanged" >&2
 fi
 
 exec gosu node "$@"
