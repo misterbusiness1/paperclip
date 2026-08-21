@@ -106,9 +106,11 @@ export async function prepareOpenCodeRuntimeConfig(input: {
   env: Record<string, string>;
   config: Record<string, unknown>;
   targetIsRemote?: boolean;
+  skillPaths?: string[];
 }): Promise<PreparedOpenCodeRuntimeConfig> {
   const skipPermissions = asBoolean(input.config.dangerouslySkipPermissions, true);
-  if (!skipPermissions) {
+  const skillPaths = (input.skillPaths ?? []).map((entry) => entry.trim()).filter(Boolean);
+  if (!skipPermissions && skillPaths.length === 0) {
     return {
       env: input.env,
       notes: [],
@@ -149,12 +151,13 @@ export async function prepareOpenCodeRuntimeConfig(input: {
   }
 
   const existingConfig = await readJsonObject(runtimeConfigPath);
-  const existingPermission = isPlainObject(existingConfig.permission)
-    ? existingConfig.permission
-    : {};
-  const notes = [
-    "Injected runtime OpenCode config with permission.external_directory=allow to avoid headless approval prompts.",
-  ];
+  const existingPermission = isPlainObject(existingConfig.permission) ? existingConfig.permission : {};
+  const notes: string[] = [];
+  if (skipPermissions) {
+    notes.push(
+      "Injected runtime OpenCode config with permission.external_directory=allow to avoid headless approval prompts.",
+    );
+  }
 
   // Merge gateway/custom provider definitions supplied via PAPERCLIP_OPENCODE_PROVIDERS
   // (a JSON object in OpenCode's `provider` shape). OpenCode resolves a `--model
@@ -164,11 +167,13 @@ export async function prepareOpenCodeRuntimeConfig(input: {
   // custom provider with an explicit models map. We accept it as config (not
   // hard-coded) so the gateway URL, key env, and model list stay declarative.
   const resolveEnv = (name: string): string | undefined => input.env[name] ?? process.env[name];
-  const gatewayProviders = parseProviderConfig(
-    input.env.PAPERCLIP_OPENCODE_PROVIDERS ?? process.env.PAPERCLIP_OPENCODE_PROVIDERS,
-    resolveEnv,
-    notes,
-  );
+  const gatewayProviders = skipPermissions
+    ? parseProviderConfig(
+        input.env.PAPERCLIP_OPENCODE_PROVIDERS ?? process.env.PAPERCLIP_OPENCODE_PROVIDERS,
+        resolveEnv,
+        notes,
+      )
+    : null;
   const existingProvider = isPlainObject(existingConfig.provider) ? existingConfig.provider : {};
   let nextProvider = gatewayProviders
     ? { ...existingProvider, ...gatewayProviders }
@@ -187,7 +192,7 @@ export async function prepareOpenCodeRuntimeConfig(input: {
   // An empty entry deep-merges with catalog metadata, so this is a no-op for models
   // the catalog already knows, and we never clobber an explicit definition from the
   // user config or PAPERCLIP_OPENCODE_PROVIDERS.
-  const configuredModel = parseConfiguredModelRef(input.config.model);
+  const configuredModel = skipPermissions ? parseConfiguredModelRef(input.config.model) : null;
   if (configuredModel) {
     const providerEntry = isPlainObject(nextProvider[configuredModel.provider])
       ? { ...(nextProvider[configuredModel.provider] as Record<string, unknown>) }
@@ -205,15 +210,22 @@ export async function prepareOpenCodeRuntimeConfig(input: {
     }
   }
 
-  const nextConfig: Record<string, unknown> = {
-    ...existingConfig,
-    permission: {
+  const nextConfig: Record<string, unknown> = { ...existingConfig };
+  if (skipPermissions) {
+    nextConfig.permission = {
       ...existingPermission,
       external_directory: "allow",
-    },
-  };
+    };
+  }
   if (Object.keys(nextProvider).length > 0) {
     nextConfig.provider = nextProvider;
+  }
+  if (skillPaths.length > 0) {
+    nextConfig.skills = {
+      ...(isPlainObject(existingConfig.skills) ? existingConfig.skills : {}),
+      paths: skillPaths,
+    };
+    notes.push("Restricted OpenCode skill discovery to the Paperclip-managed per-run directory.");
   }
 
   // Pin OpenCode's auxiliary "small" model (used for session-title generation and
@@ -222,7 +234,9 @@ export async function prepareOpenCodeRuntimeConfig(input: {
   // for the anthropic provider); when that provider is repointed at a gateway that
   // does not serve that exact model, the title-gen call fails and aborts the run.
   // Setting small_model to a gateway-served model keeps every call on supported models.
-  const smallModel = (input.env.PAPERCLIP_OPENCODE_SMALL_MODEL ?? process.env.PAPERCLIP_OPENCODE_SMALL_MODEL)?.trim();
+  const smallModel = skipPermissions
+    ? (input.env.PAPERCLIP_OPENCODE_SMALL_MODEL ?? process.env.PAPERCLIP_OPENCODE_SMALL_MODEL)?.trim()
+    : undefined;
   if (smallModel) {
     nextConfig.small_model = smallModel;
     notes.push(`Pinned OpenCode small_model to ${smallModel}.`);
@@ -232,6 +246,7 @@ export async function prepareOpenCodeRuntimeConfig(input: {
   return {
     env: {
       ...input.env,
+      ...(skillPaths.length > 0 ? { OPENCODE_DISABLE_EXTERNAL_SKILLS: "1" } : {}),
       XDG_CONFIG_HOME: runtimeConfigHome,
     },
     notes,

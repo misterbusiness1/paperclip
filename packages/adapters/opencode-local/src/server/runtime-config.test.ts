@@ -31,6 +31,38 @@ async function makeConfigHome(initialConfig?: Record<string, unknown>) {
 }
 
 describe("prepareOpenCodeRuntimeConfig", () => {
+  it("isolates each run to its configured skill directory and disables external discovery", async () => {
+    const configHome = await makeConfigHome();
+    const first = await prepareOpenCodeRuntimeConfig({
+      env: { XDG_CONFIG_HOME: configHome },
+      config: { dangerouslySkipPermissions: false },
+      skillPaths: ["/tmp/paperclip-agent-a-skills"],
+    });
+    const second = await prepareOpenCodeRuntimeConfig({
+      env: { XDG_CONFIG_HOME: configHome },
+      config: { dangerouslySkipPermissions: false },
+      skillPaths: ["/tmp/paperclip-agent-b-skills"],
+    });
+    cleanupPaths.add(first.env.XDG_CONFIG_HOME);
+    cleanupPaths.add(second.env.XDG_CONFIG_HOME);
+
+    const readConfig = async (configHomePath: string) =>
+      JSON.parse(
+        await fs.readFile(path.join(configHomePath, "opencode", "opencode.json"), "utf8"),
+      ) as { permission?: unknown; skills?: { paths?: string[] } };
+
+    const firstConfig = await readConfig(first.env.XDG_CONFIG_HOME);
+    const secondConfig = await readConfig(second.env.XDG_CONFIG_HOME);
+    expect(firstConfig.skills?.paths).toEqual(["/tmp/paperclip-agent-a-skills"]);
+    expect(secondConfig.skills?.paths).toEqual(["/tmp/paperclip-agent-b-skills"]);
+    expect(firstConfig.permission).toBeUndefined();
+    expect(secondConfig.permission).toBeUndefined();
+    expect(first.env.OPENCODE_DISABLE_EXTERNAL_SKILLS).toBe("1");
+    expect(second.env.OPENCODE_DISABLE_EXTERNAL_SKILLS).toBe("1");
+
+    await Promise.all([first.cleanup(), second.cleanup()]);
+  });
+
   it("injects an external_directory allow rule by default", async () => {
     const configHome = await makeConfigHome({
       permission: {
