@@ -110,6 +110,10 @@ vi.mock("./ToastViewport", () => ({
   ToastViewport: () => null,
 }));
 
+vi.mock("../pages/NotFound", () => ({
+  NotFoundPage: () => <div>Not found</div>,
+}));
+
 vi.mock("./MobileBottomNav", () => ({
   MobileBottomNav: () => null,
 }));
@@ -215,7 +219,8 @@ vi.mock("../api/instanceSettings", () => ({
   instanceSettingsApi: mockInstanceSettingsApi,
 }));
 
-vi.mock("../lib/company-selection", () => ({
+vi.mock("../lib/company-selection", async () => ({
+  ...await vi.importActual<typeof import("../lib/company-selection")>("../lib/company-selection"),
   shouldSyncCompanySelectionFromRoute: () => false,
 }));
 
@@ -300,6 +305,34 @@ describe("Layout", () => {
     expect(container.textContent).not.toContain(
       "Sign-in is required and this instance is intended for private-network access.",
     );
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
+
+  it("redirects an obsolete company prefix to its unique surviving extension", async () => {
+    currentPathname = "/OXF/issues";
+    mockCompanyState.companies = [
+      { id: "origin", issuePrefix: "ORI", name: "Origin" },
+      { id: "oxford", issuePrefix: "OXFA", name: "Oxford" },
+    ];
+    mockCompanyState.selectedCompany = mockCompanyState.companies[0]!;
+    mockCompanyState.selectedCompanyId = "origin";
+    const root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <Layout />
+        </QueryClientProvider>,
+      );
+    });
+    await flushReact();
+
+    expect(mockNavigate).toHaveBeenCalledWith("/OXFA/issues", { replace: true });
+    expect(mockSetSelectedCompanyId).toHaveBeenCalledWith("oxford", { source: "route_sync" });
 
     await act(async () => {
       root.unmount();

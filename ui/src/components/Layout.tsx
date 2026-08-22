@@ -33,7 +33,10 @@ import { useAppsEnabled } from "../hooks/useAppsEnabled";
 import { useCompanyPageMemory } from "../hooks/useCompanyPageMemory";
 import { healthApi } from "../api/health";
 import { instanceSettingsApi } from "../api/instanceSettings";
-import { shouldSyncCompanySelectionFromRoute } from "../lib/company-selection";
+import {
+  resolveUnknownCompanyPrefixFallback,
+  shouldSyncCompanySelectionFromRoute,
+} from "../lib/company-selection";
 import {
   applyMainContentScrollTop,
   NavigationScrollMemory,
@@ -225,9 +228,15 @@ export function Layout() {
     if (!companyPrefix || companiesLoading || companies.length === 0) return;
 
     if (!matchedCompany) {
-      const fallback = (selectedCompanyId ? companies.find((company) => company.id === selectedCompanyId) : null)
-        ?? companies[0]
-        ?? null;
+      const fallback = resolveUnknownCompanyPrefixFallback({
+        companies,
+        requestedPrefix: companyPrefix,
+        selectedCompanyId,
+      });
+      if (fallback) {
+        const suffix = location.pathname.replace(/^\/[^/]+/, "");
+        navigate(`/${fallback.issuePrefix}${suffix}${location.search}`, { replace: true });
+      }
       if (fallback && selectedCompanyId !== fallback.id) {
         setSelectedCompanyId(fallback.id, { source: "route_sync" });
       }

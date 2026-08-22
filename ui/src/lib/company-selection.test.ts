@@ -1,5 +1,31 @@
 import { describe, expect, it } from "vitest";
-import { shouldSyncCompanySelectionFromRoute } from "./company-selection";
+import {
+  resolveUnknownCompanyPrefixFallback,
+  shouldSyncCompanySelectionFromRoute,
+} from "./company-selection";
+
+describe("resolveUnknownCompanyPrefixFallback", () => {
+  const companies = [
+    { id: "origin", issuePrefix: "ORI" },
+    { id: "oxford", issuePrefix: "OXFA" },
+  ];
+
+  it("redirects an obsolete prefix to its unique surviving extension", () => {
+    expect(resolveUnknownCompanyPrefixFallback({
+      companies,
+      requestedPrefix: "OXF",
+      selectedCompanyId: "origin",
+    })).toEqual(companies[1]);
+  });
+
+  it("uses the valid selection when a prefix extension is ambiguous", () => {
+    expect(resolveUnknownCompanyPrefixFallback({
+      companies: [...companies, { id: "other-oxford", issuePrefix: "OXFB" }],
+      requestedPrefix: "OXF",
+      selectedCompanyId: "origin",
+    })).toEqual(companies[0]);
+  });
+});
 
 describe("shouldSyncCompanySelectionFromRoute", () => {
   it("does not resync when selection already matches the route", () => {
