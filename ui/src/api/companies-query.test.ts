@@ -11,6 +11,10 @@ vi.mock("./companies", () => ({
 }));
 
 describe("companiesListQueryOptions", () => {
+  it("periodically reconciles company changes made outside the current tab", () => {
+    expect(companiesListQueryOptions.refetchInterval).toBe(30_000);
+  });
+
   it.each([401, 403])("treats %s company-list failures as unauthorized bootstrap state", async (status) => {
     mockCompaniesApi.list.mockRejectedValueOnce(new ApiError("Board access required", status, { error: "Board access required" }));
 

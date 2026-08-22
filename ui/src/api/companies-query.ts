@@ -22,4 +22,6 @@ export const companiesListQueryOptions = {
     }
   },
   retry: false,
+  // Reconcile company changes made by another tab, API client, or operator.
+  refetchInterval: 30_000,
 } as const;
