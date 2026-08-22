@@ -30,6 +30,8 @@ export const costEvents = pgTable(
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
+    agentIdForeignKeyIdx: index("cost_events_agent_id_fk_idx").on(table.agentId),
+    heartbeatRunIdForeignKeyIdx: index("cost_events_heartbeat_run_id_fk_idx").on(table.heartbeatRunId),
     companyOccurredIdx: index("cost_events_company_occurred_idx").on(table.companyId, table.occurredAt),
     companyAgentOccurredIdx: index("cost_events_company_agent_occurred_idx").on(
       table.companyId,

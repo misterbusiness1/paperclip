@@ -31,6 +31,8 @@ export const issuePlanDecompositions = pgTable(
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
+    sourceIssueIdForeignKeyIdx: index("issue_plan_decompositions_source_issue_id_fk_idx").on(table.sourceIssueId),
+    ownerRunIdForeignKeyIdx: index("issue_plan_decompositions_owner_run_id_fk_idx").on(table.ownerRunId),
     companySourceStatusIdx: index("issue_plan_decompositions_company_source_status_idx").on(
       table.companyId,
       table.sourceIssueId,

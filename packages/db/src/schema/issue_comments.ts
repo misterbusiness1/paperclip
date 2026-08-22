@@ -43,6 +43,12 @@ export const issueComments = pgTable(
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
+    authorAgentIdForeignKeyIdx: index("issue_comments_author_agent_id_fk_idx").on(table.authorAgentId),
+    deletedByAgentIdForeignKeyIdx: index("issue_comments_deleted_by_agent_id_fk_idx").on(table.deletedByAgentId),
+    derivedAuthorAgentIdForeignKeyIdx: index("issue_comments_derived_author_agent_id_fk_idx").on(table.derivedAuthorAgentId),
+    createdByRunIdForeignKeyIdx: index("issue_comments_created_by_run_id_fk_idx").on(table.createdByRunId),
+    deletedByRunIdForeignKeyIdx: index("issue_comments_deleted_by_run_id_fk_idx").on(table.deletedByRunId),
+    derivedCreatedByRunIdForeignKeyIdx: index("issue_comments_derived_created_by_run_id_fk_idx").on(table.derivedCreatedByRunId),
     issueIdx: index("issue_comments_issue_idx").on(table.issueId),
     companyIdx: index("issue_comments_company_idx").on(table.companyId),
     companyIssueCreatedAtIdx: index("issue_comments_company_issue_created_at_idx").on(

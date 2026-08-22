@@ -47,6 +47,8 @@ export const workspaceRuntimeServices = pgTable(
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
+    issueIdForeignKeyIdx: index("workspace_runtime_services_issue_id_fk_idx").on(table.issueId),
+    executionWorkspaceIdForeignKeyIdx: index("workspace_runtime_services_execution_workspace_id_fk_idx").on(table.executionWorkspaceId),
     companyWorkspaceStatusIdx: index("workspace_runtime_services_company_workspace_status_idx").on(
       table.companyId,
       table.projectWorkspaceId,

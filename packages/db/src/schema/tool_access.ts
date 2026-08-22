@@ -415,6 +415,8 @@ export const toolMcpGateways = pgTable(
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [
+    index("tool_mcp_gateways_approval_issue_id_fk_idx").on(table.approvalIssueId),
+    index("tool_mcp_gateways_issue_id_fk_idx").on(table.issueId),
     index("tool_mcp_gateways_company_idx").on(table.companyId),
     index("tool_mcp_gateways_company_status_idx").on(table.companyId, table.status),
     index("tool_mcp_gateways_profile_idx").on(table.companyId, table.profileId),
@@ -520,6 +522,8 @@ export const toolRuntimeSlots = pgTable(
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [
+    index("tool_runtime_slots_issue_id_fk_idx").on(table.issueId),
+    index("tool_runtime_slots_execution_workspace_id_fk_idx").on(table.executionWorkspaceId),
     index("tool_runtime_slots_company_idx").on(table.companyId),
     index("tool_runtime_slots_connection_idx").on(table.connectionId),
     index("tool_runtime_slots_execution_workspace_idx").on(table.companyId, table.executionWorkspaceId),
@@ -578,6 +582,8 @@ export const toolGatewaySessions = pgTable(
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [
+    index("tool_gateway_sessions_issue_id_fk_idx").on(table.issueId),
+    index("tool_gateway_sessions_run_id_fk_idx").on(table.runId),
     uniqueIndex("tool_gateway_sessions_token_hash_uq").on(table.tokenHash),
     index("tool_gateway_sessions_company_agent_idx").on(table.companyId, table.agentId),
     index("tool_gateway_sessions_company_expires_idx").on(table.companyId, table.expiresAt),
@@ -662,6 +668,8 @@ export const toolInvocations = pgTable(
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [
+    index("tool_invocations_issue_id_fk_idx").on(table.issueId),
+    index("tool_invocations_run_id_fk_idx").on(table.runId),
     index("tool_invocations_company_created_idx").on(table.companyId, table.createdAt),
     index("tool_invocations_run_idx").on(table.companyId, table.runId),
     index("tool_invocations_issue_idx").on(table.companyId, table.issueId),
@@ -697,6 +705,7 @@ export const toolActionRequests = pgTable(
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [
+    index("tool_action_requests_issue_id_fk_idx").on(table.issueId),
     index("tool_action_requests_company_status_idx").on(table.companyId, table.status),
     index("tool_action_requests_invocation_idx").on(table.invocationId),
     index("tool_action_requests_issue_idx").on(table.companyId, table.issueId),
@@ -751,6 +760,8 @@ export const toolCallEvents = pgTable(
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [
+    index("tool_call_events_issue_id_fk_idx").on(table.issueId),
+    index("tool_call_events_run_id_fk_idx").on(table.runId),
     index("tool_call_events_company_created_idx").on(table.companyId, table.createdAt),
     index("tool_call_events_run_idx").on(table.companyId, table.runId),
     index("tool_call_events_issue_idx").on(table.companyId, table.issueId),
@@ -783,6 +794,8 @@ export const connectionTokenIssuances = pgTable(
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [
+    index("connection_token_issuances_issue_id_fk_idx").on(table.issueId),
+    index("connection_token_issuances_run_id_fk_idx").on(table.runId),
     index("connection_token_issuances_company_created_idx").on(table.companyId, table.createdAt),
     index("connection_token_issuances_connection_created_idx").on(table.companyId, table.connectionId, table.createdAt),
     index("connection_token_issuances_agent_connection_idx").on(table.companyId, table.agentId, table.connectionId, table.createdAt),

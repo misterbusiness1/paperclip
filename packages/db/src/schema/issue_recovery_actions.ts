@@ -44,6 +44,9 @@ export const issueRecoveryActions = pgTable(
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
+    ownerAgentIdForeignKeyIdx: index("issue_recovery_actions_owner_agent_id_fk_idx").on(table.ownerAgentId),
+    previousOwnerAgentIdForeignKeyIdx: index("issue_recovery_actions_previous_owner_agent_id_fk_idx").on(table.previousOwnerAgentId),
+    returnOwnerAgentIdForeignKeyIdx: index("issue_recovery_actions_return_owner_agent_id_fk_idx").on(table.returnOwnerAgentId),
     companySourceStatusIdx: index("issue_recovery_actions_company_source_status_idx").on(
       table.companyId,
       table.sourceIssueId,

@@ -19,6 +19,8 @@ export const agentTaskSessions = pgTable(
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
+    agentIdForeignKeyIdx: index("agent_task_sessions_agent_id_fk_idx").on(table.agentId),
+    lastRunIdForeignKeyIdx: index("agent_task_sessions_last_run_id_fk_idx").on(table.lastRunId),
     companyAgentTaskUniqueIdx: uniqueIndex("agent_task_sessions_company_agent_adapter_task_uniq").on(
       table.companyId,
       table.agentId,

@@ -21,6 +21,7 @@ export const issueExecutionDecisions = pgTable(
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
+    createdByRunIdForeignKeyIdx: index("issue_execution_decisions_created_by_run_id_fk_idx").on(table.createdByRunId),
     companyIssueIdx: index("issue_execution_decisions_company_issue_idx").on(table.companyId, table.issueId),
     stageIdx: index("issue_execution_decisions_stage_idx").on(table.issueId, table.stageId, table.createdAt),
   }),

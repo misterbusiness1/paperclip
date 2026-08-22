@@ -29,6 +29,9 @@ export const issueTreeHolds = pgTable(
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
+    rootIssueIdForeignKeyIdx: index("issue_tree_holds_root_issue_id_fk_idx").on(table.rootIssueId),
+    createdByRunIdForeignKeyIdx: index("issue_tree_holds_created_by_run_id_fk_idx").on(table.createdByRunId),
+    releasedByRunIdForeignKeyIdx: index("issue_tree_holds_released_by_run_id_fk_idx").on(table.releasedByRunId),
     companyRootStatusIdx: index("issue_tree_holds_company_root_status_idx").on(
       table.companyId,
       table.rootIssueId,

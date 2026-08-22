@@ -42,6 +42,7 @@ export const executionWorkspaces = pgTable(
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
+    derivedFromExecutionWorkspaceIdForeignKeyIdx: index("execution_workspaces_derived_from_execution_workspace_id_fk_idx").on(table.derivedFromExecutionWorkspaceId),
     companyProjectStatusIdx: index("execution_workspaces_company_project_status_idx").on(
       table.companyId,
       table.projectId,

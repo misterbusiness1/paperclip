@@ -20,6 +20,7 @@ export const heartbeatRunEvents = pgTable(
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
+    agentIdForeignKeyIdx: index("heartbeat_run_events_agent_id_fk_idx").on(table.agentId),
     runSeqIdx: index("heartbeat_run_events_run_seq_idx").on(table.runId, table.seq),
     companyRunIdx: index("heartbeat_run_events_company_run_idx").on(table.companyId, table.runId),
     companyCreatedIdx: index("heartbeat_run_events_company_created_idx").on(table.companyId, table.createdAt),

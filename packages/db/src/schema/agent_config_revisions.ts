@@ -18,6 +18,7 @@ export const agentConfigRevisions = pgTable(
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
+    createdByAgentIdForeignKeyIdx: index("agent_config_revisions_created_by_agent_id_fk_idx").on(table.createdByAgentId),
     companyAgentCreatedIdx: index("agent_config_revisions_company_agent_created_idx").on(
       table.companyId,
       table.agentId,

@@ -32,6 +32,9 @@ export const documentAnnotationComments = pgTable(
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
+    documentIdForeignKeyIdx: index("document_annotation_comments_document_id_fk_idx").on(table.documentId),
+    issueIdForeignKeyIdx: index("document_annotation_comments_issue_id_fk_idx").on(table.issueId),
+    createdByRunIdForeignKeyIdx: index("document_annotation_comments_created_by_run_id_fk_idx").on(table.createdByRunId),
     companyThreadCreatedAtIdx: index("document_annotation_comments_company_thread_created_at_idx").on(
       table.companyId,
       table.threadId,

@@ -35,6 +35,7 @@ export const feedbackExports = pgTable(
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
+    issueIdForeignKeyIdx: index("feedback_exports_issue_id_fk_idx").on(table.issueId),
     voteUniqueIdx: uniqueIndex("feedback_exports_feedback_vote_idx").on(table.feedbackVoteId),
     companyCreatedIdx: index("feedback_exports_company_created_idx").on(table.companyId, table.createdAt),
     companyStatusIdx: index("feedback_exports_company_status_idx").on(table.companyId, table.status, table.createdAt),

@@ -25,6 +25,9 @@ export const documents = pgTable(
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
+    createdByAgentIdForeignKeyIdx: index("documents_created_by_agent_id_fk_idx").on(table.createdByAgentId),
+    lockedByAgentIdForeignKeyIdx: index("documents_locked_by_agent_id_fk_idx").on(table.lockedByAgentId),
+    updatedByAgentIdForeignKeyIdx: index("documents_updated_by_agent_id_fk_idx").on(table.updatedByAgentId),
     companyUpdatedIdx: index("documents_company_updated_idx").on(table.companyId, table.updatedAt),
     companyCreatedIdx: index("documents_company_created_idx").on(table.companyId, table.createdAt),
     titleSearchIdx: index("documents_title_search_idx").using("gin", table.title.op("gin_trgm_ops")),

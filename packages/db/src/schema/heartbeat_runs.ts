@@ -60,6 +60,8 @@ export const heartbeatRuns = pgTable(
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
+    retryOfRunIdForeignKeyIdx: index("heartbeat_runs_retry_of_run_id_fk_idx").on(table.retryOfRunId),
+    wakeupRequestIdForeignKeyIdx: index("heartbeat_runs_wakeup_request_id_fk_idx").on(table.wakeupRequestId),
     companyAgentStartedIdx: index("heartbeat_runs_company_agent_started_idx").on(
       table.companyId,
       table.agentId,

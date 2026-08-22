@@ -1,0 +1,50 @@
+CREATE INDEX IF NOT EXISTS "agent_task_sessions_last_run_id_fk_idx" ON "agent_task_sessions" USING btree ("last_run_id");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "company_secret_proposals_origin_run_id_fk_idx" ON "company_secret_proposals" USING btree ("origin_run_id");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "cost_events_heartbeat_run_id_fk_idx" ON "cost_events" USING btree ("heartbeat_run_id");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "decision_queue_items_added_by_run_id_fk_idx" ON "decision_queue_items" USING btree ("added_by_run_id");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "decision_queues_created_by_run_id_fk_idx" ON "decision_queues" USING btree ("created_by_run_id");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "decision_retention_archived_by_run_id_fk_idx" ON "decision_retention" USING btree ("archived_by_run_id");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "decision_triage_set_by_run_id_fk_idx" ON "decision_triage" USING btree ("set_by_run_id");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "decision_triage_events_actor_run_id_fk_idx" ON "decision_triage_events" USING btree ("actor_run_id");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "decision_bundles_origin_run_id_fk_idx" ON "decision_bundles" USING btree ("origin_run_id");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "decisions_origin_run_id_fk_idx" ON "decisions" USING btree ("origin_run_id");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "document_annotation_comments_created_by_run_id_fk_idx" ON "document_annotation_comments" USING btree ("created_by_run_id");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "document_revisions_created_by_run_id_fk_idx" ON "document_revisions" USING btree ("created_by_run_id");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "environment_leases_execution_workspace_id_fk_idx" ON "environment_leases" USING btree ("execution_workspace_id");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "execution_workspaces_derived_from_execution_workspace_id_fk_idx" ON "execution_workspaces" USING btree ("derived_from_execution_workspace_id");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "finance_events_heartbeat_run_id_fk_idx" ON "finance_events" USING btree ("heartbeat_run_id");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "heartbeat_run_watchdog_decisions_created_by_run_id_fk_idx" ON "heartbeat_run_watchdog_decisions" USING btree ("created_by_run_id");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "heartbeat_run_watchdog_decisions_run_id_fk_idx" ON "heartbeat_run_watchdog_decisions" USING btree ("run_id");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "heartbeat_runs_retry_of_run_id_fk_idx" ON "heartbeat_runs" USING btree ("retry_of_run_id");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "heartbeat_runs_wakeup_request_id_fk_idx" ON "heartbeat_runs" USING btree ("wakeup_request_id");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "connection_token_issuances_run_id_fk_idx" ON "connection_token_issuances" USING btree ("run_id");--> statement-breakpoint
+-- paperclip:migration-safety-ignore large-create-index-not-concurrently: Drizzle migrations run transactionally, so CONCURRENTLY is unavailable. Production rollouts prebuild this reverse-FK index concurrently before applying the migration.
+CREATE INDEX IF NOT EXISTS "issue_comments_created_by_run_id_fk_idx" ON "issue_comments" USING btree ("created_by_run_id");--> statement-breakpoint
+-- paperclip:migration-safety-ignore large-create-index-not-concurrently: Drizzle migrations run transactionally, so CONCURRENTLY is unavailable. Production rollouts prebuild this reverse-FK index concurrently before applying the migration.
+CREATE INDEX IF NOT EXISTS "issue_comments_deleted_by_run_id_fk_idx" ON "issue_comments" USING btree ("deleted_by_run_id");--> statement-breakpoint
+-- paperclip:migration-safety-ignore large-create-index-not-concurrently: Drizzle migrations run transactionally, so CONCURRENTLY is unavailable. Production rollouts prebuild this reverse-FK index concurrently before applying the migration.
+CREATE INDEX IF NOT EXISTS "issue_comments_derived_created_by_run_id_fk_idx" ON "issue_comments" USING btree ("derived_created_by_run_id");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "issue_execution_decisions_created_by_run_id_fk_idx" ON "issue_execution_decisions" USING btree ("created_by_run_id");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "issue_inbox_archives_archived_by_run_id_fk_idx" ON "issue_inbox_archives" USING btree ("archived_by_run_id");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "issue_plan_decompositions_owner_run_id_fk_idx" ON "issue_plan_decompositions" USING btree ("owner_run_id");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "issue_thread_interactions_resolved_by_run_id_fk_idx" ON "issue_thread_interactions" USING btree ("resolved_by_run_id");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "issue_thread_interactions_source_run_id_fk_idx" ON "issue_thread_interactions" USING btree ("source_run_id");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "issue_tree_hold_members_active_run_id_fk_idx" ON "issue_tree_hold_members" USING btree ("active_run_id");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "issue_tree_holds_created_by_run_id_fk_idx" ON "issue_tree_holds" USING btree ("created_by_run_id");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "issue_tree_holds_released_by_run_id_fk_idx" ON "issue_tree_holds" USING btree ("released_by_run_id");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "issue_watchdogs_created_by_run_id_fk_idx" ON "issue_watchdogs" USING btree ("created_by_run_id");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "issue_watchdogs_updated_by_run_id_fk_idx" ON "issue_watchdogs" USING btree ("updated_by_run_id");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "issue_work_products_created_by_run_id_fk_idx" ON "issue_work_products" USING btree ("created_by_run_id");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "issue_work_products_execution_workspace_id_fk_idx" ON "issue_work_products" USING btree ("execution_workspace_id");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "issues_checkout_run_id_fk_idx" ON "issues" USING btree ("checkout_run_id");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "issues_execution_run_id_fk_idx" ON "issues" USING btree ("execution_run_id");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "issues_execution_workspace_id_fk_idx" ON "issues" USING btree ("execution_workspace_id");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "routine_revisions_created_by_run_id_fk_idx" ON "routine_revisions" USING btree ("created_by_run_id");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "status_card_updates_run_id_fk_idx" ON "status_card_updates" USING btree ("run_id");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "tool_call_events_run_id_fk_idx" ON "tool_call_events" USING btree ("run_id");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "tool_gateway_sessions_run_id_fk_idx" ON "tool_gateway_sessions" USING btree ("run_id");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "tool_invocations_run_id_fk_idx" ON "tool_invocations" USING btree ("run_id");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "tool_runtime_slots_execution_workspace_id_fk_idx" ON "tool_runtime_slots" USING btree ("execution_workspace_id");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "workspace_operations_execution_workspace_id_fk_idx" ON "workspace_operations" USING btree ("execution_workspace_id");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "workspace_operations_heartbeat_run_id_fk_idx" ON "workspace_operations" USING btree ("heartbeat_run_id");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "workspace_runtime_services_execution_workspace_id_fk_idx" ON "workspace_runtime_services" USING btree ("execution_workspace_id");

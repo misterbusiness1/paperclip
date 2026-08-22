@@ -43,6 +43,8 @@ export const issueWorkProducts = pgTable(
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
+    createdByRunIdForeignKeyIdx: index("issue_work_products_created_by_run_id_fk_idx").on(table.createdByRunId),
+    executionWorkspaceIdForeignKeyIdx: index("issue_work_products_execution_workspace_id_fk_idx").on(table.executionWorkspaceId),
     companyIssueTypeIdx: index("issue_work_products_company_issue_type_idx").on(
       table.companyId,
       table.issueId,

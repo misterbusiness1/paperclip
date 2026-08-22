@@ -46,6 +46,8 @@ export const issueThreadInteractions = pgTable(
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
+    resolvedByRunIdForeignKeyIdx: index("issue_thread_interactions_resolved_by_run_id_fk_idx").on(table.resolvedByRunId),
+    sourceRunIdForeignKeyIdx: index("issue_thread_interactions_source_run_id_fk_idx").on(table.sourceRunId),
     issueIdx: index("issue_thread_interactions_issue_idx").on(table.issueId),
     companyIssueCreatedAtIdx: index("issue_thread_interactions_company_issue_created_at_idx").on(
       table.companyId,

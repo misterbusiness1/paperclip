@@ -28,6 +28,7 @@ export const documentAnnotationAnchorSnapshots = pgTable(
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
+    documentIdForeignKeyIdx: index("document_annotation_anchor_snapshots_document_id_fk_idx").on(table.documentId),
     companyThreadCreatedAtIdx: index("document_annotation_anchor_snapshots_company_thread_created_at_idx").on(
       table.companyId,
       table.threadId,

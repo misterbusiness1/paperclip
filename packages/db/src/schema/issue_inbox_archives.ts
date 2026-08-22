@@ -21,6 +21,7 @@ export const issueInboxArchives = pgTable(
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
+    archivedByRunIdForeignKeyIdx: index("issue_inbox_archives_archived_by_run_id_fk_idx").on(table.archivedByRunId),
     companyIssueIdx: index("issue_inbox_archives_company_issue_idx").on(table.companyId, table.issueId),
     issueIdx: index("issue_inbox_archives_issue_idx").on(table.issueId),
     companyUserIdx: index("issue_inbox_archives_company_user_idx").on(table.companyId, table.userId),

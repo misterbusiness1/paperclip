@@ -29,6 +29,7 @@ export const environmentLeases = pgTable(
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
+    executionWorkspaceIdForeignKeyIdx: index("environment_leases_execution_workspace_id_fk_idx").on(table.executionWorkspaceId),
     companyEnvironmentStatusIdx: index("environment_leases_company_environment_status_idx").on(
       table.companyId,
       table.environmentId,

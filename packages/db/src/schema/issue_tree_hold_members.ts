@@ -26,6 +26,9 @@ export const issueTreeHoldMembers = pgTable(
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
+    issueIdForeignKeyIdx: index("issue_tree_hold_members_issue_id_fk_idx").on(table.issueId),
+    parentIssueIdForeignKeyIdx: index("issue_tree_hold_members_parent_issue_id_fk_idx").on(table.parentIssueId),
+    activeRunIdForeignKeyIdx: index("issue_tree_hold_members_active_run_id_fk_idx").on(table.activeRunId),
     holdIssueUniqueIdx: uniqueIndex("issue_tree_hold_members_hold_issue_uq").on(table.holdId, table.issueId),
     companyIssueIdx: index("issue_tree_hold_members_company_issue_idx").on(table.companyId, table.issueId),
     holdDepthIdx: index("issue_tree_hold_members_hold_depth_idx").on(table.holdId, table.depth),

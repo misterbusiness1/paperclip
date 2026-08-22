@@ -26,6 +26,7 @@ export const summarySlots = pgTable(
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
+    generatingIssueIdForeignKeyIdx: index("summary_slots_generating_issue_id_fk_idx").on(table.generatingIssueId),
     companyScopeSlotUq: unique("summary_slots_company_scope_slot_uq")
       .on(table.companyId, table.scopeKind, table.scopeId, table.slotKey)
       .nullsNotDistinct(),

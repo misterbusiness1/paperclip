@@ -21,6 +21,8 @@ export const documentRevisions = pgTable(
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
+    createdByAgentIdForeignKeyIdx: index("document_revisions_created_by_agent_id_fk_idx").on(table.createdByAgentId),
+    createdByRunIdForeignKeyIdx: index("document_revisions_created_by_run_id_fk_idx").on(table.createdByRunId),
     documentRevisionUq: uniqueIndex("document_revisions_document_revision_uq").on(
       table.documentId,
       table.revisionNumber,

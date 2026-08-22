@@ -55,6 +55,7 @@ export const routines = pgTable(
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
+    parentIssueIdForeignKeyIdx: index("routines_parent_issue_id_fk_idx").on(table.parentIssueId),
     companyStatusIdx: index("routines_company_status_idx").on(table.companyId, table.status),
     companyAssigneeIdx: index("routines_company_assignee_idx").on(table.companyId, table.assigneeAgentId),
     companyProjectIdx: index("routines_company_project_idx").on(table.companyId, table.projectId),
@@ -86,6 +87,7 @@ export const routineRevisions = pgTable(
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
+    createdByRunIdForeignKeyIdx: index("routine_revisions_created_by_run_id_fk_idx").on(table.createdByRunId),
     routineRevisionUq: uniqueIndex("routine_revisions_routine_revision_uq").on(
       table.routineId,
       table.revisionNumber,

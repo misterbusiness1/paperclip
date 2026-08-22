@@ -224,6 +224,7 @@ export const companySkillTestRuns = pgTable(
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
+    issueIdForeignKeyIdx: index("company_skill_test_runs_issue_id_fk_idx").on(table.issueId),
     companySkillCreatedIdx: index("company_skill_test_runs_company_skill_created_idx").on(
       table.companyId,
       table.skillId,

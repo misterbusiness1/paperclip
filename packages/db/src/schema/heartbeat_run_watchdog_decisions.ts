@@ -20,6 +20,9 @@ export const heartbeatRunWatchdogDecisions = pgTable(
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
+    evaluationIssueIdForeignKeyIdx: index("heartbeat_run_watchdog_decisions_evaluation_issue_id_fk_idx").on(table.evaluationIssueId),
+    createdByRunIdForeignKeyIdx: index("heartbeat_run_watchdog_decisions_created_by_run_id_fk_idx").on(table.createdByRunId),
+    runIdForeignKeyIdx: index("heartbeat_run_watchdog_decisions_run_id_fk_idx").on(table.runId),
     companyRunCreatedIdx: index("heartbeat_run_watchdog_decisions_company_run_created_idx").on(
       table.companyId,
       table.runId,

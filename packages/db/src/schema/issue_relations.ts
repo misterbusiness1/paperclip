@@ -17,6 +17,9 @@ export const issueRelations = pgTable(
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
+    createdByAgentIdForeignKeyIdx: index("issue_relations_created_by_agent_id_fk_idx").on(table.createdByAgentId),
+    issueIdForeignKeyIdx: index("issue_relations_issue_id_fk_idx").on(table.issueId),
+    relatedIssueIdForeignKeyIdx: index("issue_relations_related_issue_id_fk_idx").on(table.relatedIssueId),
     companyIssueIdx: index("issue_relations_company_issue_idx").on(table.companyId, table.issueId),
     companyRelatedIssueIdx: index("issue_relations_company_related_issue_idx").on(table.companyId, table.relatedIssueId),
     companyTypeIdx: index("issue_relations_company_type_idx").on(table.companyId, table.type),

@@ -64,6 +64,8 @@ export const statusCards = pgTable(
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
+    documentIdForeignKeyIdx: index("status_cards_document_id_fk_idx").on(table.documentId),
+    generatingIssueIdForeignKeyIdx: index("status_cards_generating_issue_id_fk_idx").on(table.generatingIssueId),
     companyArchivedIdx: index("status_cards_company_archived_idx").on(table.companyId, table.archivedAt),
     companyNextEvalIdx: index("status_cards_company_next_eval_idx").on(table.companyId, table.nextEvalAt),
   }),
@@ -91,6 +93,7 @@ export const statusCardUpdates = pgTable(
     error: text("error"),
   },
   (table) => ({
+    runIdForeignKeyIdx: index("status_card_updates_run_id_fk_idx").on(table.runId),
     cardStartedIdx: index("status_card_updates_card_started_idx").on(table.cardId, table.startedAt),
     generationIssueIdx: index("status_card_updates_generation_issue_idx").on(table.generationIssueId),
   }),

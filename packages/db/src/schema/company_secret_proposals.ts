@@ -43,6 +43,8 @@ export const companySecretProposals = pgTable(
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
+    originIssueIdForeignKeyIdx: index("company_secret_proposals_origin_issue_id_fk_idx").on(table.originIssueId),
+    originRunIdForeignKeyIdx: index("company_secret_proposals_origin_run_id_fk_idx").on(table.originRunId),
     companyStatusIdx: index("company_secret_proposals_company_status_idx").on(table.companyId, table.status),
     proposerStatusIdx: index("company_secret_proposals_proposer_status_idx").on(table.proposedByAgentId, table.status),
     expiryIdx: index("company_secret_proposals_expiry_idx").on(table.status, table.expiresAt),

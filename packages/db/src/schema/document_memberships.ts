@@ -14,6 +14,7 @@ export const documentMemberships = pgTable(
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
+    documentIdForeignKeyIdx: index("document_memberships_document_id_fk_idx").on(table.documentId),
     companyUserStarredIdx: index("document_memberships_company_user_starred_idx").on(
       table.companyId,
       table.userId,

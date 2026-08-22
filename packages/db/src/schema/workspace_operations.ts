@@ -47,6 +47,8 @@ export const workspaceOperations = pgTable(
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
+    executionWorkspaceIdForeignKeyIdx: index("workspace_operations_execution_workspace_id_fk_idx").on(table.executionWorkspaceId),
+    heartbeatRunIdForeignKeyIdx: index("workspace_operations_heartbeat_run_id_fk_idx").on(table.heartbeatRunId),
     companyRunStartedIdx: index("workspace_operations_company_run_started_idx").on(
       table.companyId,
       table.heartbeatRunId,

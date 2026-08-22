@@ -30,6 +30,7 @@ export const externalObjectMentions = pgTable(
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
+    sourceIssueIdForeignKeyIdx: index("external_object_mentions_source_issue_id_fk_idx").on(table.sourceIssueId),
     companySourceIssueIdx: index("external_object_mentions_company_source_issue_idx").on(
       table.companyId,
       table.sourceIssueId,

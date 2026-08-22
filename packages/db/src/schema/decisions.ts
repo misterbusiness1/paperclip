@@ -30,6 +30,8 @@ export const decisionBundles = pgTable(
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
+    originIssueIdForeignKeyIdx: index("decision_bundles_origin_issue_id_fk_idx").on(table.originIssueId),
+    originRunIdForeignKeyIdx: index("decision_bundles_origin_run_id_fk_idx").on(table.originRunId),
     companyCreatedAtIdx: index("decision_bundles_company_created_at_idx").on(table.companyId, table.createdAt),
   }),
 );
@@ -64,6 +66,7 @@ export const decisions = pgTable(
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
+    originRunIdForeignKeyIdx: index("decisions_origin_run_id_fk_idx").on(table.originRunId),
     companyStatusExpiresAtIdx: index("decisions_company_status_expires_at_idx").on(
       table.companyId,
       table.status,

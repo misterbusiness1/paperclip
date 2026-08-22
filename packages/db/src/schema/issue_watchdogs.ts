@@ -32,6 +32,10 @@ export const issueWatchdogs = pgTable(
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
+    issueIdForeignKeyIdx: index("issue_watchdogs_issue_id_fk_idx").on(table.issueId),
+    watchdogIssueIdForeignKeyIdx: index("issue_watchdogs_watchdog_issue_id_fk_idx").on(table.watchdogIssueId),
+    createdByRunIdForeignKeyIdx: index("issue_watchdogs_created_by_run_id_fk_idx").on(table.createdByRunId),
+    updatedByRunIdForeignKeyIdx: index("issue_watchdogs_updated_by_run_id_fk_idx").on(table.updatedByRunId),
     companyIssueIdx: uniqueIndex("issue_watchdogs_company_issue_uq").on(table.companyId, table.issueId),
     companyStatusIdx: index("issue_watchdogs_company_status_idx").on(table.companyId, table.status),
     companyAgentIdx: index("issue_watchdogs_company_agent_idx").on(table.companyId, table.watchdogAgentId),

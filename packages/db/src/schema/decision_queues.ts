@@ -40,6 +40,7 @@ export const decisionQueues = pgTable(
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
+    createdByRunIdForeignKeyIdx: index("decision_queues_created_by_run_id_fk_idx").on(table.createdByRunId),
     companyKeyUq: uniqueIndex("decision_queues_company_key_uq").on(table.companyId, table.key),
     companyUpdatedIdx: index("decision_queues_company_updated_idx").on(table.companyId, table.updatedAt),
     idCompanyUq: unique("decision_queues_id_company_uq").on(table.id, table.companyId),
@@ -75,6 +76,7 @@ export const decisionQueueItems = pgTable(
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
+    addedByRunIdForeignKeyIdx: index("decision_queue_items_added_by_run_id_fk_idx").on(table.addedByRunId),
     queueSourceUq: uniqueIndex("decision_queue_items_queue_source_uq").on(
       table.queueId,
       table.sourceKind,
@@ -122,6 +124,7 @@ export const decisionTriage = pgTable(
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
+    setByRunIdForeignKeyIdx: index("decision_triage_set_by_run_id_fk_idx").on(table.setByRunId),
     companySourceUq: uniqueIndex("decision_triage_company_source_uq").on(
       table.companyId,
       table.sourceKind,
@@ -165,6 +168,7 @@ export const decisionTriageEvents = pgTable(
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
+    actorRunIdForeignKeyIdx: index("decision_triage_events_actor_run_id_fk_idx").on(table.actorRunId),
     companySourceCreatedIdx: index("decision_triage_events_company_source_created_idx").on(
       table.companyId,
       table.sourceKind,
@@ -204,6 +208,7 @@ export const decisionRetention = pgTable(
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
+    archivedByRunIdForeignKeyIdx: index("decision_retention_archived_by_run_id_fk_idx").on(table.archivedByRunId),
     companySourceUq: uniqueIndex("decision_retention_company_source_uq").on(
       table.companyId,
       table.sourceKind,

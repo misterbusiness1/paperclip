@@ -51,6 +51,8 @@ export const documentAnnotationThreads = pgTable(
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
+    documentIdForeignKeyIdx: index("document_annotation_threads_document_id_fk_idx").on(table.documentId),
+    issueIdForeignKeyIdx: index("document_annotation_threads_issue_id_fk_idx").on(table.issueId),
     companyDocumentStatusIdx: index("document_annotation_threads_company_document_status_idx").on(
       table.companyId,
       table.documentId,

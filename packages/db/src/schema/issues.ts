@@ -77,6 +77,11 @@ export const issues = pgTable(
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
+    assigneeAgentIdForeignKeyIdx: index("issues_assignee_agent_id_fk_idx").on(table.assigneeAgentId),
+    createdByAgentIdForeignKeyIdx: index("issues_created_by_agent_id_fk_idx").on(table.createdByAgentId),
+    checkoutRunIdForeignKeyIdx: index("issues_checkout_run_id_fk_idx").on(table.checkoutRunId),
+    executionRunIdForeignKeyIdx: index("issues_execution_run_id_fk_idx").on(table.executionRunId),
+    executionWorkspaceIdForeignKeyIdx: index("issues_execution_workspace_id_fk_idx").on(table.executionWorkspaceId),
     companyStatusIdx: index("issues_company_status_idx").on(table.companyId, table.status),
     companyHarnessKindIdx: index("issues_company_harness_kind_idx").on(table.companyId, table.harnessKind),
     assigneeStatusIdx: index("issues_company_assignee_status_idx").on(
