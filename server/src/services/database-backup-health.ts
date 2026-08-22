@@ -1,8 +1,11 @@
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 
+const EMPTY_GZIP_BYTES = 20;
+
 export type DatabaseBackupHealthWarningCode =
   | "database_backup_check_failed"
+  | "database_backup_empty"
   | "database_backup_last_failure"
   | "database_backup_missing"
   | "database_backup_stale";
@@ -51,6 +54,7 @@ function alertFileCandidates(opts: InspectDatabaseBackupHealthOptions) {
     ...(opts.alertFiles ?? []),
     join(opts.backupDir, "db-backup-to-s3.failure"),
     resolve(opts.backupDir, "..", "db-backup-to-s3.failure"),
+    join(opts.backupDir, "database-backup.failure"),
   ].filter((value): value is string => Boolean(value)))];
 }
 
@@ -120,6 +124,11 @@ export function inspectDatabaseBackupHealth(
       warnings.push({
         code: "database_backup_missing",
         message: `No .sql.gz database backups found in ${opts.backupDir}.`,
+      });
+    } else if (latestBackup.sizeBytes === EMPTY_GZIP_BYTES) {
+      warnings.push({
+        code: "database_backup_empty",
+        message: `Latest database backup is empty: ${latestBackup.path}.`,
       });
     } else if (latestBackup.ageHours > maxAgeHours) {
       warnings.push({
