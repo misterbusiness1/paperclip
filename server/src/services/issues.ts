@@ -7995,6 +7995,7 @@ export function issueService(db: Db) {
           and(
             eq(issues.id, id),
             inArray(issues.status, expectedStatuses),
+            notInArray(issues.status, ["done", "cancelled"]),
             or(isNull(issues.assigneeAgentId), sameRunAssigneeCondition),
             executionLockCondition,
           ),
@@ -8101,6 +8102,7 @@ export function issueService(db: Db) {
               and(
                 eq(issues.id, id),
                 inArray(issues.status, expectedStatuses),
+                notInArray(issues.status, ["done", "cancelled"]),
                 eq(issues.executionRunId, current.executionRunId),
                 or(isNull(issues.assigneeAgentId), eq(issues.assigneeAgentId, agentId)),
               ),

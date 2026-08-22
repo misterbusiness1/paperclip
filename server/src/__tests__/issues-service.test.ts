@@ -5517,12 +5517,9 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
     });
   });
 
-  it("checkout refuses to promote a 'done' issue when 'done' is not in expectedStatuses, even with a lingering executionRunId pointer", async () => {
-    // Regression for PR #2482 checkout-adoption review finding: the original
-    // patch's stale-executionRunId adoption SQL set `status: 'in_progress'`
-    // unconditionally, bypassing the caller's expectedStatuses guard. With the
-    // guard restored, attempting to take over a 'done' issue with
-    // expectedStatuses=['todo'] must fail and leave the row untouched.
+  it("checkout refuses to promote a 'done' issue even when the caller includes 'done' in expectedStatuses", async () => {
+    // A recovery agent must not reopen board-completed work by supplying a
+    // terminal status in its own optimistic checkout guard.
     const companyId = randomUUID();
     const agentId = randomUUID();
     const issueId = randomUUID();
@@ -5577,7 +5574,7 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
       completedAt: new Date("2026-06-10T10:01:00.000Z"),
     });
 
-    await expect(svc.checkout(issueId, agentId, ["todo"], successorRunId))
+    await expect(svc.checkout(issueId, agentId, ["done"], successorRunId))
       .rejects.toMatchObject({ status: 409 });
 
     const row = await db
