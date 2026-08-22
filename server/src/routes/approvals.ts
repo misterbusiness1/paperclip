@@ -4,6 +4,7 @@ import { heartbeatRuns, type Db } from "@paperclipai/db";
 import {
   addApprovalCommentSchema,
   createApprovalSchema,
+  decisionReadyApprovalPayloadSchema,
   requestApprovalRevisionSchema,
   resolveApprovalSchema,
   resubmitApprovalSchema,
@@ -472,6 +473,19 @@ export function approvalRoutes(
     if (req.actor.type === "agent" && req.actor.agentId !== existing.requestedByAgentId) {
       res.status(403).json({ error: "Only requesting agent can resubmit this approval" });
       return;
+    }
+
+    if (existing.type === "request_board_approval") {
+      const decisionPayload = decisionReadyApprovalPayloadSchema.safeParse(
+        req.body.payload ?? existing.payload,
+      );
+      if (!decisionPayload.success) {
+        res.status(400).json({
+          error: "Board approval payload must include a recommendation, reasoning, pros, and risks",
+          details: decisionPayload.error.flatten(),
+        });
+        return;
+      }
     }
 
     const normalizedPayload = req.body.payload

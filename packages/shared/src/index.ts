@@ -1824,6 +1824,7 @@ export {
   type CreateGoal,
   type UpdateGoal,
   createApprovalSchema,
+  decisionReadyApprovalPayloadSchema,
   upsertBudgetPolicySchema,
   resolveBudgetIncidentSchema,
   resolveApprovalSchema,

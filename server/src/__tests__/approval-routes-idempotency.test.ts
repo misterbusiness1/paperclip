@@ -330,7 +330,13 @@ describe("approval routes idempotent retries", () => {
       requestedByAgentId: "agent-1",
       requestedByUserId: null,
       status: "pending",
-      payload: { title: "Approve hosting spend" },
+      payload: {
+        title: "Approve hosting spend",
+        recommendedAction: "Approve the bounded hosting spend.",
+        reasoning: "The selected plan meets the stated capacity requirement.",
+        pros: ["Provisioning can continue."],
+        risks: ["The recurring cost increases."],
+      },
       decisionNote: null,
       decidedByUserId: null,
       decidedAt: null,
@@ -343,7 +349,13 @@ describe("approval routes idempotent retries", () => {
       .send({
         type: "request_board_approval",
         issueIds: ["00000000-0000-0000-0000-000000000001"],
-        payload: { title: "Approve hosting spend" },
+        payload: {
+          title: "Approve hosting spend",
+          recommendedAction: "Approve the bounded hosting spend.",
+          reasoning: "The selected plan meets the stated capacity requirement.",
+          pros: ["Provisioning can continue."],
+          risks: ["The recurring cost increases."],
+        },
       });
 
     expect([200, 201], JSON.stringify(res.body)).toContain(res.status);
@@ -371,6 +383,36 @@ describe("approval routes idempotent retries", () => {
     );
   });
 
+  it("rejects board approval requests without micro-decision fields", async () => {
+    const res = await request(await createAgentApp())
+      .post("/api/companies/company-1/approvals")
+      .send({
+        type: "request_board_approval",
+        payload: { title: "Approve hosting spend" },
+      });
+
+    expect(res.status).toBe(400);
+    expect(mockApprovalService.create).not.toHaveBeenCalled();
+  });
+
+  it("rejects incomplete board approval resubmissions", async () => {
+    mockApprovalService.getById.mockResolvedValue({
+      id: "approval-7",
+      companyId: "company-1",
+      type: "request_board_approval",
+      status: "revision_requested",
+      payload: { title: "Approve hosting spend" },
+      requestedByAgentId: "agent-1",
+    });
+
+    const res = await request(await createAgentApp())
+      .post("/api/approvals/approval-7/resubmit")
+      .send({ payload: { title: "Retry" } });
+
+    expect(res.status).toBe(400);
+    expect(mockApprovalService.resubmit).not.toHaveBeenCalled();
+  });
+
   it("blocks status-only recovery runs from creating approvals", async () => {
     const res = await request(await createAgentApp({
       contextSnapshot: {
@@ -384,7 +426,13 @@ describe("approval routes idempotent retries", () => {
       .post("/api/companies/company-1/approvals")
       .send({
         type: "request_board_approval",
-        payload: { title: "Approve hosting spend" },
+        payload: {
+          title: "Approve hosting spend",
+          recommendedAction: "Approve the bounded hosting spend.",
+          reasoning: "The selected plan meets the stated capacity requirement.",
+          pros: ["Provisioning can continue."],
+          risks: ["The recurring cost increases."],
+        },
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(403);

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   addApprovalCommentSchema,
+  createApprovalSchema,
   requestApprovalRevisionSchema,
   resolveApprovalSchema,
 } from "./approval.js";
@@ -27,5 +28,29 @@ describe("approval validators", () => {
       .toBe("Decision\n\nApproved.");
     expect(requestApprovalRevisionSchema.parse({ decisionNote: "Decision\\r\\nRevise." }).decisionNote)
       .toBe("Decision\nRevise.");
+  });
+
+  it("requires decision-ready fields for board approval requests", () => {
+    expect(createApprovalSchema.safeParse({
+      type: "request_board_approval",
+      payload: { recommendedAction: "Approve", reasoning: "Bounded change", pros: [], risks: [] },
+    }).success).toBe(false);
+
+    expect(createApprovalSchema.safeParse({
+      type: "request_board_approval",
+      payload: {
+        recommendedAction: "Approve the bounded change.",
+        reasoning: "The reviewed evidence supports it.",
+        pros: ["Completes the requested outcome."],
+        risks: ["Requires rollback if the acceptance check fails."],
+      },
+    }).success).toBe(true);
+  });
+
+  it("keeps non-board approval payloads extensible", () => {
+    expect(createApprovalSchema.safeParse({
+      type: "hire_agent",
+      payload: { name: "Support Agent" },
+    }).success).toBe(true);
   });
 });
