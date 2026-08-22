@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { gzipSync } from "node:zlib";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import express from "express";
 import request from "supertest";
@@ -211,6 +212,27 @@ describe("GET /health", () => {
     expect(res.body.warnings).toEqual(res.body.databaseBackup.warnings);
   });
 
+  it("surfaces an empty database backup warning in full health details", async () => {
+    const backupDir = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-health-empty-backup-"));
+    const backupFile = path.join(backupDir, "paperclip-20260706-031702.sql.gz");
+    fs.writeFileSync(backupFile, gzipSync(Buffer.alloc(0)));
+    const app = createApp(createHealthyDb(), testServerInfo, {
+      enabled: true,
+      backupDir,
+      maxAgeHours: 26,
+      now: new Date("2026-07-06T04:00:00.000Z"),
+    });
+
+    const res = await request(app).get("/health");
+
+    expect(res.status).toBe(200);
+    expect(res.body.databaseBackup).toMatchObject({
+      status: "warning",
+      latestBackup: { path: backupFile, sizeBytes: 20 },
+      warnings: [{ code: "database_backup_empty" }],
+    });
+  });
+
   it("surfaces database backup failure markers in full health details", async () => {
     const backupDir = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-health-backups-"));
     const backupFile = path.join(backupDir, "paperclip-20260706-031702.sql.gz");
@@ -240,6 +262,29 @@ describe("GET /health", () => {
           message: "db-backup-to-s3 failed at 2026-07-06T03:17:00.000Z exit=1",
         },
       ],
+    });
+  });
+
+  it("finds scheduled database backup failure markers", async () => {
+    const backupDir = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-health-scheduled-backup-"));
+    const backupFile = path.join(backupDir, "paperclip-20260706-031702.sql.gz");
+    const alertFile = path.join(backupDir, "database-backup.failure");
+    fs.writeFileSync(backupFile, "backup");
+    fs.writeFileSync(alertFile, "Database backup failed; inspect server logs.\n");
+    const app = createApp(createHealthyDb(), testServerInfo, {
+      enabled: true,
+      backupDir,
+      maxAgeHours: 26,
+      now: new Date("2026-07-06T04:00:00.000Z"),
+    });
+
+    const res = await request(app).get("/health");
+
+    expect(res.status).toBe(200);
+    expect(res.body.databaseBackup).toMatchObject({
+      status: "warning",
+      lastFailure: { path: alertFile },
+      warnings: [{ code: "database_backup_last_failure" }],
     });
   });
 

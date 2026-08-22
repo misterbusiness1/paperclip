@@ -70,6 +70,7 @@ const DEFAULT_BACKUP_WRITE_BUFFER_BYTES = 1024 * 1024;
 const BACKUP_DATA_CURSOR_ROWS = 100;
 const BACKUP_CLI_STDERR_BYTES = 64 * 1024;
 const BACKUP_BREAKPOINT_DETECT_BYTES = 64 * 1024;
+const EMPTY_GZIP_BYTES = 20;
 
 const STATEMENT_BREAKPOINT = "-- paperclip statement breakpoint 69f6f3f1-42fd-46a6-bf17-d1d85f8f3900";
 
@@ -346,10 +347,20 @@ async function runPgDumpBackup(opts: {
     throw new Error("pg_dump did not expose stdout");
   }
 
-  await Promise.all([
+  const [outputResult, exitResult] = await Promise.allSettled([
     pipeline(child.stdout, createGzip(), createWriteStream(opts.backupFile)),
     waitForChildExit(child, pgDumpBin),
   ]);
+  if (exitResult.status === "rejected") throw exitResult.reason;
+  if (outputResult.status === "rejected") throw outputResult.reason;
+}
+
+function validatedBackupSize(backupFile: string): number {
+  const sizeBytes = statSync(backupFile).size;
+  if (sizeBytes <= EMPTY_GZIP_BYTES) {
+    throw new Error(`Database backup is empty: ${backupFile}`);
+  }
+  return sizeBytes;
 }
 
 async function restoreWithPsql(opts: RunDatabaseRestoreOptions, connectTimeout: number): Promise<void> {
@@ -555,7 +566,7 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
           connectTimeout,
         });
         await writer.abort();
-        const sizeBytes = statSync(backupFile).size;
+        const sizeBytes = validatedBackupSize(backupFile);
         const prunedCount = pruneOldBackups(opts.backupDir, retention, filenamePrefix);
         return {
           backupFile,
@@ -704,9 +715,12 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
         character_maximum_length: number | null;
         numeric_precision: number | null;
         numeric_scale: number | null;
+        is_generated: "ALWAYS" | "NEVER";
+        generation_expression: string | null;
       }[]>`
         SELECT column_name, data_type, udt_schema, udt_name, is_nullable, column_default,
-               character_maximum_length, numeric_precision, numeric_scale
+               character_maximum_length, numeric_precision, numeric_scale,
+               is_generated, generation_expression
         FROM information_schema.columns
         WHERE table_schema = ${schema_name} AND table_name = ${tablename}
         ORDER BY ordinal_position
@@ -739,7 +753,14 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
         }
 
         let def = `  "${col.column_name}" ${typeStr}`;
-        if (col.column_default != null) def += ` DEFAULT ${col.column_default}`;
+        if (col.is_generated === "ALWAYS") {
+          if (!col.generation_expression) {
+            throw new Error(`Generated column ${schema_name}.${tablename}.${col.column_name} has no expression`);
+          }
+          def += ` GENERATED ALWAYS AS (${col.generation_expression}) STORED`;
+        } else if (col.column_default != null) {
+          def += ` DEFAULT ${col.column_default}`;
+        }
         if (col.is_nullable === "NO") def += " NOT NULL";
         colDefs.push(def);
       }
@@ -895,11 +916,20 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
         SELECT column_name, data_type
         FROM information_schema.columns
         WHERE table_schema = ${schema_name} AND table_name = ${tablename}
+          AND is_generated = 'NEVER'
         ORDER BY ordinal_position
       `;
       const colNames = cols.map((c) => `"${c.column_name}"`).join(", ");
 
       emit(`-- Data for: ${schema_name}.${tablename} (${count[0]!.n} rows)`);
+
+      if (cols.length === 0) {
+        for (let row = 0; row < count[0]!.n; row += 1) {
+          emitStatement(`INSERT INTO ${qualifiedTableName} DEFAULT VALUES;`);
+        }
+        emit("");
+        continue;
+      }
 
       const nullifiedColumns = nullifiedColumnsByTable.get(currentTableKey) ?? new Set<string>();
       if (backupEngine !== "javascript" && nullifiedColumns.size === 0) {
@@ -923,7 +953,7 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
       }
 
       const rowCursor = sql
-        .unsafe(`SELECT * FROM ${qualifiedTableName}`)
+        .unsafe(`SELECT ${colNames} FROM ${qualifiedTableName}`)
         .values()
         .cursor(BACKUP_DATA_CURSOR_ROWS) as AsyncIterable<unknown[][]>;
       for await (const rows of rowCursor) {
@@ -967,7 +997,7 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
     await pipeline(sqlReadStream, createGzip(), gzWriteStream);
     unlinkSync(sqlFile);
 
-    const sizeBytes = statSync(backupFile).size;
+    const sizeBytes = validatedBackupSize(backupFile);
     const prunedCount = pruneOldBackups(opts.backupDir, retention, filenamePrefix);
 
     return {
@@ -986,6 +1016,9 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
     throw error;
   } finally {
     await closeSql();
+    if (existsSync(sqlFile)) {
+      try { unlinkSync(sqlFile); } catch { /* ignore */ }
+    }
   }
 }
 

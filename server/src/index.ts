@@ -4,7 +4,7 @@
 // instrumentationReady before opening DB connections or constructing the
 // HTTP server, so trace coverage does not depend on incidental timing.
 import { instrumentationReady, shutdownInstrumentation } from "./instrumentation.js";
-import { existsSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
@@ -663,7 +663,9 @@ export async function startServer(): Promise<StartedServer> {
     databaseBackupAlertFile,
     resolve(config.databaseBackupDir, "db-backup-to-s3.failure"),
     resolve(config.databaseBackupDir, "..", "db-backup-to-s3.failure"),
+    resolve(config.databaseBackupDir, "database-backup.failure"),
   ];
+  const databaseBackupFailureFile = resolve(config.databaseBackupDir, "database-backup.failure");
   let databaseBackupInFlight = false;
   const runServerDatabaseBackup = async (
     trigger: InstanceDatabaseBackupTrigger,
@@ -693,6 +695,7 @@ export async function startServer(): Promise<StartedServer> {
         retention,
         filenamePrefix: "paperclip",
       });
+      rmSync(databaseBackupFailureFile, { force: true });
       const finishedAt = new Date();
       const response: InstanceDatabaseBackupRunResult = {
         ...result,
@@ -717,6 +720,15 @@ export async function startServer(): Promise<StartedServer> {
       );
       return response;
     } catch (err) {
+      try {
+        writeFileSync(
+          databaseBackupFailureFile,
+          `Database backup failed at ${new Date().toISOString()}; inspect server logs.\n`,
+          { encoding: "utf8", mode: 0o600 },
+        );
+      } catch (markerError) {
+        logger.warn({ err: markerError }, "Could not persist database backup failure marker");
+      }
       logger.error({ err, backupDir: config.databaseBackupDir, trigger }, `${label} database backup failed`);
       throw err;
     } finally {
