@@ -148,7 +148,11 @@ export function builtInAgentRoutes(db: Db) {
   router.get("/companies/:companyId/built-in-agents", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
-    await assertBuiltInAgentsEnabled();
+    const experimental = await settings.getExperimental();
+    if (experimental.enableBuiltInAgents !== true) {
+      res.json([]);
+      return;
+    }
     const states = await svc.list(companyId);
     res.json(states.map(redactBuiltInAgentListState));
   });
