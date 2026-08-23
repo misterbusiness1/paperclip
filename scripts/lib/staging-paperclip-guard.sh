@@ -13,6 +13,7 @@ require_staging_project() {
   local production_project="${PAPERCLIP_PRODUCTION_PROJECT:-}"
 
   [[ -n "$production_project" ]] || { staging_die "production project identity is required"; return 2; }
+  [[ "$production_project" == "paperclip" ]] || { staging_die "production project must be exactly paperclip"; return 2; }
   [[ "$staging_project" == "$PAPERCLIP_APPROVED_STAGING_PROJECT" ]] || { staging_die "unapproved staging project"; return 2; }
   [[ "$staging_project" != "$production_project" ]] || { staging_die "staging and production projects must differ"; return 2; }
 }

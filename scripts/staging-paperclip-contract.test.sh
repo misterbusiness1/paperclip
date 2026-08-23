@@ -69,7 +69,7 @@ fi
 
 common=(
   PAPERCLIP_STAGING_COMMIT="$(git -C "$repo_root" rev-parse HEAD)"
-  PAPERCLIP_PRODUCTION_PROJECT=paperclip-production
+  PAPERCLIP_PRODUCTION_PROJECT=paperclip
   PAPERCLIP_STAGING_PROJECT=occ-paperclip-staging
   PAPERCLIP_STAGING_PORT=3310
   PAPERCLIP_STAGING_PUBLIC_URL=http://127.0.0.1:3310
@@ -77,11 +77,12 @@ common=(
   PAPERCLIP_STAGING_ADMIN_PASSWORD=synthetic-test-only
 )
 
-assert_rejected_without_mutation staging-paperclip-deploy.sh "${common[@]}" PAPERCLIP_STAGING_PROJECT=paperclip-production
+assert_rejected_without_mutation staging-paperclip-deploy.sh "${common[@]}" PAPERCLIP_PRODUCTION_PROJECT=dummy-production
+assert_rejected_without_mutation staging-paperclip-deploy.sh "${common[@]}" PAPERCLIP_STAGING_PROJECT=paperclip
 assert_rejected_without_mutation staging-paperclip-deploy.sh "${common[@]}" PAPERCLIP_STAGING_PROJECT=bad-staging-name
 assert_rejected_without_mutation staging-paperclip-bootstrap.sh "${common[@]}" PAPERCLIP_STAGING_PUBLIC_URL=https://production.example.test
 assert_rejected_without_mutation staging-paperclip-bootstrap.sh "${common[@]}" PAPERCLIP_STAGING_SECRET_DIR="$test_dir/secrets/../secrets"
-assert_rejected_without_mutation staging-paperclip-teardown.sh "${common[@]}" PAPERCLIP_STAGING_PROJECT=paperclip-production
+assert_rejected_without_mutation staging-paperclip-teardown.sh "${common[@]}" PAPERCLIP_STAGING_PROJECT=paperclip
 
 # Exercise the failure trap with a valid preflight and a prior staging stack.
 # Each adversarial case must reach mutation, stay staging-scoped, restore the
@@ -107,7 +108,7 @@ cat >"$test_dir/bin/docker" <<'MOCK'
 #!/usr/bin/env bash
 printf 'docker %s\n' "$*" >>"$STAGING_TEST_CALLS"
 case "$*" in
-  'ps --all --filter label=com.docker.compose.project=paperclip-production --format {{.ID}}') printf 'prod-1\n' ;;
+  'ps --all --filter label=com.docker.compose.project=paperclip --format {{.ID}}') printf 'prod-1\n' ;;
   'inspect prod-1 --format {{.Id}} {{.Image}}')
     [[ "${STAGING_TEST_SCENARIO:-}" == identity-mismatch && -f "$STAGING_TEST_STATE/started" ]] && printf 'prod-2 image-prod\n' || printf 'prod-1 image-prod\n'
     ;;
@@ -134,7 +135,9 @@ seconds="$1"; shift
 printf 'timeout %s %s\n' "$seconds" "$*" >>"$STAGING_TEST_CALLS"
 case "${STAGING_TEST_SCENARIO:-}:$*" in
   build-timeout:'docker build '*) exit 124 ;;
-  start-timeout:'docker compose '*' up -d --wait') exit 124 ;;
+  start-timeout:'docker compose '*' up -d --wait')
+    if [[ ! -f "$STAGING_TEST_STATE/start-failed" ]]; then : >"$STAGING_TEST_STATE/start-failed"; exit 124; fi
+    ;;
 esac
 "$@"
 MOCK
@@ -142,23 +145,35 @@ chmod +x "$test_dir/bin/docker" "$test_dir/bin/curl" "$test_dir/bin/timeout"
 
 assert_failed_deploy() {
   local scenario="$1" receipt="$fixture/receipts/$fixture_commit.failed.json"
-  rm -f "$receipt" "$test_dir/started"
+  rm -f "$receipt" "$test_dir/started" "$test_dir/start-failed"
   : >"$test_dir/calls"
   if env PATH="$test_dir/bin:$PATH" STAGING_TEST_CALLS="$test_dir/calls" \
     STAGING_TEST_SCENARIO="$scenario" STAGING_TEST_STATE="$test_dir" \
     STAGING_TEST_BACKUP_DIR="$fixture/receipts/$fixture_commit.predeploy-data" \
     STAGING_TEST_COMMIT="$fixture_commit" PAPERCLIP_STAGING_COMMIT="$fixture_commit" \
-    PAPERCLIP_PRODUCTION_PROJECT=paperclip-production PAPERCLIP_STAGING_PROJECT=occ-paperclip-staging \
+    PAPERCLIP_PRODUCTION_PROJECT=paperclip PAPERCLIP_STAGING_PROJECT=occ-paperclip-staging \
     PAPERCLIP_STAGING_PORT=3310 PAPERCLIP_STAGING_PUBLIC_URL=http://127.0.0.1:3310 \
     PAPERCLIP_STAGING_SECRET_DIR="$fixture/secrets" PAPERCLIP_STAGING_RECEIPT_DIR="$fixture/receipts" \
-    PAPERCLIP_STAGING_BUILD_TIMEOUT_SECONDS=7 PAPERCLIP_STAGING_START_TIMEOUT_SECONDS=11 \
+    PAPERCLIP_STAGING_BUILD_TIMEOUT_SECONDS=60 PAPERCLIP_STAGING_START_TIMEOUT_SECONDS=30 \
     bash "$fixture/scripts/staging-paperclip-deploy.sh" >/dev/null 2>&1; then
     echo "expected deploy failure: $scenario" >&2; exit 1
   fi
-  jq -e --arg c "$fixture_commit" '.status=="failed" and .commit==$c and .composeProject=="occ-paperclip-staging" and (.failedStep|test("^line-[0-9]+$")) and (.rollback|IN("prior-image-and-data-restored","restore-failed-stack-left-down","torn-down")) and (keys|sort)==["commit","composeProject","failedStep","rollback","status"]' "$receipt" >/dev/null
-  ! grep -q 'paperclip-production.*\(down\|up\|build\|run\|tag\)' "$test_dir/calls"
+  if [[ "$scenario" == build-timeout ]]; then
+    jq -e --arg c "$fixture_commit" '.status=="failed" and .commit==$c and .rollback=="not-required" and (keys|sort)==["commit","composeProject","failedStep","rollback","status"]' "$receipt" >/dev/null
+    ! grep -Eq 'compose .* (stop|down|up)' "$test_dir/calls"
+    return
+  fi
+  jq -e --arg c "$fixture_commit" '.status=="failed" and .commit==$c and .composeProject=="occ-paperclip-staging" and (.failedStep|test("^line-[0-9]+$")) and .rollback=="prior-image-and-data-restored" and (keys|sort)==["commit","composeProject","failedStep","rollback","status"]' "$receipt" >/dev/null
+  ! grep -q 'compose -p paper .*\(down\|up\|build\|run\|tag\)' "$test_dir/calls"
+  stop_line="$(grep -n 'compose -p occ-paperclip-staging .* stop$' "$test_dir/calls" | head -1 | cut -d: -f1)"
+  backup_line="$(grep -n 'run --pull never .*:/source:ro' "$test_dir/calls" | head -1 | cut -d: -f1)"
+  failed_up_line="$(grep -n 'compose -p occ-paperclip-staging .* up -d --wait' "$test_dir/calls" | head -1 | cut -d: -f1)"
+  down_line="$(grep -n 'compose -p occ-paperclip-staging .* down --remove-orphans' "$test_dir/calls" | head -1 | cut -d: -f1)"
+  restore_line="$(grep -n 'run --pull never .*:/restore' "$test_dir/calls" | head -1 | cut -d: -f1)"
+  restart_line="$(grep -n 'compose -p occ-paperclip-staging .* up -d --wait' "$test_dir/calls" | tail -1 | cut -d: -f1)"
+  (( stop_line < backup_line && backup_line < failed_up_line && failed_up_line < down_line && down_line < restore_line && restore_line < restart_line ))
   grep -q 'timeout 120 docker compose -p occ-paperclip-staging .* down --remove-orphans' "$test_dir/calls"
-  grep -q 'docker image tag prior-image ghcr.io/oxfordcigar/paperclip:' "$test_dir/calls"
+  ! grep -q 'docker image tag prior-image' "$test_dir/calls"
   grep -q 'timeout 180 docker compose -p occ-paperclip-staging .* up -d --wait' "$test_dir/calls"
 }
 

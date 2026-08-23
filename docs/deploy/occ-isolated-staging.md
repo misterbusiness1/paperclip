@@ -31,7 +31,7 @@ export PAPERCLIP_STAGING_ADMIN_PASSWORD=<runtime-only-synthetic-password>
 ./scripts/staging-paperclip-bootstrap.sh
 ```
 
-Bootstrap briefly permits the first synthetic account, then force-recreates only the staging server with `PAPERCLIP_AUTH_DISABLE_SIGN_UP=true`. It fails unless a second synthetic signup is denied and the original authenticated session remains valid.
+Signup is disabled by default. Bootstrap installs an EXIT fail-safe before briefly enabling it for the first synthetic account, then force-recreates only the staging server with `PAPERCLIP_AUTH_DISABLE_SIGN_UP=true`. It uses a unique valid second address and requires the explicit HTTP 403 signup-disabled response contract; a duplicate/validation response cannot pass. The original authenticated session must remain valid.
 
 Give Browser QA the explicit private tunnel endpoint that maps to `127.0.0.1:3310`. Do not expose the port on a public interface.
 
@@ -47,4 +47,4 @@ export PAPERCLIP_PRODUCTION_PROJECT=<exact-production-compose-project>
 
 Set `PAPERCLIP_STAGING_DELETE_DATA=true` only when the staging database and runtime volume must be deleted. This action cannot affect production volumes because the script names the two staging volumes exactly.
 
-Before replacing an existing staging container, deploy archives both staging volumes and records the prior image identity. The success receipt attests whether data rollback was prepared and records value-free SHA-256 digests for both archives. A failed build/start, production-identity comparison, or health check triggers a bounded teardown. When a prior stack exists, the trap restores both volume archives, retags the prior image, and restarts it within fixed timeouts; if restoration fails, the stack is left down. The adjacent `.failed.json` receipt contains only commit/project, failed-step, and rollback outcome—never secret or data values. A successful receipt is promotion evidence; a failed receipt is not.
+The image is built before rollback becomes required, so build failure records `rollback: "not-required"` and cannot disturb a healthy prior stack. Before replacing an existing staging container, deploy boundedly stops the isolated stack, archives both now-quiescent volumes with the captured immutable prior image (never a pullable helper), and records that image identity. Receipt and backup directories are owner-only, archives are mode `0600`, and predeploy backups older than seven days are removed. A later failed start, production-identity comparison, or bounded health check triggers teardown, volume restoration, and restart directly from the captured immutable image ID—never a retag bearing the failed commit. If restoration fails, the stack is left down. The adjacent `.failed.json` receipt contains only commit/project, failed-step, and rollback outcome—never secret or data values. A successful receipt is promotion evidence; a failed receipt is not.

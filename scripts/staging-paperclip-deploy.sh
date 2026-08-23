@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 compose_file="$repo_root/docker/staging/compose.yml"
@@ -24,6 +25,8 @@ export PAPERCLIP_STAGING_PROJECT PAPERCLIP_STAGING_PORT PAPERCLIP_STAGING_PUBLIC
 export PAPERCLIP_STAGING_IMAGE="ghcr.io/oxfordcigar/paperclip:${PAPERCLIP_STAGING_COMMIT}"
 receipt_dir="${PAPERCLIP_STAGING_RECEIPT_DIR:-$repo_root/staging-receipts}"
 mkdir -p "$receipt_dir"
+chmod 700 "$receipt_dir"
+find "$receipt_dir" -mindepth 1 -maxdepth 1 -type d -name '*.predeploy-data' -mtime +7 -exec rm -rf -- {} +
 receipt="$receipt_dir/${PAPERCLIP_STAGING_COMMIT}.json"
 failure_receipt="$receipt_dir/${PAPERCLIP_STAGING_COMMIT}.failed.json"
 backup_dir="$receipt_dir/${PAPERCLIP_STAGING_COMMIT}.predeploy-data"
@@ -64,15 +67,16 @@ write_failure_receipt() {
 backup_volume() {
   local volume="$1"
   local archive="$2"
-  timeout 120 docker run --rm --volume "$volume:/source:ro" --volume "$backup_dir:/backup" alpine:3.22 \
-    sh -c "cd /source && tar -czf /backup/$archive ."
+  timeout 120 docker run --pull never --rm --entrypoint sh --volume "$volume:/source:ro" --volume "$backup_dir:/backup" "$prior_image_id" \
+    -c "cd /source && tar -czf /backup/$archive ."
+  chmod 600 "$backup_dir/$archive"
 }
 
 restore_volume() {
   local volume="$1"
   local archive="$2"
-  timeout 120 docker run --rm --volume "$volume:/restore" --volume "$backup_dir:/backup:ro" alpine:3.22 \
-    sh -c "find /restore -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + && tar -xzf /backup/$archive -C /restore"
+  timeout 120 docker run --pull never --rm --entrypoint sh --volume "$volume:/restore" --volume "$backup_dir:/backup:ro" "$prior_image_id" \
+    -c "find /restore -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + && tar -xzf /backup/$archive -C /restore"
 }
 
 rollback_failed_deploy() {
@@ -86,8 +90,8 @@ rollback_failed_deploy() {
     if [[ -n "$prior_image_id" && -f "$backup_dir/db.tgz" && -f "$backup_dir/runtime.tgz" ]]; then
       if restore_volume "${PAPERCLIP_STAGING_PROJECT}_db" db.tgz \
         && restore_volume "${PAPERCLIP_STAGING_PROJECT}_runtime" runtime.tgz \
-        && docker image tag "$prior_image_id" "$PAPERCLIP_STAGING_IMAGE" \
-        && timeout 180 docker compose -p "$PAPERCLIP_STAGING_PROJECT" -f "$compose_file" up -d --wait; then
+        && PAPERCLIP_STAGING_IMAGE="$prior_image_id" PAPERCLIP_STAGING_AUTH_DISABLE_SIGN_UP=true \
+          timeout 180 docker compose -p "$PAPERCLIP_STAGING_PROJECT" -f "$compose_file" up -d --wait; then
         result="prior-image-and-data-restored"
       else
         result="restore-failed-stack-left-down"
@@ -100,13 +104,12 @@ rollback_failed_deploy() {
 trap 'status=$?; if (( status != 0 )) && [[ "$rollback_running" != true ]]; then rollback_failed_deploy "$LINENO" || true; fi; exit "$status"' EXIT
 
 mkdir -p "$backup_dir"
-if [[ -n "$prior_image_id" ]]; then
-  backup_volume "${PAPERCLIP_STAGING_PROJECT}_db" db.tgz
-  backup_volume "${PAPERCLIP_STAGING_PROJECT}_runtime" runtime.tgz
-fi
-
-mutation_started=true
-timeout "${PAPERCLIP_STAGING_BUILD_TIMEOUT_SECONDS:-900}" docker build --pull --target production \
+chmod 700 "$backup_dir"
+build_timeout="${PAPERCLIP_STAGING_BUILD_TIMEOUT_SECONDS:-900}"
+start_timeout="${PAPERCLIP_STAGING_START_TIMEOUT_SECONDS:-300}"
+[[ "$build_timeout" =~ ^[0-9]+$ && "$build_timeout" -ge 60 && "$build_timeout" -le 1800 ]] || { echo "invalid build timeout" >&2; exit 2; }
+[[ "$start_timeout" =~ ^[0-9]+$ && "$start_timeout" -ge 30 && "$start_timeout" -le 600 ]] || { echo "invalid start timeout" >&2; exit 2; }
+timeout "$build_timeout" docker build --pull --target production \
   --build-arg "PAPERCLIP_BUILD_COMMIT=$PAPERCLIP_STAGING_COMMIT" \
   --build-arg "PAPERCLIP_BUILD_VERSION=staging-$PAPERCLIP_STAGING_COMMIT" \
   --label "org.opencontainers.image.revision=$PAPERCLIP_STAGING_COMMIT" \
@@ -114,12 +117,19 @@ timeout "${PAPERCLIP_STAGING_BUILD_TIMEOUT_SECONDS:-900}" docker build --pull --
 local_image_id="$(docker image inspect "$PAPERCLIP_STAGING_IMAGE" --format '{{.Id}}')"
 local_image_revision="$(docker image inspect "$PAPERCLIP_STAGING_IMAGE" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')"
 [[ -n "$local_image_id" && "$local_image_revision" == "$PAPERCLIP_STAGING_COMMIT" ]] || { echo "locally built image provenance does not match reviewed commit" >&2; exit 2; }
-timeout "${PAPERCLIP_STAGING_START_TIMEOUT_SECONDS:-300}" docker compose -p "$PAPERCLIP_STAGING_PROJECT" -f "$compose_file" up -d --wait
+if [[ -n "$prior_image_id" ]]; then
+  mutation_started=true
+  timeout 120 docker compose -p "$PAPERCLIP_STAGING_PROJECT" -f "$compose_file" stop
+  backup_volume "${PAPERCLIP_STAGING_PROJECT}_db" db.tgz
+  backup_volume "${PAPERCLIP_STAGING_PROJECT}_runtime" runtime.tgz
+fi
+mutation_started=true
+timeout "$start_timeout" docker compose -p "$PAPERCLIP_STAGING_PROJECT" -f "$compose_file" up -d --wait
 
 after_prod="$(snapshot_production)"
 require_unchanged_production_identity "$before_prod" "$after_prod"
 after_digest="$(docker image inspect "$PAPERCLIP_STAGING_IMAGE" --format '{{.Id}}')"
-health="$(curl --fail --silent "$PAPERCLIP_STAGING_PUBLIC_URL/api/health" | jq -r .status)"
+health="$(curl --connect-timeout 5 --max-time 15 --fail --silent "$PAPERCLIP_STAGING_PUBLIC_URL/api/health" | jq -r .status)"
 require_staging_health "$health"
 
 jq -n \

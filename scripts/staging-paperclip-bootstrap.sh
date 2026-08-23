@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 source "$repo_root/scripts/lib/staging-paperclip-guard.sh"
@@ -18,7 +19,22 @@ admin_email="${PAPERCLIP_STAGING_ADMIN_EMAIL:-paperclip-staging@oxfordcigar.inva
 compose_file="$repo_root/docker/staging/compose.yml"
 scratch_dir="$(mktemp -d "${TMPDIR:-/tmp}/paperclip-staging-bootstrap.XXXXXX")"
 cookie_jar="$scratch_dir/cookies"
-trap 'rm -rf "$scratch_dir"' EXIT
+signup_closed=false
+close_signup() {
+  local status=$?
+  if [[ "$signup_closed" != true ]]; then
+    export PAPERCLIP_STAGING_AUTH_DISABLE_SIGN_UP=true
+    timeout 180 docker compose -p "$PAPERCLIP_STAGING_PROJECT" -f "$compose_file" up -d --wait --force-recreate --no-deps server || true
+  fi
+  rm -rf "$scratch_dir"
+  exit "$status"
+}
+trap close_signup EXIT
+
+# Signup defaults closed in Compose. Open it only after the EXIT fail-safe is
+# installed, and bound the one service recreation that begins the bootstrap.
+export PAPERCLIP_STAGING_AUTH_DISABLE_SIGN_UP=false
+timeout 180 docker compose -p "$PAPERCLIP_STAGING_PROJECT" -f "$compose_file" up -d --wait --force-recreate --no-deps server
 
 post_json() {
   local path="$1"
@@ -58,10 +74,13 @@ jq -e 'type == "array"' >/dev/null <<<"$companies_json"
 # isolated server service with signup disabled, then prove the seeded session
 # survives and a second synthetic signup is denied.
 export PAPERCLIP_STAGING_AUTH_DISABLE_SIGN_UP=true
-docker compose -p "$PAPERCLIP_STAGING_PROJECT" -f "$compose_file" up -d --wait --force-recreate --no-deps server
-second_signup_json="$(jq -cn --arg name 'Denied Staging User' --arg email 'paperclip-staging-denied@oxfordcigar.invalid' --arg password "$PAPERCLIP_STAGING_ADMIN_PASSWORD" '{name:$name,email:$email,password:$password}')"
+timeout 180 docker compose -p "$PAPERCLIP_STAGING_PROJECT" -f "$compose_file" up -d --wait --force-recreate --no-deps server
+signup_closed=true
+second_email="paperclip-staging-denied-$(date +%s)-$$@oxfordcigar.invalid"
+second_signup_json="$(jq -cn --arg name 'Denied Staging User' --arg email "$second_email" --arg password "$PAPERCLIP_STAGING_ADMIN_PASSWORD" '{name:$name,email:$email,password:$password}')"
 second_status="$(post_json /api/auth/sign-up/email "$second_signup_json" "$scratch_dir/second-signup.json")"
-[[ "$second_status" =~ ^(400|401|403|404|409|422)$ ]] || { echo "staging bootstrap: second signup was not denied (HTTP $second_status)" >&2; exit 1; }
+[[ "$second_status" == 403 ]] || { echo "staging bootstrap: signup-disabled contract returned HTTP $second_status, expected 403" >&2; exit 1; }
+jq -e '((.code // .error.code // "") | ascii_upcase | test("SIGN.?UP.*DISABLED")) or ((.message // .error.message // "") | ascii_downcase | test("sign.?up.*disabled"))' "$scratch_dir/second-signup.json" >/dev/null || { echo "staging bootstrap: explicit signup-disabled response missing" >&2; exit 1; }
 session_json="$(curl --fail --silent --cookie "$cookie_jar" --cookie-jar "$cookie_jar" "$PAPERCLIP_STAGING_PUBLIC_URL/api/auth/get-session")"
 jq -e '.user.id // .session.userId' >/dev/null <<<"$session_json"
 echo "staging bootstrap: authenticated UI/API smoke ready for $admin_email"
