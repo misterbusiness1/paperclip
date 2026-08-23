@@ -11,12 +11,14 @@ export const decisionReadyApprovalPayloadSchema = z.object({
   risks: z.array(decisionTextSchema).min(1),
 }).passthrough();
 
-export const createApprovalSchema = z.object({
+export const createApprovalInputSchema = z.object({
   type: z.enum(APPROVAL_TYPES),
   requestedByAgentId: z.string().uuid().optional().nullable(),
   payload: z.record(z.string(), z.unknown()),
   issueIds: z.array(z.string().uuid()).optional(),
-}).superRefine((value, ctx) => {
+});
+
+export const createApprovalSchema = createApprovalInputSchema.superRefine((value, ctx) => {
   if (value.type !== "request_board_approval") return;
 
   const result = decisionReadyApprovalPayloadSchema.safeParse(value.payload);

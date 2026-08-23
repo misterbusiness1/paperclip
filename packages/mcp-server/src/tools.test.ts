@@ -110,6 +110,7 @@ describe("paperclip MCP tools", () => {
       priority: "medium",
       assigneeAgentId: "22222222-2222-2222-2222-222222222222",
       requestDepth: 0,
+      allowDuplicate: false,
     });
   });
 
@@ -372,6 +373,19 @@ describe("paperclip MCP tools", () => {
       payload: { branch: "pap-1167" },
       issueIds: ["44444444-4444-4444-4444-444444444444"],
     });
+  });
+
+  it("rejects incomplete board approval payloads before the API request", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await getTool("paperclipCreateApproval").execute({
+      type: "request_board_approval",
+      payload: { reasoning: "Needs a decision" },
+    });
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(response.content[0]?.text).toContain("recommendedAction");
   });
 
   it("rejects invalid generic request paths", async () => {
