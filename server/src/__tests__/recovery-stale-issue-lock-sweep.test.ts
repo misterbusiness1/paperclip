@@ -340,6 +340,99 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
     expect(audits.map((audit) => (audit.details as { count: number }).count)).toEqual([2, 1]);
   });
 
+  it("reconciles stale claimed wakes whose linked runs are terminal", async () => {
+    const { companyId, agentId, failedRunId, runningRunId } = await seed();
+    const succeededRunId = randomUUID();
+    const cancelledRunId = randomUUID();
+    const freshWakeSucceededRunId = randomUUID();
+    const recentSucceededRunId = randomUUID();
+    const wakeIds = [randomUUID(), randomUUID(), randomUUID(), randomUUID(), randomUUID(), randomUUID()];
+    const staleAt = new Date(Date.now() - 10 * 60 * 1000);
+
+    await db.insert(agentWakeupRequests).values([
+      { id: wakeIds[0], companyId, agentId, source: "automation", status: "claimed", runId: succeededRunId, updatedAt: staleAt },
+      { id: wakeIds[1], companyId, agentId, source: "automation", status: "claimed", runId: failedRunId, updatedAt: staleAt },
+      { id: wakeIds[2], companyId, agentId, source: "automation", status: "claimed", runId: cancelledRunId, updatedAt: staleAt },
+      { id: wakeIds[3], companyId, agentId, source: "automation", status: "claimed", runId: runningRunId, updatedAt: staleAt },
+      { id: wakeIds[4], companyId, agentId, source: "automation", status: "claimed", runId: freshWakeSucceededRunId },
+      { id: wakeIds[5], companyId, agentId, source: "automation", status: "claimed", runId: recentSucceededRunId, updatedAt: staleAt },
+    ]);
+    await db.insert(heartbeatRuns).values([
+      {
+        id: succeededRunId,
+        companyId,
+        agentId,
+        status: "succeeded",
+        invocationSource: "automation",
+        wakeupRequestId: wakeIds[0],
+        finishedAt: staleAt,
+      },
+      {
+        id: cancelledRunId,
+        companyId,
+        agentId,
+        status: "cancelled",
+        invocationSource: "automation",
+        wakeupRequestId: wakeIds[2],
+        finishedAt: staleAt,
+      },
+      {
+        id: freshWakeSucceededRunId,
+        companyId,
+        agentId,
+        status: "succeeded",
+        invocationSource: "automation",
+        wakeupRequestId: wakeIds[4],
+        finishedAt: staleAt,
+      },
+      {
+        id: recentSucceededRunId,
+        companyId,
+        agentId,
+        status: "succeeded",
+        invocationSource: "automation",
+        wakeupRequestId: wakeIds[5],
+        finishedAt: new Date(),
+      },
+    ]);
+    await db
+      .update(heartbeatRuns)
+      .set({ wakeupRequestId: wakeIds[1], finishedAt: staleAt })
+      .where(eq(heartbeatRuns.id, failedRunId));
+    await db
+      .update(heartbeatRuns)
+      .set({ wakeupRequestId: wakeIds[3] })
+      .where(eq(heartbeatRuns.id, runningRunId));
+
+    const heartbeat = heartbeatService(db);
+    const first = await heartbeat.sweepStaleIssueLocks();
+    expect(first.reconciledClaimedWakeups).toBe(3);
+    expect(new Set(first.reconciledClaimedWakeupIds)).toEqual(new Set(wakeIds.slice(0, 3)));
+
+    const wakeups = await db
+      .select({ id: agentWakeupRequests.id, status: agentWakeupRequests.status, finishedAt: agentWakeupRequests.finishedAt })
+      .from(agentWakeupRequests);
+    expect(wakeups.find((wake) => wake.id === wakeIds[0])).toMatchObject({ status: "completed" });
+    expect(wakeups.find((wake) => wake.id === wakeIds[1])).toMatchObject({ status: "failed" });
+    expect(wakeups.find((wake) => wake.id === wakeIds[2])).toMatchObject({ status: "cancelled" });
+    expect(wakeups.find((wake) => wake.id === wakeIds[3])).toMatchObject({ status: "claimed", finishedAt: null });
+    expect(wakeups.find((wake) => wake.id === wakeIds[4])).toMatchObject({ status: "claimed", finishedAt: null });
+    expect(wakeups.find((wake) => wake.id === wakeIds[5])).toMatchObject({ status: "claimed", finishedAt: null });
+
+    const second = await heartbeat.sweepStaleIssueLocks();
+    expect(second.reconciledClaimedWakeups).toBe(0);
+
+    const audit = await db
+      .select({ details: activityLog.details })
+      .from(activityLog)
+      .where(eq(activityLog.action, "heartbeat.terminal_claimed_wakes_reconciled"))
+      .then((rows) => rows[0]);
+    expect(audit?.details).toMatchObject({
+      count: 3,
+      runStatusCounts: { succeeded: 1, failed: 1, cancelled: 1 },
+    });
+  });
+
   it("terminalizes an orphaned running run whose process is gone, then clears the lock", async () => {
     const { companyId, agentId, runningRunId } = await seed();
     await db.update(agents).set({ status: "running" }).where(eq(agents.id, agentId));
