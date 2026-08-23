@@ -76,6 +76,49 @@ describe("createBufferedTextFileWriter", () => {
 
 describeEmbeddedPostgres("runDatabaseBackup", () => {
   it(
+    "does not publish failed pg_dump output as a restore point",
+    async () => {
+      const sourceConnectionString = await createTempDatabase();
+      const backupDir = createTempDir("paperclip-db-backup-atomic-");
+      const fakePgDump = path.join(backupDir, "failing-pg-dump");
+      const originalPgDumpPath = process.env.PAPERCLIP_PG_DUMP_PATH;
+
+      fs.writeFileSync(fakePgDump, "#!/bin/sh\nprintf partial\nsleep 1\nexit 1\n", { mode: 0o755 });
+      process.env.PAPERCLIP_PG_DUMP_PATH = fakePgDump;
+
+      try {
+        const backup = runDatabaseBackup({
+          connectionString: sourceConnectionString,
+          backupDir,
+          retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 },
+          filenamePrefix: "paperclip-atomic-test",
+          backupEngine: "pg_dump",
+        });
+
+        let partialBackupVisible = false;
+        for (let attempt = 0; attempt < 100; attempt += 1) {
+          partialBackupVisible = fs
+            .readdirSync(backupDir)
+            .some((name) => name.endsWith(".sql.gz.partial"));
+          if (partialBackupVisible) break;
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+
+        expect(partialBackupVisible).toBe(true);
+        expect(fs.readdirSync(backupDir).some((name) => name.endsWith(".sql.gz"))).toBe(false);
+        await expect(backup).rejects.toThrow("failed with exit code 1");
+        expect(
+          fs.readdirSync(backupDir).filter((name) => name.startsWith("paperclip-atomic-test-")),
+        ).toEqual([]);
+      } finally {
+        if (originalPgDumpPath === undefined) delete process.env.PAPERCLIP_PG_DUMP_PATH;
+        else process.env.PAPERCLIP_PG_DUMP_PATH = originalPgDumpPath;
+      }
+    },
+    30_000,
+  );
+
+  it(
     "keeps the newest backup for each retained calendar month",
     async () => {
       const sourceConnectionString = await createTempDatabase();
