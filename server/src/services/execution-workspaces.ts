@@ -1650,11 +1650,9 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         .where(and(...conditions))
         .orderBy(desc(executionWorkspaces.lastUsedAt), desc(executionWorkspaces.createdAt));
       const runtimeServicesByWorkspaceId = await loadEffectiveRuntimeServicesByExecutionWorkspace(db, companyId, rows);
-      return Promise.all(rows.map((row) =>
-        hydrateWorkspace(
-          row,
-          (runtimeServicesByWorkspaceId.get(row.id) ?? []).map(toRuntimeService),
-        ),
+      return rows.map((row) => toExecutionWorkspace(
+        row,
+        (runtimeServicesByWorkspaceId.get(row.id) ?? []).map(toRuntimeService),
       ));
     },
 
