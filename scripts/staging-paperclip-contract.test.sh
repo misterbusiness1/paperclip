@@ -113,17 +113,22 @@ fixture_commit="$(git -C "$fixture" rev-parse HEAD)"
 cat >"$test_dir/bin/docker" <<'MOCK'
 #!/usr/bin/env bash
 printf 'docker %s\n' "$*" >>"$STAGING_TEST_CALLS"
+prior_digest="1111111111111111111111111111111111111111111111111111111111111111"
+prior_image_id="sha256:$prior_digest"
 backup_mount=""
 for argument in "$@"; do
   case "$argument" in *:/backup|*:/backup:ro) backup_mount="${argument%%:/backup*}" ;; esac
 done
+if [[ "${1:-}" == run && ( "$*" == *":/source:ro"* || "$*" == *":/restore"* ) ]]; then
+  [[ " $* " == *" $prior_image_id "* ]] || exit 98
+fi
 case "$*" in
   'ps --all --filter label=com.docker.compose.project=paperclip --format {{.ID}}') printf 'prod-1\n' ;;
   'inspect prod-1 --format {{.Id}} {{.Image}}')
     [[ "${STAGING_TEST_SCENARIO:-}" == identity-mismatch && -f "$STAGING_TEST_STATE/started" ]] && printf 'prod-2 image-prod\n' || printf 'prod-1 image-prod\n'
     ;;
   *' config --format json') jq -n --arg p occ-paperclip-staging '{name:$p,volumes:{"staging-db":{name:($p+"_db")},"staging-runtime":{name:($p+"_runtime")}},networks:{staging:{name:($p+"_network")}}}' ;;
-  *' images -q server') [[ "${STAGING_TEST_SCENARIO:-}" == first-deploy ]] || printf 'sha256:prior-image\n' ;;
+  *' images -q server') [[ "${STAGING_TEST_SCENARIO:-}" == first-deploy ]] || printf '%s\n' "$prior_digest" ;;
   *' ps -a -q db') [[ "${STAGING_TEST_SCENARIO:-}" == first-deploy || "${STAGING_TEST_SCENARIO:-}" == orphan-runtime || "${STAGING_TEST_SCENARIO:-}" == orphan-container ]] || printf 'staging-db\n' ;;
   *' ps -a -q server') [[ "${STAGING_TEST_SCENARIO:-}" == first-deploy || "${STAGING_TEST_SCENARIO:-}" == orphan-db ]] || printf 'staging-server\n' ;;
   'ps --all --filter label=com.docker.compose.project=occ-paperclip-staging --format {{.ID}}') printf 'staging-server\n' ;;
@@ -132,7 +137,7 @@ case "$*" in
   'volume inspect occ-paperclip-staging_runtime') [[ "${STAGING_TEST_SCENARIO:-}" == first-deploy || "${STAGING_TEST_SCENARIO:-}" == orphan-db || "${STAGING_TEST_SCENARIO:-}" == orphan-container ]] && exit 1 || exit 0 ;;
   'network inspect occ-paperclip-staging_network') [[ "${STAGING_TEST_SCENARIO:-}" == first-deploy || "${STAGING_TEST_SCENARIO:-}" == orphan-container ]] && exit 1 || exit 0 ;;
   'volume inspect --format {{index .Labels "com.docker.compose.project"}} occ-paperclip-staging_db'|'volume inspect --format {{index .Labels "com.docker.compose.project"}} occ-paperclip-staging_runtime'|'network inspect --format {{index .Labels "com.docker.compose.project"}} occ-paperclip-staging_network') printf 'occ-paperclip-staging\n' ;;
-  'image inspect sha256:prior-image --format {{.Id}}') printf 'sha256:prior-image\n' ;;
+  "image inspect $prior_digest --format {{.Id}}") printf '%s\n' "$prior_image_id" ;;
   run*':/source:ro'*db.tgz*)
     [[ "${STAGING_TEST_SCENARIO:-}" == first-backup-failure ]] && exit 1
     printf 'db-backup-%s' "${STAGING_TEST_ATTEMPT:-one}" >"$backup_mount/.db-marker"
@@ -217,12 +222,12 @@ assert_failed_deploy() {
   fi
   jq -e --arg c "$fixture_commit" '.status=="failed" and .commit==$c and .composeProject=="occ-paperclip-staging" and (.failedStep|test("^line-[0-9]+$")) and .rollback=="prior-image-and-data-restored" and (keys|sort)==["commit","composeProject","failedStep","rollback","status"]' "$receipt" >/dev/null
   if grep -q 'compose -p paper .*\(down\|up\|build\|run\|tag\)' "$test_dir/calls"; then echo 'production Compose mutation attempted' >&2; exit 1; fi
-  stop_line="$(grep -n 'compose -p occ-paperclip-staging .* stop$' "$test_dir/calls" | head -1 | cut -d: -f1)"
-  backup_line="$(grep -n 'run --pull never .*:/source:ro' "$test_dir/calls" | head -1 | cut -d: -f1)"
-  failed_up_line="$(grep -n 'compose -p occ-paperclip-staging .* up -d --wait' "$test_dir/calls" | head -1 | cut -d: -f1)"
-  down_line="$(grep -n 'compose -p occ-paperclip-staging .* down --remove-orphans' "$test_dir/calls" | head -1 | cut -d: -f1)"
-  restore_line="$(grep -n 'run --pull never .*:/restore' "$test_dir/calls" | head -1 | cut -d: -f1)"
-  restart_line="$(grep -n 'compose -p occ-paperclip-staging .* up -d --wait' "$test_dir/calls" | tail -1 | cut -d: -f1)"
+  stop_line="$(awk '/compose -p occ-paperclip-staging .* stop$/{print NR; exit}' "$test_dir/calls")"
+  backup_line="$(awk '/run --pull never .*:\/source:ro/{print NR; exit}' "$test_dir/calls")"
+  failed_up_line="$(awk '/compose -p occ-paperclip-staging .* up -d --wait/{print NR; exit}' "$test_dir/calls")"
+  down_line="$(awk '/compose -p occ-paperclip-staging .* down --remove-orphans/{print NR; exit}' "$test_dir/calls")"
+  restore_line="$(awk '/run --pull never .*:\/restore/{print NR; exit}' "$test_dir/calls")"
+  restart_line="$(awk '/compose -p occ-paperclip-staging .* up -d --wait/{line=NR} END{print line}' "$test_dir/calls")"
   (( stop_line < backup_line && backup_line < failed_up_line && failed_up_line < down_line && down_line < restore_line && restore_line < restart_line ))
   grep -q 'timeout 120 docker compose -p occ-paperclip-staging .* down --remove-orphans' "$test_dir/calls"
   if grep -q 'docker image tag prior-image' "$test_dir/calls"; then echo 'prior image was retagged' >&2; exit 1; fi
