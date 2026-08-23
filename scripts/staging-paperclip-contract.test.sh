@@ -222,12 +222,12 @@ assert_failed_deploy() {
   fi
   jq -e --arg c "$fixture_commit" '.status=="failed" and .commit==$c and .composeProject=="occ-paperclip-staging" and (.failedStep|test("^line-[0-9]+$")) and .rollback=="prior-image-and-data-restored" and (keys|sort)==["commit","composeProject","failedStep","rollback","status"]' "$receipt" >/dev/null
   if grep -q 'compose -p paper .*\(down\|up\|build\|run\|tag\)' "$test_dir/calls"; then echo 'production Compose mutation attempted' >&2; exit 1; fi
-  stop_line="$(grep -n 'compose -p occ-paperclip-staging .* stop$' "$test_dir/calls" | head -1 | cut -d: -f1)"
-  backup_line="$(grep -n 'run --pull never .*:/source:ro' "$test_dir/calls" | head -1 | cut -d: -f1)"
-  failed_up_line="$(grep -n 'compose -p occ-paperclip-staging .* up -d --wait' "$test_dir/calls" | head -1 | cut -d: -f1)"
-  down_line="$(grep -n 'compose -p occ-paperclip-staging .* down --remove-orphans' "$test_dir/calls" | head -1 | cut -d: -f1)"
-  restore_line="$(grep -n 'run --pull never .*:/restore' "$test_dir/calls" | head -1 | cut -d: -f1)"
-  restart_line="$(grep -n 'compose -p occ-paperclip-staging .* up -d --wait' "$test_dir/calls" | tail -1 | cut -d: -f1)"
+  stop_line="$(awk '/compose -p occ-paperclip-staging .* stop$/{print NR; exit}' "$test_dir/calls")"
+  backup_line="$(awk '/run --pull never .*:\/source:ro/{print NR; exit}' "$test_dir/calls")"
+  failed_up_line="$(awk '/compose -p occ-paperclip-staging .* up -d --wait/{print NR; exit}' "$test_dir/calls")"
+  down_line="$(awk '/compose -p occ-paperclip-staging .* down --remove-orphans/{print NR; exit}' "$test_dir/calls")"
+  restore_line="$(awk '/run --pull never .*:\/restore/{print NR; exit}' "$test_dir/calls")"
+  restart_line="$(awk '/compose -p occ-paperclip-staging .* up -d --wait/{line=NR} END{print line}' "$test_dir/calls")"
   (( stop_line < backup_line && backup_line < failed_up_line && failed_up_line < down_line && down_line < restore_line && restore_line < restart_line ))
   grep -q 'timeout 120 docker compose -p occ-paperclip-staging .* down --remove-orphans' "$test_dir/calls"
   if grep -q 'docker image tag prior-image' "$test_dir/calls"; then echo 'prior image was retagged' >&2; exit 1; fi
