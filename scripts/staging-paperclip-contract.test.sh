@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2016 # Compose interpolation tokens are matched literally.
 set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 compose="$repo_root/docker/staging/compose.yml"
 test_dir="$(mktemp -d "${TMPDIR:-/tmp}/paperclip-staging-contract.XXXXXX")"
+test_dir="$(cd "$test_dir" && pwd -P)"
 trap 'rm -rf "$test_dir"' EXIT
 mkdir -p "$test_dir/bin" "$test_dir/secrets"
 touch "$test_dir/calls"
@@ -35,10 +37,10 @@ grep -q 'PAPERCLIP_DEPLOYMENT_MODE: authenticated' "$compose"
 grep -q 'pull_policy: never' "$compose"
 grep -q 'pgvector/pgvector:pg16' "$compose"
 grep -q 'PAPERCLIP_AUTH_DISABLE_SIGN_UP:' "$compose"
-! grep -q '/usr/local/bin/docker-entrypoint.sh' "$compose"
+if grep -q '/usr/local/bin/docker-entrypoint.sh' "$compose"; then echo 'unexpected entrypoint override' >&2; exit 1; fi
 grep -q 'resources:' "$compose"
 grep -q 'healthcheck:' "$compose"
-! grep -Eq '(/paperclip/instances/default|onecli|\.config/gh|woocommerce|customer|production.*volume)' "$compose"
+if grep -Eq '(/paperclip/instances/default|onecli|\.config/gh|woocommerce|customer|production.*volume)' "$compose"; then echo 'sensitive production path in staging Compose' >&2; exit 1; fi
 bash -n "$repo_root/scripts/staging-paperclip-deploy.sh"
 bash -n "$repo_root/scripts/staging-paperclip-bootstrap.sh"
 bash -n "$repo_root/scripts/staging-paperclip-teardown.sh"
@@ -91,6 +93,7 @@ assert_rejected_without_mutation staging-paperclip-teardown.sh "${common[@]}" PA
 fixture="$test_dir/repo"
 mkdir -p "$fixture/scripts/lib" "$fixture/docker/staging" "$fixture/secrets" "$fixture/staging-receipts"
 cp "$repo_root/scripts/staging-paperclip-deploy.sh" "$fixture/scripts/"
+cp "$repo_root/scripts/staging-paperclip-bootstrap.sh" "$fixture/scripts/"
 cp "$repo_root/scripts/lib/staging-paperclip-guard.sh" "$fixture/scripts/lib/"
 cp "$compose" "$fixture/docker/staging/compose.yml"
 sed "s#PAPERCLIP_APPROVED_STAGING_SECRET_DIR=\"/run/occ-paperclip-staging\"#PAPERCLIP_APPROVED_STAGING_SECRET_DIR=\"$fixture/secrets\"#" \
@@ -150,6 +153,25 @@ MOCK
 cat >"$test_dir/bin/curl" <<'MOCK'
 #!/usr/bin/env bash
 printf 'curl %s\n' "$*" >>"$STAGING_TEST_CALLS"
+if [[ "${STAGING_TEST_SCENARIO:-}" == bootstrap-signup-open ]]; then
+  output=""
+  previous=""
+  for argument in "$@"; do
+    if [[ "$previous" == --output ]]; then output="$argument"; break; fi
+    previous="$argument"
+  done
+  case "$*" in
+    *'/api/auth/sign-up/email'*)
+      [[ -z "$output" ]] || printf '{"status":"unexpected-open"}\n' >"$output"
+      printf '200'
+      ;;
+    *'/api/auth/get-session'*) printf '{"user":{"id":"fixture-user"}}\n' ;;
+    *'/api/companies'*) printf '[]\n' ;;
+    *'/api/health'*) printf '{"status":"ok","bootstrapStatus":"ready"}\n' ;;
+    *) exit 1 ;;
+  esac
+  exit
+fi
 [[ "${STAGING_TEST_SCENARIO:-}" == health-failure ]] && printf '{"status":"bad"}\n' || printf '{"status":"ok"}\n'
 MOCK
 cat >"$test_dir/bin/timeout" <<'MOCK'
@@ -183,18 +205,18 @@ assert_failed_deploy() {
   fi
   if [[ "$scenario" == build-timeout ]]; then
     jq -e --arg c "$fixture_commit" '.status=="failed" and .commit==$c and .rollback=="not-required" and (keys|sort)==["commit","composeProject","failedStep","rollback","status"]' "$receipt" >/dev/null
-    ! grep -Eq 'compose .* (stop|down|up)' "$test_dir/calls"
+    if grep -Eq 'compose .* (stop|down|up)' "$test_dir/calls"; then echo 'build failure mutated staging' >&2; exit 1; fi
     return
   fi
   if [[ "$scenario" == stop-failure || "$scenario" == first-backup-failure || "$scenario" == second-backup-failure ]]; then
     jq -e --arg c "$fixture_commit" '.status=="failed" and .commit==$c and .rollback=="prior-stack-restarted-untouched"' "$receipt" >/dev/null
-    ! grep -q 'down --remove-orphans' "$test_dir/calls"
-    ! grep -q ':/restore' "$test_dir/calls"
+    if grep -q 'down --remove-orphans' "$test_dir/calls"; then echo 'untouched prior stack was torn down' >&2; exit 1; fi
+    if grep -q ':/restore' "$test_dir/calls"; then echo 'untouched prior data was restored' >&2; exit 1; fi
     grep -q 'timeout 180 docker compose -p occ-paperclip-staging .* up -d --wait' "$test_dir/calls"
     return
   fi
   jq -e --arg c "$fixture_commit" '.status=="failed" and .commit==$c and .composeProject=="occ-paperclip-staging" and (.failedStep|test("^line-[0-9]+$")) and .rollback=="prior-image-and-data-restored" and (keys|sort)==["commit","composeProject","failedStep","rollback","status"]' "$receipt" >/dev/null
-  ! grep -q 'compose -p paper .*\(down\|up\|build\|run\|tag\)' "$test_dir/calls"
+  if grep -q 'compose -p paper .*\(down\|up\|build\|run\|tag\)' "$test_dir/calls"; then echo 'production Compose mutation attempted' >&2; exit 1; fi
   stop_line="$(grep -n 'compose -p occ-paperclip-staging .* stop$' "$test_dir/calls" | head -1 | cut -d: -f1)"
   backup_line="$(grep -n 'run --pull never .*:/source:ro' "$test_dir/calls" | head -1 | cut -d: -f1)"
   failed_up_line="$(grep -n 'compose -p occ-paperclip-staging .* up -d --wait' "$test_dir/calls" | head -1 | cut -d: -f1)"
@@ -203,7 +225,7 @@ assert_failed_deploy() {
   restart_line="$(grep -n 'compose -p occ-paperclip-staging .* up -d --wait' "$test_dir/calls" | tail -1 | cut -d: -f1)"
   (( stop_line < backup_line && backup_line < failed_up_line && failed_up_line < down_line && down_line < restore_line && restore_line < restart_line ))
   grep -q 'timeout 120 docker compose -p occ-paperclip-staging .* down --remove-orphans' "$test_dir/calls"
-  ! grep -q 'docker image tag prior-image' "$test_dir/calls"
+  if grep -q 'docker image tag prior-image' "$test_dir/calls"; then echo 'prior image was retagged' >&2; exit 1; fi
   grep -q 'timeout 180 docker compose -p occ-paperclip-staging .* up -d --wait' "$test_dir/calls"
 }
 
@@ -215,6 +237,18 @@ assert_failed_deploy start-timeout
 assert_failed_deploy identity-mismatch
 assert_failed_deploy health-failure
 
+# A bootstrap that cannot prove signup is closed must stop the staging server.
+: >"$test_dir/calls"
+if env PATH="$test_dir/bin:$PATH" STAGING_TEST_CALLS="$test_dir/calls" \
+  STAGING_TEST_SCENARIO=bootstrap-signup-open STAGING_TEST_STATE="$test_dir" \
+  PAPERCLIP_PRODUCTION_PROJECT=paperclip PAPERCLIP_STAGING_PROJECT=occ-paperclip-staging \
+  PAPERCLIP_STAGING_PORT=3310 PAPERCLIP_STAGING_PUBLIC_URL=http://127.0.0.1:3310 \
+  PAPERCLIP_STAGING_SECRET_DIR="$fixture/secrets" PAPERCLIP_STAGING_ADMIN_PASSWORD=synthetic-test-only \
+  bash "$fixture/scripts/staging-paperclip-bootstrap.sh" >/dev/null 2>&1; then
+  echo "expected bootstrap signup proof failure" >&2; exit 1
+fi
+grep -q 'timeout 60 docker compose -p occ-paperclip-staging .* stop server' "$test_dir/calls"
+
 # Orphan/partial resource sets fail closed before build, stop, backup, or start.
 for scenario in orphan-db orphan-runtime orphan-container; do
   : >"$test_dir/calls"
@@ -225,7 +259,7 @@ for scenario in orphan-db orphan-runtime orphan-container; do
     PAPERCLIP_STAGING_SECRET_DIR="$fixture/secrets" bash "$fixture/scripts/staging-paperclip-deploy.sh" >/dev/null 2>&1; then
     echo "expected orphan rejection: $scenario" >&2; exit 1
   fi
-  ! grep -Eq 'docker (build|run)|compose .* (stop|down|up)' "$test_dir/calls"
+  if grep -Eq 'docker (build|run)|compose .* (stop|down|up)' "$test_dir/calls"; then echo "orphan check mutated staging: $scenario" >&2; exit 1; fi
 done
 
 # Same-SHA retries always receive distinct attempt directories; a partial first

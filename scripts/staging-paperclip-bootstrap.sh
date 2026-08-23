@@ -25,6 +25,7 @@ close_signup() {
   if [[ "$signup_closed" != true ]]; then
     export PAPERCLIP_STAGING_AUTH_DISABLE_SIGN_UP=true
     timeout 180 docker compose -p "$PAPERCLIP_STAGING_PROJECT" -f "$compose_file" up -d --wait --force-recreate --no-deps server || true
+    timeout 60 docker compose -p "$PAPERCLIP_STAGING_PROJECT" -f "$compose_file" stop server || true
   fi
   rm -rf "$scratch_dir"
   exit "$status"
@@ -76,12 +77,12 @@ jq -e 'type == "array"' >/dev/null <<<"$companies_json"
 # survives and a second synthetic signup is denied.
 export PAPERCLIP_STAGING_AUTH_DISABLE_SIGN_UP=true
 timeout 180 docker compose -p "$PAPERCLIP_STAGING_PROJECT" -f "$compose_file" up -d --wait --force-recreate --no-deps server
-signup_closed=true
 second_email="paperclip-staging-denied-$(date +%s)-$$@oxfordcigar.invalid"
 second_signup_json="$(jq -cn --arg name 'Denied Staging User' --arg email "$second_email" --arg password "$PAPERCLIP_STAGING_ADMIN_PASSWORD" '{name:$name,email:$email,password:$password}')"
 second_status="$(post_json /api/auth/sign-up/email "$second_signup_json" "$scratch_dir/second-signup.json")"
 [[ "$second_status" == 403 ]] || { echo "staging bootstrap: signup-disabled contract returned HTTP $second_status, expected 403" >&2; exit 1; }
 jq -e '((.code // .error.code // "") | ascii_upcase | test("SIGN.?UP.*DISABLED")) or ((.message // .error.message // "") | ascii_downcase | test("sign.?up.*disabled"))' "$scratch_dir/second-signup.json" >/dev/null || { echo "staging bootstrap: explicit signup-disabled response missing" >&2; exit 1; }
+signup_closed=true
 session_json="$(curl --connect-timeout 5 --max-time 15 --fail --silent --cookie "$cookie_jar" --cookie-jar "$cookie_jar" "$PAPERCLIP_STAGING_PUBLIC_URL/api/auth/get-session")"
 jq -e '.user.id // .session.userId' >/dev/null <<<"$session_json"
 echo "staging bootstrap: authenticated UI/API smoke ready for $admin_email"

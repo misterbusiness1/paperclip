@@ -8,6 +8,18 @@ staging_die() {
   return 2
 }
 
+staging_file_mode() {
+  stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"
+}
+
+staging_file_uid() {
+  stat -c '%u' "$1" 2>/dev/null || stat -f '%u' "$1"
+}
+
+staging_realpath() {
+  realpath -e -- "$1" 2>/dev/null || realpath "$1"
+}
+
 require_staging_project() {
   local staging_project="${PAPERCLIP_STAGING_PROJECT:-}"
   local production_project="${PAPERCLIP_PRODUCTION_PROJECT:-}"
@@ -28,15 +40,15 @@ require_staging_secret_dir() {
   local resolved
   [[ -n "$requested" ]] || { staging_die "staging secret directory is required"; return 2; }
   [[ -d "$requested" ]] || { staging_die "staging secret directory does not exist"; return 2; }
-  resolved="$(realpath -e -- "$requested")" || { staging_die "cannot resolve staging secret directory"; return 2; }
+  resolved="$(staging_realpath "$requested")" || { staging_die "cannot resolve staging secret directory"; return 2; }
   [[ "$resolved" == "$PAPERCLIP_APPROVED_STAGING_SECRET_DIR" ]] || { staging_die "unapproved staging secret directory"; return 2; }
-  [[ "$(stat -c '%a' "$resolved")" == "700" ]] || { staging_die "staging secret directory must have mode 0700"; return 2; }
-  [[ "$(stat -c '%u' "$resolved")" == "$(id -u)" ]] || { staging_die "staging secret directory must be owned by the deploy user"; return 2; }
+  [[ "$(staging_file_mode "$resolved")" == "700" ]] || { staging_die "staging secret directory must have mode 0700"; return 2; }
+  [[ "$(staging_file_uid "$resolved")" == "$(id -u)" ]] || { staging_die "staging secret directory must be owned by the deploy user"; return 2; }
   local secret_file
   for secret_file in better-auth-secret postgres-password; do
     [[ -f "$resolved/$secret_file" && ! -L "$resolved/$secret_file" ]] || { staging_die "required staging secret file is missing or not regular"; return 2; }
-    [[ "$(stat -c '%a' "$resolved/$secret_file")" == "600" ]] || { staging_die "staging secret files must have mode 0600"; return 2; }
-    [[ "$(stat -c '%u' "$resolved/$secret_file")" == "$(id -u)" ]] || { staging_die "staging secret files must be owned by the deploy user"; return 2; }
+    [[ "$(staging_file_mode "$resolved/$secret_file")" == "600" ]] || { staging_die "staging secret files must have mode 0600"; return 2; }
+    [[ "$(staging_file_uid "$resolved/$secret_file")" == "$(id -u)" ]] || { staging_die "staging secret files must be owned by the deploy user"; return 2; }
   done
   PAPERCLIP_STAGING_SECRET_DIR="$resolved"
   export PAPERCLIP_STAGING_SECRET_DIR

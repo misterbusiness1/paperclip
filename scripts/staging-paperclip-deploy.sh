@@ -28,7 +28,7 @@ receipt_dir="$repo_root/staging-receipts"
   || { echo "receipt directory must be exactly $receipt_dir" >&2; exit 2; }
 mkdir -p "$receipt_dir"
 chmod 700 "$receipt_dir"
-[[ "$(realpath -e -- "$receipt_dir")" == "$(realpath -e -- "$repo_root")/staging-receipts" ]] || { echo "receipt directory escaped the repository" >&2; exit 2; }
+[[ "$(staging_realpath "$receipt_dir")" == "$(staging_realpath "$repo_root")/staging-receipts" ]] || { echo "receipt directory escaped the repository" >&2; exit 2; }
 find "$receipt_dir" -mindepth 1 -maxdepth 1 -type d -name '*.predeploy-data.*' -mtime +7 -exec rm -rf -- {} +
 receipt="$receipt_dir/${PAPERCLIP_STAGING_COMMIT}.json"
 failure_receipt="$receipt_dir/${PAPERCLIP_STAGING_COMMIT}.failed.json"
@@ -139,7 +139,13 @@ rollback_failed_deploy() {
   fi
   write_failure_receipt "$failed_step" "$result"
 }
-trap 'status=$?; if (( status != 0 )) && [[ "$rollback_running" != true ]]; then rollback_failed_deploy "$LINENO" || true; fi; exit "$status"' EXIT
+rollback_on_exit() {
+  local status="$1"
+  local failed_line="$2"
+  if (( status != 0 )) && [[ "$rollback_running" != true ]]; then rollback_failed_deploy "$failed_line" || true; fi
+  exit "$status"
+}
+trap 'rollback_on_exit "$?" "$LINENO"' EXIT
 
 build_timeout="${PAPERCLIP_STAGING_BUILD_TIMEOUT_SECONDS:-900}"
 start_timeout="${PAPERCLIP_STAGING_START_TIMEOUT_SECONDS:-300}"
@@ -174,6 +180,10 @@ after_digest="$(docker image inspect "$PAPERCLIP_STAGING_IMAGE" --format '{{.Id}
 health="$(curl --connect-timeout 5 --max-time 15 --fail --silent "$PAPERCLIP_STAGING_PUBLIC_URL/api/health" | jq -r .status)"
 require_staging_health "$health"
 
+db_backup_sha256=""
+runtime_backup_sha256=""
+if [[ -f "$backup_dir/db.tgz" ]]; then db_backup_sha256="$(sha256sum "$backup_dir/db.tgz" | cut -d' ' -f1)"; fi
+if [[ -f "$backup_dir/runtime.tgz" ]]; then runtime_backup_sha256="$(sha256sum "$backup_dir/runtime.tgz" | cut -d' ' -f1)"; fi
 jq -n \
   --arg commit "$PAPERCLIP_STAGING_COMMIT" \
   --arg project "$PAPERCLIP_STAGING_PROJECT" \
@@ -183,8 +193,8 @@ jq -n \
   --arg health "$health" \
   --arg productionProject "$PAPERCLIP_PRODUCTION_PROJECT" \
   --argjson dataRollbackPrepared "$([[ -n "$prior_image_id" ]] && echo true || echo false)" \
-  --arg dbBackupSha256 "$([[ -f "$backup_dir/db.tgz" ]] && sha256sum "$backup_dir/db.tgz" | cut -d' ' -f1 || true)" \
-  --arg runtimeBackupSha256 "$([[ -f "$backup_dir/runtime.tgz" ]] && sha256sum "$backup_dir/runtime.tgz" | cut -d' ' -f1 || true)" \
+  --arg dbBackupSha256 "$db_backup_sha256" \
+  --arg runtimeBackupSha256 "$runtime_backup_sha256" \
   --arg rollbackAttempt "$(basename "$backup_dir")" \
   --arg productionStateSha256 "$(printf '%s' "$after_prod" | sha256sum | cut -d' ' -f1)" \
   '{commit:$commit,composeProject:$project,privateEndpoint:$endpoint,preImageDigest:$preImageDigest,postImageDigest:$postImageDigest,health:$health,productionProject:$productionProject,productionStateSha256:$productionStateSha256,dataRollbackPrepared:$dataRollbackPrepared,rollbackAttempt:$rollbackAttempt,dbBackupSha256:$dbBackupSha256,runtimeBackupSha256:$runtimeBackupSha256}' \
