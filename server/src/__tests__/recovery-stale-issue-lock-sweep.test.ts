@@ -4,6 +4,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 import {
   activityLog,
   agents,
+  agentWakeupRequests,
   companies,
   createDb,
   heartbeatRunEvents,
@@ -49,6 +50,7 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
     await db.delete(issues);
     await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
+    await db.delete(agentWakeupRequests);
     await db.delete(agents);
     await db.delete(companies);
   });
@@ -224,6 +226,118 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
     const second = await heartbeat.sweepStaleIssueLocks();
     expect(first.cleared).toBe(1);
     expect(second.cleared).toBe(0);
+  });
+
+  it("retires terminal deferred wakes only after their active execution path closes", async () => {
+    const { companyId, agentId, runningRunId } = await seed();
+    const doneIssueId = randomUUID();
+    const cancelledIssueId = randomUUID();
+    const activeIssueId = randomUUID();
+    await db.insert(issues).values([
+      {
+        id: doneIssueId,
+        companyId,
+        title: "Done issue with stale deferred wake",
+        status: "done",
+        priority: "medium",
+        assigneeAgentId: agentId,
+        completedAt: new Date(),
+      },
+      {
+        id: cancelledIssueId,
+        companyId,
+        title: "Cancelled issue with stale deferred wake",
+        status: "cancelled",
+        priority: "medium",
+        assigneeAgentId: agentId,
+      },
+      {
+        id: activeIssueId,
+        companyId,
+        title: "Terminal issue whose run is still active",
+        status: "done",
+        priority: "medium",
+        assigneeAgentId: agentId,
+        completedAt: new Date(),
+      },
+    ]);
+    await db
+      .update(heartbeatRuns)
+      .set({ contextSnapshot: { issueId: activeIssueId } })
+      .where(eq(heartbeatRuns.id, runningRunId));
+    const wakeIds = [randomUUID(), randomUUID(), randomUUID(), randomUUID()];
+    const staleAt = new Date(Date.now() - 10 * 60 * 1000);
+    await db.insert(agentWakeupRequests).values([
+      {
+        id: wakeIds[0],
+        companyId,
+        agentId,
+        source: "automation",
+        status: "deferred_issue_execution",
+        payload: { issueId: doneIssueId },
+        updatedAt: staleAt,
+      },
+      {
+        id: wakeIds[1],
+        companyId,
+        agentId,
+        source: "automation",
+        status: "deferred_issue_execution",
+        payload: { _paperclipWakeContext: { issueId: cancelledIssueId } },
+        updatedAt: staleAt,
+      },
+      {
+        id: wakeIds[2],
+        companyId,
+        agentId,
+        source: "automation",
+        status: "deferred_issue_execution",
+        payload: { issueId: activeIssueId },
+        updatedAt: staleAt,
+      },
+      {
+        id: wakeIds[3],
+        companyId,
+        agentId,
+        source: "automation",
+        status: "deferred_issue_execution",
+        payload: { issueId: doneIssueId },
+      },
+    ]);
+
+    const heartbeat = heartbeatService(db);
+    const first = await heartbeat.sweepStaleIssueLocks();
+    expect(first.retiredDeferredWakeups).toBe(2);
+    expect(new Set(first.retiredDeferredWakeupIds)).toEqual(new Set(wakeIds.slice(0, 2)));
+
+    const firstStatuses = await db
+      .select({ id: agentWakeupRequests.id, status: agentWakeupRequests.status })
+      .from(agentWakeupRequests);
+    expect(firstStatuses.find((wake) => wake.id === wakeIds[2])?.status).toBe(
+      "deferred_issue_execution",
+    );
+    expect(firstStatuses.find((wake) => wake.id === wakeIds[3])?.status).toBe(
+      "deferred_issue_execution",
+    );
+
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "succeeded", finishedAt: new Date() })
+      .where(eq(heartbeatRuns.id, runningRunId));
+    const second = await heartbeat.sweepStaleIssueLocks();
+    expect(second.retiredDeferredWakeupIds).toEqual([wakeIds[2]]);
+
+    const [freshWake] = await db
+      .select({ status: agentWakeupRequests.status })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, wakeIds[3]));
+    expect(freshWake?.status).toBe("deferred_issue_execution");
+
+    const audits = await db
+      .select({ details: activityLog.details })
+      .from(activityLog)
+      .where(eq(activityLog.action, "heartbeat.terminal_deferred_wakes_retired"));
+    expect(audits.map((audit) => (audit.details as { count: number }).count)).toEqual([2, 1]);
   });
 
   it("terminalizes an orphaned running run whose process is gone, then clears the lock", async () => {
