@@ -1,0 +1,94 @@
+name: ${PAPERCLIP_STAGING_PROJECT:?set PAPERCLIP_STAGING_PROJECT}
+
+services:
+  db:
+    image: postgres:17.6-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: paperclip_staging
+      POSTGRES_DB: paperclip_staging
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets:
+      - postgres_password
+    volumes:
+      - staging-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U paperclip_staging -d paperclip_staging"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 10s
+    networks:
+      - staging
+    deploy:
+      resources:
+        limits:
+          cpus: "1.00"
+          memory: 1G
+        reservations:
+          memory: 256M
+
+  server:
+    image: ${PAPERCLIP_STAGING_IMAGE:?set PAPERCLIP_STAGING_IMAGE}
+    restart: unless-stopped
+    init: true
+    command:
+      - /bin/bash
+      - -euc
+      - |
+        export BETTER_AUTH_SECRET="$$(cat /run/secrets/better_auth_secret)"
+        export DATABASE_URL="postgres://paperclip_staging:$$(cat /run/secrets/postgres_password)@db:5432/paperclip_staging"
+        exec /usr/local/bin/docker-entrypoint.sh node --import ./server/node_modules/tsx/dist/loader.mjs server/dist/index.js
+    environment:
+      HOST: 0.0.0.0
+      PORT: "3100"
+      SERVE_UI: "true"
+      PAPERCLIP_HOME: /paperclip-staging
+      PAPERCLIP_INSTANCE_ID: occ-staging
+      PAPERCLIP_CONFIG: /paperclip-staging/instances/occ-staging/config.json
+      PAPERCLIP_DEPLOYMENT_MODE: authenticated
+      PAPERCLIP_DEPLOYMENT_EXPOSURE: private
+      PAPERCLIP_PUBLIC_URL: ${PAPERCLIP_STAGING_PUBLIC_URL:?set PAPERCLIP_STAGING_PUBLIC_URL}
+      PAPERCLIP_ALLOWED_HOSTNAMES: ${PAPERCLIP_STAGING_ALLOWED_HOSTNAMES:-127.0.0.1,localhost}
+    secrets:
+      - better_auth_secret
+      - postgres_password
+    ports:
+      - "127.0.0.1:${PAPERCLIP_STAGING_PORT:-3310}:3100"
+    volumes:
+      - staging-runtime:/paperclip-staging
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail --silent http://127.0.0.1:3100/api/health | grep -q '\"status\":\"ok\"'"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    networks:
+      - staging
+    deploy:
+      resources:
+        limits:
+          cpus: "2.00"
+          memory: 3G
+        reservations:
+          memory: 512M
+
+secrets:
+  better_auth_secret:
+    file: ${PAPERCLIP_STAGING_SECRET_DIR:?set PAPERCLIP_STAGING_SECRET_DIR}/better-auth-secret
+  postgres_password:
+    file: ${PAPERCLIP_STAGING_SECRET_DIR:?set PAPERCLIP_STAGING_SECRET_DIR}/postgres-password
+
+volumes:
+  staging-db:
+    name: ${PAPERCLIP_STAGING_PROJECT}_db
+  staging-runtime:
+    name: ${PAPERCLIP_STAGING_PROJECT}_runtime
+
+networks:
+  staging:
+    name: ${PAPERCLIP_STAGING_PROJECT}_network
+    driver: bridge
