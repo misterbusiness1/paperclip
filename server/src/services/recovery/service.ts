@@ -5657,7 +5657,109 @@ export function recoveryService(
       terminalizedRunIds: [] as string[],
       retiredDeferredWakeups: 0,
       retiredDeferredWakeupIds: [] as string[],
+      reconciledClaimedWakeups: 0,
+      reconciledClaimedWakeupIds: [] as string[],
     };
+
+    const reconciledClaimedWakeups = await db.transaction(async (tx) => {
+      const staleClaimedWakeups = await tx
+        .select({
+          id: agentWakeupRequests.id,
+          companyId: agentWakeupRequests.companyId,
+          runId: heartbeatRuns.id,
+          runStatus: heartbeatRuns.status,
+        })
+        .from(agentWakeupRequests)
+        .innerJoin(
+          heartbeatRuns,
+          and(
+            eq(heartbeatRuns.id, agentWakeupRequests.runId),
+            eq(heartbeatRuns.wakeupRequestId, agentWakeupRequests.id),
+          ),
+        )
+        .where(
+          and(
+            eq(agentWakeupRequests.status, "claimed"),
+            isNull(agentWakeupRequests.finishedAt),
+            inArray(heartbeatRuns.status, [...TERMINAL_HEARTBEAT_RUN_STATUSES]),
+            // Stay outside a healthy finalizer's run-status/wake-status window.
+            sql`${agentWakeupRequests.updatedAt} < now() - interval '5 minutes'`,
+            sql`${heartbeatRuns.finishedAt} < now() - interval '5 minutes'`,
+          ),
+        )
+        .orderBy(asc(agentWakeupRequests.updatedAt), asc(agentWakeupRequests.id))
+        .limit(500);
+
+      const reconciled: Array<{ id: string; companyId: string; runStatus: string }> = [];
+      const byRunStatus = new Map<string, typeof staleClaimedWakeups>();
+      for (const wake of staleClaimedWakeups) {
+        const rows = byRunStatus.get(wake.runStatus) ?? [];
+        rows.push(wake);
+        byRunStatus.set(wake.runStatus, rows);
+      }
+
+      const now = new Date();
+      for (const [runStatus, wakeups] of byRunStatus) {
+        const wakeStatus = runStatus === "succeeded"
+          ? "completed"
+          : runStatus === "cancelled"
+            ? "cancelled"
+            : "failed";
+        const updated = await tx
+          .update(agentWakeupRequests)
+          .set({
+            status: wakeStatus,
+            finishedAt: now,
+            error: wakeStatus === "completed"
+              ? null
+              : `Claimed wake reconciled after linked heartbeat run became ${runStatus}`,
+            updatedAt: now,
+          })
+          .where(
+            and(
+              inArray(agentWakeupRequests.id, wakeups.map((wake) => wake.id)),
+              eq(agentWakeupRequests.status, "claimed"),
+              isNull(agentWakeupRequests.finishedAt),
+            ),
+          )
+          .returning({ id: agentWakeupRequests.id, companyId: agentWakeupRequests.companyId });
+        reconciled.push(...updated.map((wake) => ({ ...wake, runStatus })));
+      }
+
+      const reconciledByCompany = new Map<string, typeof reconciled>();
+      for (const wake of reconciled) {
+        const rows = reconciledByCompany.get(wake.companyId) ?? [];
+        rows.push(wake);
+        reconciledByCompany.set(wake.companyId, rows);
+      }
+      for (const [companyId, wakeups] of reconciledByCompany) {
+        await logActivity(tx as unknown as Db, {
+          companyId,
+          actorType: "system",
+          actorId: "system",
+          agentId: null,
+          runId: null,
+          action: "heartbeat.terminal_claimed_wakes_reconciled",
+          entityType: "company",
+          entityId: companyId,
+          details: {
+            source: "recovery.sweep_stale_issue_locks",
+            count: wakeups.length,
+            wakeupRequestIds: wakeups.map((wake) => wake.id),
+            runStatusCounts: Object.fromEntries(
+              [...new Set(wakeups.map((wake) => wake.runStatus))].map((status) => [
+                status,
+                wakeups.filter((wake) => wake.runStatus === status).length,
+              ]),
+            ),
+          },
+        });
+      }
+      return reconciled;
+    });
+
+    result.reconciledClaimedWakeupIds = reconciledClaimedWakeups.map((wake) => wake.id);
+    result.reconciledClaimedWakeups = reconciledClaimedWakeups.length;
 
     const retired = await db.transaction(async (tx) => {
       const terminalDeferredWakeups = await tx
@@ -5887,7 +5989,8 @@ export function recoveryService(
     if (
       result.cleared > 0 ||
       result.terminalizedRunIds.length > 0 ||
-      result.retiredDeferredWakeups > 0
+      result.retiredDeferredWakeups > 0 ||
+      result.reconciledClaimedWakeups > 0
     ) {
       logger.warn(
         {
@@ -5896,6 +5999,8 @@ export function recoveryService(
           terminalizedRunIds: result.terminalizedRunIds,
           retiredDeferredWakeups: result.retiredDeferredWakeups,
           retiredDeferredWakeupIds: result.retiredDeferredWakeupIds,
+          reconciledClaimedWakeups: result.reconciledClaimedWakeups,
+          reconciledClaimedWakeupIds: result.reconciledClaimedWakeupIds,
         },
         "swept stale issue execution state",
       );
