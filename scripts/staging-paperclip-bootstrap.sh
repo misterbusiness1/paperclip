@@ -1,9 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+repo_root="$(cd "$(dirname "$0")/.." && pwd)"
+source "$repo_root/scripts/lib/staging-paperclip-guard.sh"
+
 : "${PAPERCLIP_STAGING_PROJECT:?set PAPERCLIP_STAGING_PROJECT}"
 : "${PAPERCLIP_STAGING_PUBLIC_URL:?set PAPERCLIP_STAGING_PUBLIC_URL}"
 : "${PAPERCLIP_STAGING_ADMIN_PASSWORD:?inject PAPERCLIP_STAGING_ADMIN_PASSWORD at runtime}"
+: "${PAPERCLIP_PRODUCTION_PROJECT:?set PAPERCLIP_PRODUCTION_PROJECT}"
+: "${PAPERCLIP_STAGING_SECRET_DIR:?set PAPERCLIP_STAGING_SECRET_DIR}"
+: "${PAPERCLIP_STAGING_PORT:=3310}"
+
+require_staging_preflight
 
 admin_name="${PAPERCLIP_STAGING_ADMIN_NAME:-OCC Staging Admin}"
 admin_email="${PAPERCLIP_STAGING_ADMIN_EMAIL:-paperclip-staging@oxfordcigar.invalid}"
