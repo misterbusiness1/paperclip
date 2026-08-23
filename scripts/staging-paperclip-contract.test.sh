@@ -80,6 +80,7 @@ common=(
 assert_rejected_without_mutation staging-paperclip-deploy.sh "${common[@]}" PAPERCLIP_PRODUCTION_PROJECT=dummy-production
 assert_rejected_without_mutation staging-paperclip-deploy.sh "${common[@]}" PAPERCLIP_STAGING_PROJECT=paperclip
 assert_rejected_without_mutation staging-paperclip-deploy.sh "${common[@]}" PAPERCLIP_STAGING_PROJECT=bad-staging-name
+assert_rejected_without_mutation staging-paperclip-deploy.sh "${common[@]}" PAPERCLIP_STAGING_RECEIPT_DIR="$test_dir/unapproved-receipts"
 assert_rejected_without_mutation staging-paperclip-bootstrap.sh "${common[@]}" PAPERCLIP_STAGING_PUBLIC_URL=https://production.example.test
 assert_rejected_without_mutation staging-paperclip-bootstrap.sh "${common[@]}" PAPERCLIP_STAGING_SECRET_DIR="$test_dir/secrets/../secrets"
 assert_rejected_without_mutation staging-paperclip-teardown.sh "${common[@]}" PAPERCLIP_STAGING_PROJECT=paperclip
@@ -88,11 +89,13 @@ assert_rejected_without_mutation staging-paperclip-teardown.sh "${common[@]}" PA
 # Each adversarial case must reach mutation, stay staging-scoped, restore the
 # prior image/data, and leave a machine-readable, value-free terminal receipt.
 fixture="$test_dir/repo"
-mkdir -p "$fixture/scripts/lib" "$fixture/docker/staging" "$fixture/secrets" "$fixture/receipts"
+mkdir -p "$fixture/scripts/lib" "$fixture/docker/staging" "$fixture/secrets" "$fixture/staging-receipts"
 cp "$repo_root/scripts/staging-paperclip-deploy.sh" "$fixture/scripts/"
 cp "$repo_root/scripts/lib/staging-paperclip-guard.sh" "$fixture/scripts/lib/"
 cp "$compose" "$fixture/docker/staging/compose.yml"
-sed -i "s#PAPERCLIP_APPROVED_STAGING_SECRET_DIR=\"/run/occ-paperclip-staging\"#PAPERCLIP_APPROVED_STAGING_SECRET_DIR=\"$fixture/secrets\"#" "$fixture/scripts/lib/staging-paperclip-guard.sh"
+sed "s#PAPERCLIP_APPROVED_STAGING_SECRET_DIR=\"/run/occ-paperclip-staging\"#PAPERCLIP_APPROVED_STAGING_SECRET_DIR=\"$fixture/secrets\"#" \
+  "$fixture/scripts/lib/staging-paperclip-guard.sh" >"$fixture/scripts/lib/staging-paperclip-guard.sh.tmp"
+mv "$fixture/scripts/lib/staging-paperclip-guard.sh.tmp" "$fixture/scripts/lib/staging-paperclip-guard.sh"
 printf 'fixture\n' >"$fixture/secrets/better-auth-secret"
 printf 'fixture\n' >"$fixture/secrets/postgres-password"
 chmod 700 "$fixture/secrets"
@@ -107,18 +110,38 @@ fixture_commit="$(git -C "$fixture" rev-parse HEAD)"
 cat >"$test_dir/bin/docker" <<'MOCK'
 #!/usr/bin/env bash
 printf 'docker %s\n' "$*" >>"$STAGING_TEST_CALLS"
+backup_mount=""
+for argument in "$@"; do
+  case "$argument" in *:/backup|*:/backup:ro) backup_mount="${argument%%:/backup*}" ;; esac
+done
 case "$*" in
   'ps --all --filter label=com.docker.compose.project=paperclip --format {{.ID}}') printf 'prod-1\n' ;;
   'inspect prod-1 --format {{.Id}} {{.Image}}')
     [[ "${STAGING_TEST_SCENARIO:-}" == identity-mismatch && -f "$STAGING_TEST_STATE/started" ]] && printf 'prod-2 image-prod\n' || printf 'prod-1 image-prod\n'
     ;;
   *' config --format json') jq -n --arg p occ-paperclip-staging '{name:$p,volumes:{"staging-db":{name:($p+"_db")},"staging-runtime":{name:($p+"_runtime")}},networks:{staging:{name:($p+"_network")}}}' ;;
-  *' images -q server') printf 'prior-image\n' ;;
+  *' images -q server') [[ "${STAGING_TEST_SCENARIO:-}" == first-deploy ]] || printf 'sha256:prior-image\n' ;;
+  *' ps -a -q db') [[ "${STAGING_TEST_SCENARIO:-}" == first-deploy || "${STAGING_TEST_SCENARIO:-}" == orphan-runtime || "${STAGING_TEST_SCENARIO:-}" == orphan-container ]] || printf 'staging-db\n' ;;
+  *' ps -a -q server') [[ "${STAGING_TEST_SCENARIO:-}" == first-deploy || "${STAGING_TEST_SCENARIO:-}" == orphan-db ]] || printf 'staging-server\n' ;;
   'ps --all --filter label=com.docker.compose.project=occ-paperclip-staging --format {{.ID}}') printf 'staging-server\n' ;;
   'inspect --format {{index .Config.Labels "com.docker.compose.service"}} staging-server') printf 'server\n' ;;
-  'volume inspect occ-paperclip-staging_db'|'volume inspect occ-paperclip-staging_runtime'|'network inspect occ-paperclip-staging_network') exit 1 ;;
-  run*db.tgz*) : >"$STAGING_TEST_BACKUP_DIR/db.tgz" ;;
-  run*runtime.tgz*) : >"$STAGING_TEST_BACKUP_DIR/runtime.tgz" ;;
+  'volume inspect occ-paperclip-staging_db') [[ "${STAGING_TEST_SCENARIO:-}" == first-deploy || "${STAGING_TEST_SCENARIO:-}" == orphan-runtime || "${STAGING_TEST_SCENARIO:-}" == orphan-container ]] && exit 1 || exit 0 ;;
+  'volume inspect occ-paperclip-staging_runtime') [[ "${STAGING_TEST_SCENARIO:-}" == first-deploy || "${STAGING_TEST_SCENARIO:-}" == orphan-db || "${STAGING_TEST_SCENARIO:-}" == orphan-container ]] && exit 1 || exit 0 ;;
+  'network inspect occ-paperclip-staging_network') [[ "${STAGING_TEST_SCENARIO:-}" == first-deploy || "${STAGING_TEST_SCENARIO:-}" == orphan-container ]] && exit 1 || exit 0 ;;
+  'volume inspect --format {{index .Labels "com.docker.compose.project"}} occ-paperclip-staging_db'|'volume inspect --format {{index .Labels "com.docker.compose.project"}} occ-paperclip-staging_runtime'|'network inspect --format {{index .Labels "com.docker.compose.project"}} occ-paperclip-staging_network') printf 'occ-paperclip-staging\n' ;;
+  'image inspect sha256:prior-image --format {{.Id}}') printf 'sha256:prior-image\n' ;;
+  run*':/source:ro'*db.tgz*)
+    [[ "${STAGING_TEST_SCENARIO:-}" == first-backup-failure ]] && exit 1
+    printf 'db-backup-%s' "${STAGING_TEST_ATTEMPT:-one}" >"$backup_mount/.db-marker"
+    tar -czf "$backup_mount/db.tgz" -C "$backup_mount" .db-marker
+    rm "$backup_mount/.db-marker"
+    ;;
+  run*':/source:ro'*runtime.tgz*)
+    [[ "${STAGING_TEST_SCENARIO:-}" == second-backup-failure ]] && exit 1
+    printf 'runtime-backup-%s' "${STAGING_TEST_ATTEMPT:-one}" >"$backup_mount/.runtime-marker"
+    tar -czf "$backup_mount/runtime.tgz" -C "$backup_mount" .runtime-marker
+    rm "$backup_mount/.runtime-marker"
+    ;;
   'image inspect ghcr.io/oxfordcigar/paperclip:'*' --format {{.Id}}') printf 'new-image\n' ;;
   'image inspect ghcr.io/oxfordcigar/paperclip:'*' --format {{index .Config.Labels "org.opencontainers.image.revision"}}') printf '%s\n' "$STAGING_TEST_COMMIT" ;;
   compose*' up -d --wait') : >"$STAGING_TEST_STATE/started" ;;
@@ -135,6 +158,7 @@ seconds="$1"; shift
 printf 'timeout %s %s\n' "$seconds" "$*" >>"$STAGING_TEST_CALLS"
 case "${STAGING_TEST_SCENARIO:-}:$*" in
   build-timeout:'docker build '*) exit 124 ;;
+  stop-failure:'docker compose '*' stop') exit 1 ;;
   start-timeout:'docker compose '*' up -d --wait')
     if [[ ! -f "$STAGING_TEST_STATE/start-failed" ]]; then : >"$STAGING_TEST_STATE/start-failed"; exit 124; fi
     ;;
@@ -144,16 +168,15 @@ MOCK
 chmod +x "$test_dir/bin/docker" "$test_dir/bin/curl" "$test_dir/bin/timeout"
 
 assert_failed_deploy() {
-  local scenario="$1" receipt="$fixture/receipts/$fixture_commit.failed.json"
+  local scenario="$1" receipt="$fixture/staging-receipts/$fixture_commit.failed.json"
   rm -f "$receipt" "$test_dir/started" "$test_dir/start-failed"
   : >"$test_dir/calls"
   if env PATH="$test_dir/bin:$PATH" STAGING_TEST_CALLS="$test_dir/calls" \
     STAGING_TEST_SCENARIO="$scenario" STAGING_TEST_STATE="$test_dir" \
-    STAGING_TEST_BACKUP_DIR="$fixture/receipts/$fixture_commit.predeploy-data" \
     STAGING_TEST_COMMIT="$fixture_commit" PAPERCLIP_STAGING_COMMIT="$fixture_commit" \
     PAPERCLIP_PRODUCTION_PROJECT=paperclip PAPERCLIP_STAGING_PROJECT=occ-paperclip-staging \
     PAPERCLIP_STAGING_PORT=3310 PAPERCLIP_STAGING_PUBLIC_URL=http://127.0.0.1:3310 \
-    PAPERCLIP_STAGING_SECRET_DIR="$fixture/secrets" PAPERCLIP_STAGING_RECEIPT_DIR="$fixture/receipts" \
+    PAPERCLIP_STAGING_SECRET_DIR="$fixture/secrets" PAPERCLIP_STAGING_RECEIPT_DIR="$fixture/staging-receipts" \
     PAPERCLIP_STAGING_BUILD_TIMEOUT_SECONDS=60 PAPERCLIP_STAGING_START_TIMEOUT_SECONDS=30 \
     bash "$fixture/scripts/staging-paperclip-deploy.sh" >/dev/null 2>&1; then
     echo "expected deploy failure: $scenario" >&2; exit 1
@@ -161,6 +184,13 @@ assert_failed_deploy() {
   if [[ "$scenario" == build-timeout ]]; then
     jq -e --arg c "$fixture_commit" '.status=="failed" and .commit==$c and .rollback=="not-required" and (keys|sort)==["commit","composeProject","failedStep","rollback","status"]' "$receipt" >/dev/null
     ! grep -Eq 'compose .* (stop|down|up)' "$test_dir/calls"
+    return
+  fi
+  if [[ "$scenario" == stop-failure || "$scenario" == first-backup-failure || "$scenario" == second-backup-failure ]]; then
+    jq -e --arg c "$fixture_commit" '.status=="failed" and .commit==$c and .rollback=="prior-stack-restarted-untouched"' "$receipt" >/dev/null
+    ! grep -q 'down --remove-orphans' "$test_dir/calls"
+    ! grep -q ':/restore' "$test_dir/calls"
+    grep -q 'timeout 180 docker compose -p occ-paperclip-staging .* up -d --wait' "$test_dir/calls"
     return
   fi
   jq -e --arg c "$fixture_commit" '.status=="failed" and .commit==$c and .composeProject=="occ-paperclip-staging" and (.failedStep|test("^line-[0-9]+$")) and .rollback=="prior-image-and-data-restored" and (keys|sort)==["commit","composeProject","failedStep","rollback","status"]' "$receipt" >/dev/null
@@ -178,7 +208,41 @@ assert_failed_deploy() {
 }
 
 assert_failed_deploy build-timeout
+assert_failed_deploy stop-failure
+assert_failed_deploy first-backup-failure
+assert_failed_deploy second-backup-failure
 assert_failed_deploy start-timeout
 assert_failed_deploy identity-mismatch
 assert_failed_deploy health-failure
+
+# Orphan/partial resource sets fail closed before build, stop, backup, or start.
+for scenario in orphan-db orphan-runtime orphan-container; do
+  : >"$test_dir/calls"
+  if env PATH="$test_dir/bin:$PATH" STAGING_TEST_CALLS="$test_dir/calls" STAGING_TEST_SCENARIO="$scenario" \
+    STAGING_TEST_STATE="$test_dir" STAGING_TEST_COMMIT="$fixture_commit" PAPERCLIP_STAGING_COMMIT="$fixture_commit" \
+    PAPERCLIP_PRODUCTION_PROJECT=paperclip PAPERCLIP_STAGING_PROJECT=occ-paperclip-staging \
+    PAPERCLIP_STAGING_PORT=3310 PAPERCLIP_STAGING_PUBLIC_URL=http://127.0.0.1:3310 \
+    PAPERCLIP_STAGING_SECRET_DIR="$fixture/secrets" bash "$fixture/scripts/staging-paperclip-deploy.sh" >/dev/null 2>&1; then
+    echo "expected orphan rejection: $scenario" >&2; exit 1
+  fi
+  ! grep -Eq 'docker (build|run)|compose .* (stop|down|up)' "$test_dir/calls"
+done
+
+# Same-SHA retries always receive distinct attempt directories; a partial first
+# attempt can never be combined with the next attempt's archives.
+first_attempt="$(mktemp -d "$fixture/staging-receipts/$fixture_commit.predeploy-data.XXXXXX")"
+printf stale >"$first_attempt/db.tgz"
+: >"$test_dir/calls"
+STAGING_TEST_ATTEMPT=two assert_failed_deploy start-timeout
+attempt_count="$(find "$fixture/staging-receipts" -mindepth 1 -maxdepth 1 -type d -name "$fixture_commit.predeploy-data.*" | wc -l | tr -d ' ')"
+(( attempt_count >= 2 ))
+valid_retry=false
+while read -r attempt_dir; do
+  [[ -s "$attempt_dir/db.tgz" && -s "$attempt_dir/runtime.tgz" ]] || continue
+  if [[ "$(tar -xOzf "$attempt_dir/db.tgz" .db-marker)" == db-backup-two \
+    && "$(tar -xOzf "$attempt_dir/runtime.tgz" .runtime-marker)" == runtime-backup-two ]]; then
+    valid_retry=true
+  fi
+done < <(find "$fixture/staging-receipts" -mindepth 1 -maxdepth 1 -type d -name "$fixture_commit.predeploy-data.*")
+[[ "$valid_retry" == true ]]
 echo 'staging Paperclip isolation contract: PASS'

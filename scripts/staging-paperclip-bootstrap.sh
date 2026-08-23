@@ -41,6 +41,7 @@ post_json() {
   local json="$2"
   local output="$3"
   curl --silent --show-error --output "$output" --write-out '%{http_code}' \
+    --connect-timeout 5 --max-time 15 \
     --cookie "$cookie_jar" --cookie-jar "$cookie_jar" \
     --header 'Content-Type: application/json' \
     --header "Origin: $PAPERCLIP_STAGING_PUBLIC_URL" \
@@ -55,9 +56,9 @@ if [[ ! "$status" =~ ^2 ]]; then
   [[ "$status" =~ ^2 ]] || { echo "staging bootstrap: sign-up/sign-in failed (HTTP $status)" >&2; exit 1; }
 fi
 
-health_json="$(curl --fail --silent "$PAPERCLIP_STAGING_PUBLIC_URL/api/health")"
+health_json="$(curl --connect-timeout 5 --max-time 15 --fail --silent "$PAPERCLIP_STAGING_PUBLIC_URL/api/health")"
 if [[ "$health_json" != *'"bootstrapStatus":"ready"'* ]]; then
-  invite_output="$(docker compose -p "$PAPERCLIP_STAGING_PROJECT" -f "$compose_file" exec -T server \
+  invite_output="$(timeout 60 docker compose -p "$PAPERCLIP_STAGING_PROJECT" -f "$compose_file" exec -T server \
     pnpm paperclipai auth bootstrap-ceo --data-dir /paperclip-staging --base-url "$PAPERCLIP_STAGING_PUBLIC_URL")"
   invite_token="$(printf '%s\n' "$invite_output" | sed -n 's#.*\/invite\/\(pcp_bootstrap_[[:alnum:]]*\).*#\1#p' | tail -1)"
   [[ -n "$invite_token" ]] || { echo "staging bootstrap: CLI returned no bootstrap token" >&2; exit 1; }
@@ -65,8 +66,8 @@ if [[ "$health_json" != *'"bootstrapStatus":"ready"'* ]]; then
   [[ "$status" =~ ^2 ]] || { echo "staging bootstrap: invite acceptance failed (HTTP $status)" >&2; exit 1; }
 fi
 
-session_json="$(curl --fail --silent --cookie "$cookie_jar" --cookie-jar "$cookie_jar" "$PAPERCLIP_STAGING_PUBLIC_URL/api/auth/get-session")"
-companies_json="$(curl --fail --silent --cookie "$cookie_jar" --cookie-jar "$cookie_jar" "$PAPERCLIP_STAGING_PUBLIC_URL/api/companies")"
+session_json="$(curl --connect-timeout 5 --max-time 15 --fail --silent --cookie "$cookie_jar" --cookie-jar "$cookie_jar" "$PAPERCLIP_STAGING_PUBLIC_URL/api/auth/get-session")"
+companies_json="$(curl --connect-timeout 5 --max-time 15 --fail --silent --cookie "$cookie_jar" --cookie-jar "$cookie_jar" "$PAPERCLIP_STAGING_PUBLIC_URL/api/companies")"
 jq -e '.user.id // .session.userId' >/dev/null <<<"$session_json"
 jq -e 'type == "array"' >/dev/null <<<"$companies_json"
 
@@ -81,6 +82,6 @@ second_signup_json="$(jq -cn --arg name 'Denied Staging User' --arg email "$seco
 second_status="$(post_json /api/auth/sign-up/email "$second_signup_json" "$scratch_dir/second-signup.json")"
 [[ "$second_status" == 403 ]] || { echo "staging bootstrap: signup-disabled contract returned HTTP $second_status, expected 403" >&2; exit 1; }
 jq -e '((.code // .error.code // "") | ascii_upcase | test("SIGN.?UP.*DISABLED")) or ((.message // .error.message // "") | ascii_downcase | test("sign.?up.*disabled"))' "$scratch_dir/second-signup.json" >/dev/null || { echo "staging bootstrap: explicit signup-disabled response missing" >&2; exit 1; }
-session_json="$(curl --fail --silent --cookie "$cookie_jar" --cookie-jar "$cookie_jar" "$PAPERCLIP_STAGING_PUBLIC_URL/api/auth/get-session")"
+session_json="$(curl --connect-timeout 5 --max-time 15 --fail --silent --cookie "$cookie_jar" --cookie-jar "$cookie_jar" "$PAPERCLIP_STAGING_PUBLIC_URL/api/auth/get-session")"
 jq -e '.user.id // .session.userId' >/dev/null <<<"$session_json"
 echo "staging bootstrap: authenticated UI/API smoke ready for $admin_email"
