@@ -1647,17 +1647,16 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     }
   }
 
-  async function finalizeAgentAfterSourceResolvedRun(run: typeof heartbeatRuns.$inferSelect, status: "succeeded" | "cancelled") {
-    const [runningCountRow] = await db
-      .select({ count: sql<number>`count(*)::int` })
-      .from(heartbeatRuns)
-      .where(and(eq(heartbeatRuns.agentId, run.agentId), eq(heartbeatRuns.status, "running")));
-    const runningCount = Number(runningCountRow?.count ?? 0);
-    const nextStatus = runningCount > 0 ? "running" : status === "succeeded" || status === "cancelled" ? "idle" : "error";
+  async function finalizeAgentAfterRecoveredRun(run: typeof heartbeatRuns.$inferSelect) {
     await db
       .update(agents)
       .set({
-        status: nextStatus,
+        status: sql`case when exists (
+          select 1 from ${heartbeatRuns}
+          where ${heartbeatRuns.agentId} = ${run.agentId}
+            and ${heartbeatRuns.status} = 'running'
+        ) then 'running' else 'idle' end`,
+        errorReason: null,
         lastHeartbeatAt: new Date(),
         updatedAt: new Date(),
       })
@@ -1803,7 +1802,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         cleanup,
       },
     });
-    await finalizeAgentAfterSourceResolvedRun(finalizedRun, finalRunStatus);
+    await finalizeAgentAfterRecoveredRun(finalizedRun);
     return { kind: "folded" as const, evaluationIssueId: input.existingEvaluation?.id ?? null };
   }
 
@@ -5600,6 +5599,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     }
 
     runningProcesses.delete(run.id);
+    await finalizeAgentAfterRecoveredRun(updated);
     // The run update above already committed the terminal status. The audit
     // event is best-effort: if the insert fails, the caller must still treat
     // the run as terminalized and clear the lock in the same sweep. So catch
