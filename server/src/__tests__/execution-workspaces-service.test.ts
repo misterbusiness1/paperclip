@@ -2905,6 +2905,16 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     });
   }, 30_000);
 
+  it("defers live delivery assessment from company lists to workspace detail", async () => {
+    const seeded = await seedTerminalWorkspace({ mergedPr: true });
+
+    const [listed] = await svc.list(seeded.companyId);
+    expect(listed?.deliveryState).toBe("unknown");
+
+    const detail = await svc.getById(seeded.executionWorkspaceId);
+    expect(detail?.deliveryState).toBe("merged_via_pr");
+  });
+
   it("inherits only runtime-service rows matching the current project workspace configuration and reuse scopes", async () => {
     const companyId = randomUUID();
     const projectId = randomUUID();
