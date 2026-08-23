@@ -550,7 +550,11 @@ export async function startServer(): Promise<StartedServer> {
 
   const requestedListenPort = config.port;
   const listenPort = await detectPort(requestedListenPort);
-  if (config.authBaseUrlMode === "explicit" && config.authPublicBaseUrl) {
+  if (
+    listenPort !== requestedListenPort &&
+    config.authBaseUrlMode === "explicit" &&
+    config.authPublicBaseUrl
+  ) {
     config.authPublicBaseUrl = rewriteLocalUrlPort(config.authPublicBaseUrl, listenPort);
   }
   

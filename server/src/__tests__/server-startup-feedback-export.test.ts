@@ -627,6 +627,23 @@ describe("startServer authenticated auth origin setup", () => {
       serverPort: 3211,
     });
   });
+
+  it("preserves an external auth port when the requested listen port is available", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      port: 3100,
+      allowedHostnames: ["127.0.0.1"],
+      authBaseUrlMode: "explicit",
+      authPublicBaseUrl: "http://127.0.0.1:3310",
+    }));
+    detectPortMock.mockResolvedValueOnce(3100);
+
+    await startServer();
+
+    expect(deriveAuthTrustedOriginsMock).toHaveBeenCalledWith(
+      expect.objectContaining({ authPublicBaseUrl: "http://127.0.0.1:3310" }),
+      { listenPort: 3100 },
+    );
+  });
 });
 
 describe("startServer PAPERCLIP_API_URL handling", () => {
