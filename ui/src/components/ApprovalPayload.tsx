@@ -61,6 +61,8 @@ export function approvalDecisionBrief(payload?: Record<string, unknown> | null) 
     cons: uniqueStrings(
       payload?.cons,
       payload?.risks,
+      payload?.riskAssessment,
+      payload?.brandRiskAssessment,
       payload?.reasonsNotToApprove,
       payload?.tradeoffs,
       payload?.drawbacks,
@@ -242,16 +244,10 @@ export function BoardApprovalPayload({
 }
 
 function BoardApprovalPayloadContent({ payload }: { payload: Record<string, unknown> }) {
-  const risks = Array.isArray(payload.risks)
-    ? payload.risks
-        .filter((value): value is string => typeof value === "string")
-        .map((value) => value.trim())
-        .filter(Boolean)
-    : [];
+  const brief = approvalDecisionBrief(payload);
   const title = firstNonEmptyString(payload.title);
   const summary = firstNonEmptyString(payload.summary);
-  const recommendedAction = firstNonEmptyString(payload.recommendedAction);
-  const nextActionOnApproval = firstNonEmptyString(payload.nextActionOnApproval);
+  const reasoning = brief.reasoning === summary ? null : brief.reasoning;
   const proposedComment = firstNonEmptyString(payload.proposedComment);
 
   return (
@@ -268,31 +264,30 @@ function BoardApprovalPayloadContent({ payload }: { payload: Record<string, unkn
           <p className="leading-6 text-foreground/90">{summary}</p>
         </div>
       )}
-      {recommendedAction && (
+      {brief.recommendation && (
         <div className="rounded-lg border border-amber-500/20 bg-amber-500/10 px-3.5 py-3">
           <p className="text-(length:--text-micro) font-medium uppercase tracking-(--tracking-label) text-amber-700 dark:text-amber-300">
             Recommended action
           </p>
-          <p className="mt-1 leading-6 text-foreground">{recommendedAction}</p>
+          <p className="mt-1 leading-6 text-foreground">{brief.recommendation}</p>
         </div>
       )}
-      {nextActionOnApproval && (
+      {reasoning && (
+        <div className="space-y-1">
+          <p className="text-(length:--text-micro) font-medium uppercase tracking-(--tracking-label) text-muted-foreground">Why</p>
+          <p className="leading-6 text-foreground/90">{reasoning}</p>
+        </div>
+      )}
+      {(brief.pros.length > 0 || brief.cons.length > 0) && (
+        <div className="grid gap-3 sm:grid-cols-2">
+          <DecisionList label="Pros" items={brief.pros} />
+          <DecisionList label="Cons & risks" items={brief.cons} />
+        </div>
+      )}
+      {brief.nextAction && (
         <div className="rounded-lg border border-border/60 bg-background/60 px-3.5 py-3">
           <p className="text-(length:--text-micro) font-medium uppercase tracking-(--tracking-label) text-muted-foreground">On approval</p>
-          <p className="mt-1 leading-6 text-foreground">{nextActionOnApproval}</p>
-        </div>
-      )}
-      {risks.length > 0 && (
-        <div className="space-y-1.5">
-          <p className="text-(length:--text-micro) font-medium uppercase tracking-(--tracking-label) text-muted-foreground">Risks</p>
-          <ul className="space-y-1 text-sm text-muted-foreground">
-            {risks.map((risk) => (
-              <li key={risk} className="flex items-start gap-2">
-                <span className="mt-2 h-1.5 w-1.5 rounded-full bg-muted-foreground/60" />
-                <span className="leading-6">{risk}</span>
-              </li>
-            ))}
-          </ul>
+          <p className="mt-1 leading-6 text-foreground">{brief.nextAction}</p>
         </div>
       )}
       {proposedComment && (
@@ -320,7 +315,26 @@ function EmailHeaderRow({ label, value }: { label: string; value: string }) {
   );
 }
 
+function DecisionList({ label, items }: { label: string; items: string[] }) {
+  if (items.length === 0) return null;
+
+  return (
+    <div className="space-y-1.5">
+      <p className="text-(length:--text-micro) font-medium uppercase tracking-(--tracking-label) text-muted-foreground">{label}</p>
+      <ul className="space-y-1 text-sm text-muted-foreground">
+        {items.map((item) => (
+          <li key={item} className="flex items-start gap-2">
+            <span className="mt-2 h-1.5 w-1.5 shrink-0 rounded-full bg-muted-foreground/60" />
+            <span className="leading-6">{item}</span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
 export function EmailReplyPayload({ payload }: { payload: Record<string, unknown> }) {
+  const brief = approvalDecisionBrief(payload);
   const channel = firstNonEmptyString(payload.channel);
   const recipient = firstNonEmptyString(payload.recipient);
   const subject = firstNonEmptyString(payload.subject);
@@ -328,13 +342,7 @@ export function EmailReplyPayload({ payload }: { payload: Record<string, unknown
   const gate = firstNonEmptyString(payload.gate);
   const body = firstNonEmptyString(payload.body) ?? "";
   const intent = firstNonEmptyString(payload.intent);
-  const recommendedAction = firstNonEmptyString(payload.recommendedAction);
-  const risks = Array.isArray(payload.risks)
-    ? payload.risks
-        .filter((value): value is string => typeof value === "string")
-        .map((value) => value.trim())
-        .filter(Boolean)
-    : [];
+  const reasoning = brief.reasoning === intent ? null : brief.reasoning;
 
   return (
     <div className="mt-4 space-y-3.5 text-sm">
@@ -366,25 +374,24 @@ export function EmailReplyPayload({ payload }: { payload: Record<string, unknown
           <p className="leading-6 text-foreground/90">{intent}</p>
         </div>
       )}
-      {recommendedAction && (
+      {brief.recommendation && (
         <div className="rounded-lg border border-amber-500/20 bg-amber-500/10 px-3.5 py-3">
           <p className="text-(length:--text-micro) font-medium uppercase tracking-(--tracking-label) text-amber-700 dark:text-amber-300">
             Recommended action
           </p>
-          <p className="mt-1 leading-6 text-foreground">{recommendedAction}</p>
+          <p className="mt-1 leading-6 text-foreground">{brief.recommendation}</p>
         </div>
       )}
-      {risks.length > 0 && (
-        <div className="space-y-1.5">
-          <p className="text-(length:--text-micro) font-medium uppercase tracking-(--tracking-label) text-muted-foreground">Risks</p>
-          <ul className="space-y-1 text-sm text-muted-foreground">
-            {risks.map((risk) => (
-              <li key={risk} className="flex items-start gap-2">
-                <span className="mt-2 h-1.5 w-1.5 rounded-full bg-muted-foreground/60" />
-                <span className="leading-6">{risk}</span>
-              </li>
-            ))}
-          </ul>
+      {reasoning && (
+        <div className="space-y-1">
+          <p className="text-(length:--text-micro) font-medium uppercase tracking-(--tracking-label) text-muted-foreground">Why</p>
+          <p className="leading-6 text-foreground/90">{reasoning}</p>
+        </div>
+      )}
+      {(brief.pros.length > 0 || brief.cons.length > 0) && (
+        <div className="grid gap-3 sm:grid-cols-2">
+          <DecisionList label="Pros" items={brief.pros} />
+          <DecisionList label="Cons & risks" items={brief.cons} />
         </div>
       )}
     </div>
