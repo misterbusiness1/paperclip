@@ -13,7 +13,7 @@ This lane runs a Paperclip commit as an isolated Compose project. It does not us
 
 ## Reviewed host command packet
 
-Run these commands only on the dedicated Paperclip staging host after this change is reviewed. Use a managed secret directory outside the repository. The files must contain new staging-only random values.
+Run these commands only on the existing approved Paperclip control-plane host after this change is reviewed. The isolated Compose project runs beside production on that host; it must not run on either WordPress/Sevalla host. Use a managed secret directory outside the repository, owned by the deploy user with directory mode `0700` and both files mode `0600`. The files must contain new staging-only random values.
 
 ```sh
 export PAPERCLIP_STAGING_COMMIT=<reviewed-full-git-sha>
@@ -22,11 +22,16 @@ export PAPERCLIP_PRODUCTION_PROJECT=<exact-production-compose-project>
 export PAPERCLIP_STAGING_PORT=3310
 export PAPERCLIP_STAGING_PUBLIC_URL=http://127.0.0.1:3310
 export PAPERCLIP_STAGING_SECRET_DIR=/run/occ-paperclip-staging
+install -d -m 0700 /run/occ-paperclip-staging
+# Provision better-auth-secret and postgres-password through the approved
+# managed-secret mechanism, then chmod 0600 both files before continuing.
 ./scripts/staging-paperclip-deploy.sh
 
 export PAPERCLIP_STAGING_ADMIN_PASSWORD=<runtime-only-synthetic-password>
 ./scripts/staging-paperclip-bootstrap.sh
 ```
+
+Bootstrap briefly permits the first synthetic account, then force-recreates only the staging server with `PAPERCLIP_AUTH_DISABLE_SIGN_UP=true`. It fails unless a second synthetic signup is denied and the original authenticated session remains valid.
 
 Give Browser QA the explicit private tunnel endpoint that maps to `127.0.0.1:3310`. Do not expose the port on a public interface.
 

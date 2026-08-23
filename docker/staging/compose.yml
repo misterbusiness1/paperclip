@@ -2,7 +2,7 @@ name: ${PAPERCLIP_STAGING_PROJECT:?set PAPERCLIP_STAGING_PROJECT}
 
 services:
   db:
-    image: postgres:17.6-alpine
+    image: pgvector/pgvector:pg16
     restart: unless-stopped
     environment:
       POSTGRES_USER: paperclip_staging
@@ -30,6 +30,7 @@ services:
 
   server:
     image: ${PAPERCLIP_STAGING_IMAGE:?set PAPERCLIP_STAGING_IMAGE}
+    pull_policy: never
     restart: unless-stopped
     init: true
     command:
@@ -38,7 +39,7 @@ services:
       - |
         export BETTER_AUTH_SECRET="$$(cat /run/secrets/better_auth_secret)"
         export DATABASE_URL="postgres://paperclip_staging:$$(cat /run/secrets/postgres_password)@db:5432/paperclip_staging"
-        exec /usr/local/bin/docker-entrypoint.sh node --import ./server/node_modules/tsx/dist/loader.mjs server/dist/index.js
+        exec node --import ./server/node_modules/tsx/dist/loader.mjs server/dist/index.js
     environment:
       HOST: 0.0.0.0
       PORT: "3100"
@@ -48,6 +49,7 @@ services:
       PAPERCLIP_CONFIG: /paperclip-staging/instances/occ-staging/config.json
       PAPERCLIP_DEPLOYMENT_MODE: authenticated
       PAPERCLIP_DEPLOYMENT_EXPOSURE: private
+      PAPERCLIP_AUTH_DISABLE_SIGN_UP: ${PAPERCLIP_STAGING_AUTH_DISABLE_SIGN_UP:-false}
       PAPERCLIP_PUBLIC_URL: ${PAPERCLIP_STAGING_PUBLIC_URL:?set PAPERCLIP_STAGING_PUBLIC_URL}
       PAPERCLIP_ALLOWED_HOSTNAMES: ${PAPERCLIP_STAGING_ALLOWED_HOSTNAMES:-127.0.0.1,localhost}
     secrets:

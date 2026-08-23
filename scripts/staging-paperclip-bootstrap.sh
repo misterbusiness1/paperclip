@@ -15,7 +15,7 @@ require_staging_preflight
 
 admin_name="${PAPERCLIP_STAGING_ADMIN_NAME:-OCC Staging Admin}"
 admin_email="${PAPERCLIP_STAGING_ADMIN_EMAIL:-paperclip-staging@oxfordcigar.invalid}"
-compose_file="${PAPERCLIP_STAGING_COMPOSE_FILE:-docker/staging/compose.yml}"
+compose_file="$repo_root/docker/staging/compose.yml"
 scratch_dir="$(mktemp -d "${TMPDIR:-/tmp}/paperclip-staging-bootstrap.XXXXXX")"
 cookie_jar="$scratch_dir/cookies"
 trap 'rm -rf "$scratch_dir"' EXIT
@@ -53,4 +53,15 @@ session_json="$(curl --fail --silent --cookie "$cookie_jar" --cookie-jar "$cooki
 companies_json="$(curl --fail --silent --cookie "$cookie_jar" --cookie-jar "$cookie_jar" "$PAPERCLIP_STAGING_PUBLIC_URL/api/companies")"
 jq -e '.user.id // .session.userId' >/dev/null <<<"$session_json"
 jq -e 'type == "array"' >/dev/null <<<"$companies_json"
+
+# Bootstrap is the only interval in which signup is enabled. Recreate only the
+# isolated server service with signup disabled, then prove the seeded session
+# survives and a second synthetic signup is denied.
+export PAPERCLIP_STAGING_AUTH_DISABLE_SIGN_UP=true
+docker compose -p "$PAPERCLIP_STAGING_PROJECT" -f "$compose_file" up -d --wait --force-recreate --no-deps server
+second_signup_json="$(jq -cn --arg name 'Denied Staging User' --arg email 'paperclip-staging-denied@oxfordcigar.invalid' --arg password "$PAPERCLIP_STAGING_ADMIN_PASSWORD" '{name:$name,email:$email,password:$password}')"
+second_status="$(post_json /api/auth/sign-up/email "$second_signup_json" "$scratch_dir/second-signup.json")"
+[[ "$second_status" =~ ^(400|401|403|404|409|422)$ ]] || { echo "staging bootstrap: second signup was not denied (HTTP $second_status)" >&2; exit 1; }
+session_json="$(curl --fail --silent --cookie "$cookie_jar" --cookie-jar "$cookie_jar" "$PAPERCLIP_STAGING_PUBLIC_URL/api/auth/get-session")"
+jq -e '.user.id // .session.userId' >/dev/null <<<"$session_json"
 echo "staging bootstrap: authenticated UI/API smoke ready for $admin_email"

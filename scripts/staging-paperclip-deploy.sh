@@ -50,6 +50,7 @@ jq -e --arg project "$PAPERCLIP_STAGING_PROJECT" '
   .volumes["staging-runtime"].name == ($project + "_runtime") and
   .networks.staging.name == ($project + "_network")
 ' >/dev/null <<<"$resolved_compose" || { echo "resolved Compose resources violate staging isolation" >&2; exit 2; }
+require_staging_resource_labels
 prior_image_id="$(docker compose -p "$PAPERCLIP_STAGING_PROJECT" -f "$compose_file" images -q server 2>/dev/null | head -1 || true)"
 
 write_failure_receipt() {
@@ -110,6 +111,9 @@ docker build --pull --target production \
   --build-arg "PAPERCLIP_BUILD_VERSION=staging-$PAPERCLIP_STAGING_COMMIT" \
   --label "org.opencontainers.image.revision=$PAPERCLIP_STAGING_COMMIT" \
   --tag "$PAPERCLIP_STAGING_IMAGE" "$repo_root"
+local_image_id="$(docker image inspect "$PAPERCLIP_STAGING_IMAGE" --format '{{.Id}}')"
+local_image_revision="$(docker image inspect "$PAPERCLIP_STAGING_IMAGE" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')"
+[[ -n "$local_image_id" && "$local_image_revision" == "$PAPERCLIP_STAGING_COMMIT" ]] || { echo "locally built image provenance does not match reviewed commit" >&2; exit 2; }
 docker compose -p "$PAPERCLIP_STAGING_PROJECT" -f "$compose_file" up -d --wait
 
 after_prod="$(snapshot_production)"

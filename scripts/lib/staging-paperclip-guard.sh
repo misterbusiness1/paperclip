@@ -29,8 +29,33 @@ require_staging_secret_dir() {
   [[ -d "$requested" ]] || { staging_die "staging secret directory does not exist"; return 2; }
   resolved="$(realpath -e -- "$requested")" || { staging_die "cannot resolve staging secret directory"; return 2; }
   [[ "$resolved" == "$PAPERCLIP_APPROVED_STAGING_SECRET_DIR" ]] || { staging_die "unapproved staging secret directory"; return 2; }
+  [[ "$(stat -c '%a' "$resolved")" == "700" ]] || { staging_die "staging secret directory must have mode 0700"; return 2; }
+  [[ "$(stat -c '%u' "$resolved")" == "$(id -u)" ]] || { staging_die "staging secret directory must be owned by the deploy user"; return 2; }
+  local secret_file
+  for secret_file in better-auth-secret postgres-password; do
+    [[ -f "$resolved/$secret_file" && ! -L "$resolved/$secret_file" ]] || { staging_die "required staging secret file is missing or not regular"; return 2; }
+    [[ "$(stat -c '%a' "$resolved/$secret_file")" == "600" ]] || { staging_die "staging secret files must have mode 0600"; return 2; }
+    [[ "$(stat -c '%u' "$resolved/$secret_file")" == "$(id -u)" ]] || { staging_die "staging secret files must be owned by the deploy user"; return 2; }
+  done
   PAPERCLIP_STAGING_SECRET_DIR="$resolved"
   export PAPERCLIP_STAGING_SECRET_DIR
+}
+
+require_staging_resource_labels() {
+  local container service volume network
+  while read -r container; do
+    [[ -z "$container" ]] && continue
+    service="$(docker inspect --format '{{index .Config.Labels "com.docker.compose.service"}}' "$container")"
+    [[ "$service" == "db" || "$service" == "server" ]] || { staging_die "unexpected container in staging project"; return 2; }
+  done < <(docker ps --all --filter "label=com.docker.compose.project=$PAPERCLIP_APPROVED_STAGING_PROJECT" --format '{{.ID}}')
+  for volume in "${PAPERCLIP_APPROVED_STAGING_PROJECT}_db" "${PAPERCLIP_APPROVED_STAGING_PROJECT}_runtime"; do
+    docker volume inspect "$volume" >/dev/null 2>&1 || continue
+    [[ "$(docker volume inspect --format '{{index .Labels "com.docker.compose.project"}}' "$volume")" == "$PAPERCLIP_APPROVED_STAGING_PROJECT" ]] || { staging_die "staging volume lacks the approved project label"; return 2; }
+  done
+  network="${PAPERCLIP_APPROVED_STAGING_PROJECT}_network"
+  if docker network inspect "$network" >/dev/null 2>&1; then
+    [[ "$(docker network inspect --format '{{index .Labels "com.docker.compose.project"}}' "$network")" == "$PAPERCLIP_APPROVED_STAGING_PROJECT" ]] || { staging_die "staging network lacks the approved project label"; return 2; }
+  fi
 }
 
 require_staging_preflight() {
