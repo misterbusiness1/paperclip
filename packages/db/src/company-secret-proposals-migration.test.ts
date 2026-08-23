@@ -30,15 +30,19 @@ describeEmbeddedPostgres("company secret proposals migration", () => {
     const sql = postgres(database.connectionString, { max: 1 });
     cleanups.push(async () => sql.end());
 
-    await sql`DELETE FROM "drizzle"."__drizzle_migrations" WHERE "hash" = ${await migrationHash()}`;
-
-    await expect(applyPendingMigrations(database.connectionString)).resolves.toBeUndefined();
-
-    const [result] = await sql<{ constraints: number; indexes: number }[]>`
+    const readSchemaCounts = async () => {
+      const [result] = await sql<{ constraints: number; indexes: number }[]>`
       SELECT
         (SELECT count(*)::int FROM pg_constraint WHERE conrelid = 'company_secret_proposals'::regclass AND contype <> 'n') AS constraints,
         (SELECT count(*)::int FROM pg_indexes WHERE tablename = 'company_secret_proposals') AS indexes
-    `;
-    expect(result).toEqual({ constraints: 13, indexes: 5 });
+      `;
+      return result;
+    };
+    const before = await readSchemaCounts();
+
+    await sql`DELETE FROM "drizzle"."__drizzle_migrations" WHERE "hash" = ${await migrationHash()}`;
+    await expect(applyPendingMigrations(database.connectionString)).resolves.toBeUndefined();
+
+    expect(await readSchemaCounts()).toEqual(before);
   });
 });

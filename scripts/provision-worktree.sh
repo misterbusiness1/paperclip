@@ -170,6 +170,23 @@ function expandHomePrefix(value) {
   return value;
 }
 
+function canonicalPath(value) {
+  const resolved = path.resolve(value);
+  const suffix = [];
+  let existing = resolved;
+  while (!fs.existsSync(existing)) {
+    const parent = path.dirname(existing);
+    if (parent === existing) return resolved;
+    suffix.unshift(path.basename(existing));
+    existing = parent;
+  }
+  try {
+    return path.join(fs.realpathSync(existing), ...suffix);
+  } catch {
+    return resolved;
+  }
+}
+
 function parseEnvFile(contents) {
   const entries = {};
   for (const rawLine of contents.split(/\r?\n/)) {
@@ -196,29 +213,30 @@ function fail(reason) {
   process.exit(1);
 }
 
-const configPath = path.resolve(process.env.WORKTREE_CONFIG_PATH);
-const envPath = path.resolve(process.env.WORKTREE_ENV_PATH);
+const configPath = canonicalPath(process.env.WORKTREE_CONFIG_PATH);
+const envPath = canonicalPath(process.env.WORKTREE_ENV_PATH);
 const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
 const env = parseEnvFile(fs.readFileSync(envPath, "utf8"));
 const envConfigPath = expandHomePrefix(env.PAPERCLIP_CONFIG);
-if (envConfigPath && path.resolve(envConfigPath) !== configPath) {
+if (envConfigPath && canonicalPath(envConfigPath) !== configPath) {
   fail(`existing worktree env points at ${envConfigPath}, not ${configPath}`);
 }
 
-const homeDir = expandHomePrefix(env.PAPERCLIP_HOME);
+const rawHomeDir = expandHomePrefix(env.PAPERCLIP_HOME);
 const instanceId = env.PAPERCLIP_INSTANCE_ID;
 const expectedInstanceId = process.env.WORKTREE_INSTANCE_ID;
-if (!homeDir || !instanceId) {
+if (!rawHomeDir || !instanceId) {
   fail("existing worktree env is missing PAPERCLIP_HOME or PAPERCLIP_INSTANCE_ID");
 }
 if (instanceId !== expectedInstanceId) {
   fail(`existing worktree env names legacy or mismatched instance ${instanceId}, expected ${expectedInstanceId}`);
 }
-if (!fs.existsSync(homeDir)) {
-  fail(`existing worktree home does not exist on this host: ${homeDir}`);
+if (!fs.existsSync(rawHomeDir)) {
+  fail(`existing worktree home does not exist on this host: ${rawHomeDir}`);
 }
 
-const instanceRoot = path.resolve(homeDir, "instances", instanceId);
+const homeDir = canonicalPath(rawHomeDir);
+const instanceRoot = canonicalPath(path.resolve(homeDir, "instances", instanceId));
 const runtimePaths = [
   config.database?.embeddedPostgresDataDir,
   config.database?.backup?.dir,
@@ -228,7 +246,7 @@ const runtimePaths = [
 ].filter((value) => typeof value === "string" && value.length > 0);
 
 for (const rawValue of runtimePaths) {
-  const resolved = path.resolve(expandHomePrefix(rawValue));
+  const resolved = canonicalPath(expandHomePrefix(rawValue));
   const relative = path.relative(instanceRoot, resolved);
   if (relative.startsWith("..") || path.isAbsolute(relative)) {
     fail(`existing worktree config path is outside ${instanceRoot}: ${resolved}`);

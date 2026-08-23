@@ -82,6 +82,11 @@ test("shard flags are rejected for the workspaces-b group", () => {
   assert.notEqual(result.status, 0, "workspaces-b must not accept shard flags");
 });
 
+test("the stable runner excludes generated test output", () => {
+  const result = dryRunJson(["--mode", "general", "--group", "general-workspaces-b"]);
+  assert.deepEqual(result.vitestExcludePatterns, ["**/dist/**"]);
+});
+
 test("workspaces-a shards map to Vitest native --shard slices over a stable project list", () => {
   const shards = [0, 1].map((index) =>
     dryRunJson([

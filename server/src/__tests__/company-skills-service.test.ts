@@ -50,6 +50,12 @@ describeEmbeddedPostgres("companySkillService.list", () => {
     return skillDir;
   }
 
+  async function createWorkspaceDir(prefix: string) {
+    const workspaceDir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), prefix)));
+    cleanupDirs.add(workspaceDir);
+    return workspaceDir;
+  }
+
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-company-skills-service-");
     oldPaperclipHome = process.env.PAPERCLIP_HOME;
@@ -2128,8 +2134,7 @@ describeEmbeddedPostgres("companySkillService.list", () => {
     const companyId = randomUUID();
     const projectId = randomUUID();
     const workspaceId = randomUUID();
-    const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skill-browse-"));
-    cleanupDirs.add(workspaceDir);
+    const workspaceDir = await createWorkspaceDir("paperclip-skill-browse-");
     const skillDir = path.join(workspaceDir, "content", "teams", "editorial");
     await fs.mkdir(skillDir, { recursive: true });
     await fs.writeFile(path.join(skillDir, "SKILL.md"), "---\nname: Editorial\n---\n", "utf8");
@@ -2188,8 +2193,7 @@ describeEmbeddedPostgres("companySkillService.list", () => {
     const companyId = randomUUID();
     const projectId = randomUUID();
     const workspaceId = randomUUID();
-    const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skill-preview-"));
-    cleanupDirs.add(workspaceDir);
+    const workspaceDir = await createWorkspaceDir("paperclip-skill-preview-");
     const codexSkillDir = path.join(workspaceDir, ".codex", "skills", "preview-codex");
     const cursorSkillDir = path.join(workspaceDir, ".cursor", "skills", "preview-cursor");
     await fs.mkdir(codexSkillDir, { recursive: true });
@@ -2247,8 +2251,7 @@ describeEmbeddedPostgres("companySkillService.list", () => {
     const companyId = randomUUID();
     const projectId = randomUUID();
     const workspaceId = randomUUID();
-    const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skill-same-path-"));
-    cleanupDirs.add(workspaceDir);
+    const workspaceDir = await createWorkspaceDir("paperclip-skill-same-path-");
     const skillDir = path.join(workspaceDir, ".codex", "skills", "same-path");
     await fs.mkdir(skillDir, { recursive: true });
     await fs.writeFile(path.join(skillDir, "SKILL.md"), "---\nname: Same Path\n---\n", "utf8");
@@ -2295,9 +2298,8 @@ describeEmbeddedPostgres("companySkillService.list", () => {
     const projectId = randomUUID();
     const workspaceId = randomUUID();
     const bundledSkillId = randomUUID();
-    const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skill-built-in-"));
+    const workspaceDir = await createWorkspaceDir("paperclip-skill-built-in-");
     const bundledSkillDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skill-bundled-source-"));
-    cleanupDirs.add(workspaceDir);
     cleanupDirs.add(bundledSkillDir);
     const skillDir = path.join(workspaceDir, ".claude", "skills", "built-in-review");
     await fs.mkdir(skillDir, { recursive: true });
@@ -2354,9 +2356,8 @@ describeEmbeddedPostgres("companySkillService.list", () => {
     const projectId = randomUUID();
     const workspaceId = randomUUID();
     const existingSkillId = randomUUID();
-    const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skill-rename-"));
+    const workspaceDir = await createWorkspaceDir("paperclip-skill-rename-");
     const existingSkillDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skill-existing-"));
-    cleanupDirs.add(workspaceDir);
     cleanupDirs.add(existingSkillDir);
     const skillDir = path.join(workspaceDir, ".cursor", "skills", "shared-skill");
     await fs.mkdir(skillDir, { recursive: true });
@@ -2424,8 +2425,7 @@ describeEmbeddedPostgres("companySkillService.list", () => {
     const companyId = randomUUID();
     const projectId = randomUUID();
     const workspaceId = randomUUID();
-    const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skill-selective-"));
-    cleanupDirs.add(workspaceDir);
+    const workspaceDir = await createWorkspaceDir("paperclip-skill-selective-");
     const selectedSkillDir = path.join(workspaceDir, ".gemini", "skills", "selected-skill");
     const ignoredSkillDir = path.join(workspaceDir, ".opencode", "skills", "ignored-skill");
     const ignoredLinkedSkillDir = path.join(workspaceDir, ".claude", "skills", "ignored-link");
@@ -2499,12 +2499,11 @@ describeEmbeddedPostgres("companySkillService.list", () => {
     const companyId = randomUUID();
     const projectId = randomUUID();
     const workspaceId = randomUUID();
-    const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skill-scope-"));
+    const workspaceDir = await createWorkspaceDir("paperclip-skill-scope-");
     const otherCompanyId = randomUUID();
     const otherProjectId = randomUUID();
     const otherWorkspaceId = randomUUID();
     const otherWorkspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skill-scope-other-"));
-    cleanupDirs.add(workspaceDir);
     cleanupDirs.add(otherWorkspaceDir);
 
     const selectedSkillDir = path.join(workspaceDir, ".gemini", "skills", "selected-skill");
@@ -2595,9 +2594,8 @@ describeEmbeddedPostgres("companySkillService.list", () => {
     const companyId = randomUUID();
     const projectId = randomUUID();
     const workspaceId = randomUUID();
-    const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skill-symlink-"));
+    const workspaceDir = await createWorkspaceDir("paperclip-skill-symlink-");
     const outsideDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skill-outside-"));
-    cleanupDirs.add(workspaceDir);
     cleanupDirs.add(outsideDir);
     const linkedSkillDir = path.join(workspaceDir, ".codex", "skills", "linked-skill");
     const outsideSkillFile = path.join(outsideDir, "outside-skill.md");
@@ -2665,8 +2663,7 @@ describeEmbeddedPostgres("companySkillService.list", () => {
     const projectId = randomUUID();
     const workspaceId = randomUUID();
     const folderSvc = folderService(db);
-    const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skill-project-folder-"));
-    cleanupDirs.add(workspaceDir);
+    const workspaceDir = await createWorkspaceDir("paperclip-skill-project-folder-");
     const skillDir = path.join(workspaceDir, "skills", "project-skill");
     const skillFile = path.join(skillDir, "SKILL.md");
     await fs.mkdir(skillDir, { recursive: true });
