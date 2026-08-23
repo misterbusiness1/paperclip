@@ -586,6 +586,7 @@ export {
 } from "./goal.js";
 
 export {
+  createApprovalInputSchema,
   createApprovalSchema,
   decisionReadyApprovalPayloadSchema,
   resolveApprovalSchema,

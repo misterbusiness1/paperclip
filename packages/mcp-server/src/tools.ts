@@ -3,6 +3,7 @@ import {
   addIssueCommentSchema,
   askUserQuestionsPayloadSchema,
   checkoutIssueSchema,
+  createApprovalInputSchema,
   createApprovalSchema,
   createIssueInputSchema,
   issueThreadInteractionContinuationPolicySchema,
@@ -166,7 +167,7 @@ const approvalDecisionSchema = z.object({
 
 const createApprovalToolSchema = z.object({
   companyId: companyIdOptional,
-}).merge(createApprovalSchema);
+}).merge(createApprovalInputSchema);
 
 const apiRequestSchema = z.object({
   method: z.enum(["GET", "POST", "PUT", "PATCH", "DELETE"]),
@@ -431,10 +432,12 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
       "paperclipCreateApproval",
       "Create a board approval request, optionally linked to one or more issues",
       createApprovalToolSchema,
-      async ({ companyId, ...body }) =>
-        client.requestJson("POST", `/companies/${client.resolveCompanyId(companyId)}/approvals`, {
-          body,
-        }),
+      async ({ companyId, ...body }) => {
+        const approval = createApprovalSchema.parse(body);
+        return client.requestJson("POST", `/companies/${client.resolveCompanyId(companyId)}/approvals`, {
+          body: approval,
+        });
+      },
     ),
     makeTool(
       "paperclipGetApproval",

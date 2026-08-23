@@ -1823,6 +1823,7 @@ export {
   updateGoalSchema,
   type CreateGoal,
   type UpdateGoal,
+  createApprovalInputSchema,
   createApprovalSchema,
   decisionReadyApprovalPayloadSchema,
   upsertBudgetPolicySchema,

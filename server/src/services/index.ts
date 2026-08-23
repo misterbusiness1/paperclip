@@ -159,6 +159,12 @@ export {
 export { executionWorkspaceService } from "./execution-workspaces.js";
 export { workspaceOperationService } from "./workspace-operations.js";
 export { workspaceFileResourceService } from "./workspace-file-resources.js";
+export {
+  createWorkspaceGitOperationScheduler,
+  getWorkspaceGitOperationSchedulerSnapshot,
+  workspaceGitOperationScheduler,
+  type WorkspaceGitSchedulerSnapshot,
+} from "./workspace-git-operation-scheduler.js";
 export { workProductService } from "./work-products.js";
 export {
   logActivity,
