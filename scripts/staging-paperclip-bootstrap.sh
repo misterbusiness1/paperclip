@@ -59,8 +59,10 @@ fi
 
 health_json="$(curl --connect-timeout 5 --max-time 15 --fail --silent "$PAPERCLIP_STAGING_PUBLIC_URL/api/health")"
 if [[ "$health_json" != *'"bootstrapStatus":"ready"'* ]]; then
+  # shellcheck disable=SC2016 # Expand the secret and positional URL inside the container shell.
   invite_output="$(timeout 60 docker compose -p "$PAPERCLIP_STAGING_PROJECT" -f "$compose_file" exec -T server \
-    pnpm paperclipai auth bootstrap-ceo --data-dir /paperclip-staging --base-url "$PAPERCLIP_STAGING_PUBLIC_URL")"
+    bash -euc 'export DATABASE_URL="postgres://paperclip_staging:$(cat /run/secrets/postgres_password)@db:5432/paperclip_staging"; exec pnpm paperclipai auth bootstrap-ceo --data-dir /paperclip-staging --base-url "$1"' \
+    -- "$PAPERCLIP_STAGING_PUBLIC_URL")"
   invite_token="$(printf '%s\n' "$invite_output" | sed -n 's#.*\/invite\/\(pcp_bootstrap_[[:alnum:]]*\).*#\1#p' | tail -1)"
   [[ -n "$invite_token" ]] || { echo "staging bootstrap: CLI returned no bootstrap token" >&2; exit 1; }
   status="$(post_json "/api/invites/$invite_token/accept" '{"requestType":"human"}' "$scratch_dir/accept.json")"
