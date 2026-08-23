@@ -79,8 +79,9 @@ if (( resource_count != 0 )); then
     && -n "$db_container" && -n "$server_container" && -n "$prior_image_id" ]] \
     || { echo "staging resources are orphaned or incomplete; refusing mutation" >&2; exit 2; }
   inspected_prior_id="$(docker image inspect "$prior_image_id" --format '{{.Id}}' 2>/dev/null || true)"
-  [[ -n "$inspected_prior_id" && "$inspected_prior_id" == "$prior_image_id" ]] \
+  [[ "$inspected_prior_id" =~ ^sha256:[0-9a-f]{64}$ ]] \
     || { echo "prior staging image is not an immutable local image ID" >&2; exit 2; }
+  prior_image_id="$inspected_prior_id"
 elif [[ -n "$prior_image_id" ]]; then
   echo "staging image exists without a coherent prior stack; refusing mutation" >&2
   exit 2
