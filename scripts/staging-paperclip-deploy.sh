@@ -106,7 +106,7 @@ if [[ -n "$prior_image_id" ]]; then
 fi
 
 mutation_started=true
-docker build --pull --target production \
+timeout "${PAPERCLIP_STAGING_BUILD_TIMEOUT_SECONDS:-900}" docker build --pull --target production \
   --build-arg "PAPERCLIP_BUILD_COMMIT=$PAPERCLIP_STAGING_COMMIT" \
   --build-arg "PAPERCLIP_BUILD_VERSION=staging-$PAPERCLIP_STAGING_COMMIT" \
   --label "org.opencontainers.image.revision=$PAPERCLIP_STAGING_COMMIT" \
@@ -114,7 +114,7 @@ docker build --pull --target production \
 local_image_id="$(docker image inspect "$PAPERCLIP_STAGING_IMAGE" --format '{{.Id}}')"
 local_image_revision="$(docker image inspect "$PAPERCLIP_STAGING_IMAGE" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')"
 [[ -n "$local_image_id" && "$local_image_revision" == "$PAPERCLIP_STAGING_COMMIT" ]] || { echo "locally built image provenance does not match reviewed commit" >&2; exit 2; }
-docker compose -p "$PAPERCLIP_STAGING_PROJECT" -f "$compose_file" up -d --wait
+timeout "${PAPERCLIP_STAGING_START_TIMEOUT_SECONDS:-300}" docker compose -p "$PAPERCLIP_STAGING_PROJECT" -f "$compose_file" up -d --wait
 
 after_prod="$(snapshot_production)"
 require_unchanged_production_identity "$before_prod" "$after_prod"
