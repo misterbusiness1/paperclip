@@ -1,4 +1,13 @@
-import { createReadStream, createWriteStream, existsSync, mkdirSync, readdirSync, statSync, unlinkSync } from "node:fs";
+import {
+  createReadStream,
+  createWriteStream,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+} from "node:fs";
 import { basename, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { spawn } from "node:child_process";
@@ -553,7 +562,9 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
   mkdirSync(opts.backupDir, { recursive: true });
   const sqlFile = resolve(opts.backupDir, `${filenamePrefix}-${timestamp()}.sql`);
   const backupFile = `${sqlFile}.gz`;
-  const writer = createBufferedTextFileWriter(sqlFile);
+  const partialSqlFile = `${sqlFile}.partial`;
+  const partialBackupFile = `${backupFile}.partial`;
+  const writer = createBufferedTextFileWriter(partialSqlFile);
 
   try {
     if (backupEngine === "pg_dump" || (backupEngine === "auto" && canUsePgDump)) {
@@ -562,11 +573,12 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
         await closeSql();
         await runPgDumpBackup({
           connectionString: opts.connectionString,
-          backupFile,
+          backupFile: partialBackupFile,
           connectTimeout,
         });
         await writer.abort();
-        const sizeBytes = validatedBackupSize(backupFile);
+        const sizeBytes = validatedBackupSize(partialBackupFile);
+        renameSync(partialBackupFile, backupFile);
         const prunedCount = pruneOldBackups(opts.backupDir, retention, filenamePrefix);
         return {
           backupFile,
@@ -574,8 +586,8 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
           prunedCount,
         };
       } catch (error) {
-        if (existsSync(backupFile)) {
-          try { unlinkSync(backupFile); } catch { /* ignore */ }
+        if (existsSync(partialBackupFile)) {
+          try { unlinkSync(partialBackupFile); } catch { /* ignore */ }
         }
         if (backupEngine === "pg_dump") {
           throw error;
@@ -992,12 +1004,13 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
     await writer.close();
 
     // Compress the SQL file with gzip
-    const sqlReadStream = createReadStream(sqlFile);
-    const gzWriteStream = createWriteStream(backupFile);
+    const sqlReadStream = createReadStream(partialSqlFile);
+    const gzWriteStream = createWriteStream(partialBackupFile);
     await pipeline(sqlReadStream, createGzip(), gzWriteStream);
-    unlinkSync(sqlFile);
+    unlinkSync(partialSqlFile);
 
-    const sizeBytes = validatedBackupSize(backupFile);
+    const sizeBytes = validatedBackupSize(partialBackupFile);
+    renameSync(partialBackupFile, backupFile);
     const prunedCount = pruneOldBackups(opts.backupDir, retention, filenamePrefix);
 
     return {
@@ -1007,17 +1020,17 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
     };
   } catch (error) {
     await writer.abort();
-    if (existsSync(backupFile)) {
-      try { unlinkSync(backupFile); } catch { /* ignore */ }
+    if (existsSync(partialBackupFile)) {
+      try { unlinkSync(partialBackupFile); } catch { /* ignore */ }
     }
-    if (existsSync(sqlFile)) {
-      try { unlinkSync(sqlFile); } catch { /* ignore */ }
+    if (existsSync(partialSqlFile)) {
+      try { unlinkSync(partialSqlFile); } catch { /* ignore */ }
     }
     throw error;
   } finally {
     await closeSql();
-    if (existsSync(sqlFile)) {
-      try { unlinkSync(sqlFile); } catch { /* ignore */ }
+    if (existsSync(partialSqlFile)) {
+      try { unlinkSync(partialSqlFile); } catch { /* ignore */ }
     }
   }
 }
