@@ -149,7 +149,7 @@ describe("built-in agent routes", () => {
     expect(mockBuiltInAgentService.list).not.toHaveBeenCalled();
   });
 
-  it("returns 404 and does not load built-in state when the experimental flag is disabled", async () => {
+  it("returns an empty list and does not load built-in state when the experimental flag is disabled", async () => {
     mockInstanceSettingsService.getExperimental.mockResolvedValue({ enableBuiltInAgents: false });
     const app = await createApp({
       type: "board",
@@ -161,9 +161,27 @@ describe("built-in agent routes", () => {
 
     const res = await request(app).get(`/api/companies/${companyId}/built-in-agents`);
 
-    expect(res.status, JSON.stringify(res.body)).toBe(404);
-    expect(res.body.error).toContain("Built-in agents are not enabled");
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body).toEqual([]);
     expect(mockBuiltInAgentService.list).not.toHaveBeenCalled();
+  });
+
+  it("keeps built-in agent mutations unavailable when the experimental flag is disabled", async () => {
+    mockInstanceSettingsService.getExperimental.mockResolvedValue({ enableBuiltInAgents: false });
+    const app = await createApp({
+      type: "board",
+      userId: "board-user",
+      companyIds: [companyId],
+      source: "session",
+      isInstanceAdmin: true,
+    });
+
+    const res = await request(app)
+      .post(`/api/companies/${companyId}/built-in-agents/briefs/provision`)
+      .send({ adapterType: "codex_local" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(404);
+    expect(mockBuiltInAgentService.provision).not.toHaveBeenCalled();
   });
 
   it("provisions through the agents:create gate and passes optional adapter overrides", async () => {
