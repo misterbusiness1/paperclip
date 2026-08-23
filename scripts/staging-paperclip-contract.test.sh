@@ -122,6 +122,11 @@ done
 if [[ "${1:-}" == run && ( "$*" == *":/source:ro"* || "$*" == *":/restore"* ) ]]; then
   [[ " $* " == *" $prior_image_id "* ]] || exit 98
 fi
+if [[ "$*" == *' exec -T server bash -euc '* ]]; then
+  [[ "$*" == *'cat /run/secrets/postgres_password'* ]] || exit 96
+  printf 'Invite URL: http://127.0.0.1:3310/invite/pcp_bootstrap_fixture\n'
+  exit
+fi
 case "$*" in
   'ps --all --filter label=com.docker.compose.project=paperclip --format {{.ID}}') printf 'prod-1\n' ;;
   'inspect prod-1 --format {{.Id}} {{.Image}}')
@@ -173,6 +178,31 @@ if [[ "${STAGING_TEST_SCENARIO:-}" == bootstrap-signup-open ]]; then
     *'/api/auth/get-session'*) printf '{"user":{"id":"fixture-user"}}\n' ;;
     *'/api/companies'*) printf '[]\n' ;;
     *'/api/health'*) printf '{"status":"ok","bootstrapStatus":"ready"}\n' ;;
+    *) exit 1 ;;
+  esac
+  exit
+fi
+if [[ "${STAGING_TEST_SCENARIO:-}" == bootstrap-cli-env ]]; then
+  output=""
+  previous=""
+  for argument in "$@"; do
+    if [[ "$previous" == --output ]]; then output="$argument"; break; fi
+    previous="$argument"
+  done
+  case "$*" in
+    *'/api/auth/sign-up/email'*)
+      if [[ "$output" == *second-signup.json ]]; then
+        printf '{"code":"SIGN_UP_DISABLED"}\n' >"$output"
+        printf '403'
+      else
+        printf '{}\n' >"$output"
+        printf '200'
+      fi
+      ;;
+    *'/api/invites/pcp_bootstrap_fixture/accept'*) printf '{}\n' >"$output"; printf '200' ;;
+    *'/api/auth/get-session'*) printf '{"user":{"id":"fixture-user"}}\n' ;;
+    *'/api/companies'*) printf '[]\n' ;;
+    *'/api/health'*) printf '{"status":"ok","bootstrapStatus":"bootstrap_pending"}\n' ;;
     *) exit 1 ;;
   esac
   exit
@@ -255,6 +285,18 @@ if env PATH="$test_dir/bin:$PATH" STAGING_TEST_CALLS="$test_dir/calls" \
   echo "expected bootstrap signup proof failure" >&2; exit 1
 fi
 grep -q 'timeout 60 docker compose -p occ-paperclip-staging .* stop server' "$test_dir/calls"
+
+# Environment-configured authenticated deployments load the database secret
+# inside the isolated exec and complete the invite flow without config.json.
+: >"$test_dir/calls"
+env PATH="$test_dir/bin:$PATH" STAGING_TEST_CALLS="$test_dir/calls" \
+  STAGING_TEST_SCENARIO=bootstrap-cli-env STAGING_TEST_STATE="$test_dir" \
+  PAPERCLIP_PRODUCTION_PROJECT=paperclip PAPERCLIP_STAGING_PROJECT=occ-paperclip-staging \
+  PAPERCLIP_STAGING_PORT=3310 PAPERCLIP_STAGING_PUBLIC_URL=http://127.0.0.1:3310 \
+  PAPERCLIP_STAGING_SECRET_DIR="$fixture/secrets" PAPERCLIP_STAGING_ADMIN_PASSWORD=synthetic-test-only \
+  bash "$fixture/scripts/staging-paperclip-bootstrap.sh" >/dev/null
+grep -q 'exec -T server bash -euc .*cat /run/secrets/postgres_password' "$test_dir/calls"
+grep -q '/api/invites/pcp_bootstrap_fixture/accept' "$test_dir/calls"
 
 # Orphan/partial resource sets fail closed before build, stop, backup, or start.
 for scenario in orphan-db orphan-runtime orphan-container; do

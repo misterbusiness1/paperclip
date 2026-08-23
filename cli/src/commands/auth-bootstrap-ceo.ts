@@ -15,6 +15,10 @@ function createInviteToken() {
   return `pcp_bootstrap_${randomBytes(24).toString("hex")}`;
 }
 
+export function resolveBootstrapDeploymentMode(config: { server: { deploymentMode: string } } | null) {
+  return config?.server.deploymentMode ?? process.env.PAPERCLIP_DEPLOYMENT_MODE;
+}
+
 function resolveDbUrl(configPath?: string, explicitDbUrl?: string) {
   if (explicitDbUrl) return explicitDbUrl;
   const config = readConfig(configPath);
@@ -61,12 +65,13 @@ export async function bootstrapCeoInvite(opts: {
   const configPath = resolveConfigPath(opts.config);
   loadPaperclipEnvFile(configPath);
   const config = readConfig(configPath);
-  if (!config) {
+  const deploymentMode = resolveBootstrapDeploymentMode(config);
+  if (!config && deploymentMode !== "authenticated") {
     p.log.error(`No config found at ${configPath}. Run ${pc.cyan("paperclip onboard")} first.`);
     return;
   }
 
-  if (config.server.deploymentMode !== "authenticated") {
+  if (deploymentMode !== "authenticated") {
     p.log.info("Deployment mode is local_trusted. Bootstrap CEO invite is only required for authenticated mode.");
     return;
   }
