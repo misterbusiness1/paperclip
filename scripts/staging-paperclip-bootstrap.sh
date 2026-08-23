@@ -82,7 +82,7 @@ timeout 180 docker compose -p "$PAPERCLIP_STAGING_PROJECT" -f "$compose_file" up
 second_email="paperclip-staging-denied-$(date +%s)-$$@oxfordcigar.invalid"
 second_signup_json="$(jq -cn --arg name 'Denied Staging User' --arg email "$second_email" --arg password "$PAPERCLIP_STAGING_ADMIN_PASSWORD" '{name:$name,email:$email,password:$password}')"
 second_status="$(post_json /api/auth/sign-up/email "$second_signup_json" "$scratch_dir/second-signup.json")"
-[[ "$second_status" == 403 ]] || { echo "staging bootstrap: signup-disabled contract returned HTTP $second_status, expected 403" >&2; exit 1; }
+[[ "$second_status" == 400 ]] || { echo "staging bootstrap: signup-disabled contract returned HTTP $second_status, expected 400" >&2; exit 1; }
 jq -e '((.code // .error.code // "") | ascii_upcase | test("SIGN.?UP.*DISABLED")) or ((.message // .error.message // "") | ascii_downcase | test("sign.?up.*disabled"))' "$scratch_dir/second-signup.json" >/dev/null || { echo "staging bootstrap: explicit signup-disabled response missing" >&2; exit 1; }
 signup_closed=true
 session_json="$(curl --connect-timeout 5 --max-time 15 --fail --silent --cookie "$cookie_jar" --cookie-jar "$cookie_jar" "$PAPERCLIP_STAGING_PUBLIC_URL/api/auth/get-session")"

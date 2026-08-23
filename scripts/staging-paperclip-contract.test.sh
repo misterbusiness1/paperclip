@@ -193,7 +193,7 @@ if [[ "${STAGING_TEST_SCENARIO:-}" == bootstrap-cli-env ]]; then
     *'/api/auth/sign-up/email'*)
       if [[ "$output" == *second-signup.json ]]; then
         printf '{"code":"SIGN_UP_DISABLED"}\n' >"$output"
-        printf '403'
+        printf '400'
       else
         printf '{}\n' >"$output"
         printf '200'
