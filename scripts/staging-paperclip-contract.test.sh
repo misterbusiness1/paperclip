@@ -239,6 +239,8 @@ assert_failed_deploy stop-failure
 assert_failed_deploy first-backup-failure
 assert_failed_deploy second-backup-failure
 assert_failed_deploy start-timeout
+backup_owner="$(id -u):$(id -g)"
+[[ "$(awk -v marker="chown $backup_owner /backup/" 'index($0,"docker run --pull never")==1 && index($0,marker){count++} END{print count+0}' "$test_dir/calls")" -eq 2 ]]
 assert_failed_deploy identity-mismatch
 assert_failed_deploy health-failure
 
