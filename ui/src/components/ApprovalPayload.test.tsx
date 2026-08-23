@@ -34,6 +34,7 @@ describe("approvalDecisionBrief", () => {
         rationale: "It isolates the decision.",
         benefits: ["Fast feedback", "Fast feedback", "  Reversible  "],
         risks: ["May miss a long-tail case"],
+        riskAssessment: "Rollback must remain available",
         tradeoffs: "Requires one follow-up check",
         nextActionOnApproval: "Run the dry test.",
       }),
@@ -41,7 +42,11 @@ describe("approvalDecisionBrief", () => {
       recommendation: "Approve the bounded test.",
       reasoning: "It isolates the decision.",
       pros: ["Fast feedback", "Reversible"],
-      cons: ["May miss a long-tail case", "Requires one follow-up check"],
+      cons: [
+        "May miss a long-tail case",
+        "Rollback must remain available",
+        "Requires one follow-up check",
+      ],
       nextAction: "Run the dry test.",
     });
   });
@@ -138,9 +143,11 @@ describe("ApprovalPayloadRenderer", () => {
           payload={{
             title: "Reply with an ASCII frog",
             summary: "Board asked for approval before posting the frog.",
+            reasoning: "The bounded reply is reversible and has no external side effects.",
             recommendedAction: "Approve the frog reply.",
             nextActionOnApproval: "Post the frog comment on the issue.",
-            risks: ["The frog might be too powerful."],
+            pros: ["The reply is clear and scoped."],
+            risks: "The frog might be too powerful.",
             proposedComment: "(o)<",
           }}
         />,
@@ -149,8 +156,12 @@ describe("ApprovalPayloadRenderer", () => {
 
     expect(container.textContent).toContain("Reply with an ASCII frog");
     expect(container.textContent).toContain("Board asked for approval before posting the frog.");
+    expect(container.textContent).toContain("The bounded reply is reversible and has no external side effects.");
     expect(container.textContent).toContain("Approve the frog reply.");
     expect(container.textContent).toContain("Post the frog comment on the issue.");
+    expect(container.textContent).toContain("Pros");
+    expect(container.textContent).toContain("The reply is clear and scoped.");
+    expect(container.textContent).toContain("Cons & risks");
     expect(container.textContent).toContain("The frog might be too powerful.");
     expect(container.textContent).toContain("(o)<");
     expect(container.textContent).not.toContain("\"recommendedAction\"");
@@ -176,7 +187,8 @@ describe("ApprovalPayloadRenderer", () => {
             gate: "Gate B",
             intent: "Hold-vs-cancel choice for backordered Padrón lines.",
             recommendedAction: "Send as written.",
-            risks: ["Customer may expect a firm restock date."],
+            pros: ["The customer gets a direct choice."],
+            risks: "Customer may expect a firm restock date.",
             body: "Hi Marcus,\n\nThank you for your order #90210. The three boxes are briefly on backorder.",
           }}
         />,
@@ -194,6 +206,7 @@ describe("ApprovalPayloadRenderer", () => {
     expect(text).not.toContain("\"body\":");
     expect(text).toContain("Hold-vs-cancel choice for backordered Padrón lines.");
     expect(text).toContain("Send as written.");
+    expect(text).toContain("The customer gets a direct choice.");
     expect(text).toContain("Customer may expect a firm restock date.");
 
     act(() => {
