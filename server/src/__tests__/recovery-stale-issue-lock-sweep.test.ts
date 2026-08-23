@@ -228,6 +228,7 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
 
   it("terminalizes an orphaned running run whose process is gone, then clears the lock", async () => {
     const { companyId, agentId, runningRunId } = await seed();
+    await db.update(agents).set({ status: "running" }).where(eq(agents.id, agentId));
     // The run recorded a pid, but the process and its sandbox are gone. A pid
     // this large never maps to a live process, so isPidAlive returns false.
     // The issue is not terminal, so only the process-death authority applies.
@@ -263,6 +264,13 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
     expect(run?.status).toBe("interrupted");
     expect(run?.errorCode).toBe("orphaned_running_run");
 
+    const agentStatus = await db
+      .select({ status: agents.status })
+      .from(agents)
+      .where(eq(agents.id, agentId))
+      .then((rows) => rows[0]?.status);
+    expect(agentStatus).toBe("idle");
+
     const lock = await db
       .select({ checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
       .from(issues)
@@ -284,6 +292,7 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
     // process-death authority misses this case. The issue-terminal authority
     // catches it: the issue reached "done" while the run row stayed "running".
     const { companyId, agentId, runningRunId } = await seed();
+    await db.update(agents).set({ status: "running" }).where(eq(agents.id, agentId));
     // process.pid is the live test process, so isPidAlive returns true.
     await db
       .update(heartbeatRuns)
@@ -317,6 +326,13 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
     // succeeded run carries no error code.
     expect(run?.status).toBe("succeeded");
     expect(run?.errorCode).toBeNull();
+
+    const agentStatus = await db
+      .select({ status: agents.status })
+      .from(agents)
+      .where(eq(agents.id, agentId))
+      .then((rows) => rows[0]?.status);
+    expect(agentStatus).toBe("idle");
 
     const lock = await db
       .select({ checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
@@ -363,6 +379,40 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       .where(eq(heartbeatRuns.id, runningRunId))
       .then((rows) => rows[0]?.status);
     expect(runStatus).toBe("cancelled");
+  });
+
+  it("keeps the agent running when another run remains active", async () => {
+    const { companyId, agentId, runningRunId } = await seed();
+    const otherRunId = randomUUID();
+    await db.update(agents).set({ status: "running" }).where(eq(agents.id, agentId));
+    await db.insert(heartbeatRuns).values({
+      id: otherRunId,
+      companyId,
+      agentId,
+      status: "running",
+      invocationSource: "manual",
+      startedAt: new Date(),
+    });
+    await db.insert(issues).values({
+      id: randomUUID(),
+      companyId,
+      title: "Terminal issue with a separate active agent run",
+      status: "done",
+      priority: "high",
+      assigneeAgentId: agentId,
+      executionRunId: runningRunId,
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.sweepStaleIssueLocks();
+
+    expect(result.terminalizedRunIds).toEqual([runningRunId]);
+    const agentStatus = await db
+      .select({ status: agents.status })
+      .from(agents)
+      .where(eq(agents.id, agentId))
+      .then((rows) => rows[0]?.status);
+    expect(agentStatus).toBe("running");
   });
 
   it("does not terminalize a running run whose process is alive and whose issue is not terminal", async () => {
