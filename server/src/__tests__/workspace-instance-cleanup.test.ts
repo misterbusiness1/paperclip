@@ -15,7 +15,7 @@ import type { WorkspaceOperationRecorder } from "../services/workspace-operation
 const tempRoots = new Set<string>();
 
 async function makeTempRoot(prefix: string): Promise<string> {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
+  const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), prefix)));
   tempRoots.add(root);
   return root;
 }

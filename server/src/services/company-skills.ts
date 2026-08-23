@@ -1101,6 +1101,12 @@ async function statPath(targetPath: string) {
   return fs.stat(targetPath).catch(() => null);
 }
 
+async function hasExactSkillFile(skillDir: string) {
+  const entries = await fs.readdir(skillDir, { withFileTypes: true }).catch(() => []);
+  const skillFile = entries.find((entry) => entry.name === "SKILL.md");
+  return Boolean(skillFile?.isFile() || skillFile?.isSymbolicLink());
+}
+
 function pathIsContained(rootPath: string, candidatePath: string) {
   const relativePath = path.relative(rootPath, candidatePath);
   return relativePath === ""
@@ -1373,6 +1379,9 @@ export async function readLocalSkillImportFromDirectory(
   if (options?.workspaceRoot) {
     await validateProjectSkillImportPath(resolvedSkillDir, options.workspaceRoot, inventoryMode);
   }
+  if (!(await hasExactSkillFile(resolvedSkillDir))) {
+    throw unprocessable(`No SKILL.md file was found in ${resolvedSkillDir}.`);
+  }
   const skillFilePath = path.join(resolvedSkillDir, "SKILL.md");
   const markdown = await fs.readFile(skillFilePath, "utf8");
   const parsed = parseFrontmatterMarkdown(markdown);
@@ -1425,8 +1434,7 @@ export async function discoverProjectWorkspaceSkillDirectories(
   }>();
   const workspaceRoot = await fs.realpath(path.resolve(target.workspaceCwd)).catch(() => null);
   if (!workspaceRoot) return [];
-  const rootSkillPath = path.join(workspaceRoot, "SKILL.md");
-  if ((await statPath(rootSkillPath))?.isFile()) {
+  if (await hasExactSkillFile(workspaceRoot)) {
     discovered.set(workspaceRoot, {
       directoryRoot: ".",
       relativePath: ".",
@@ -1448,7 +1456,7 @@ export async function discoverProjectWorkspaceSkillDirectories(
       || relativeToWorkspace.startsWith(`..${path.sep}`)
       || path.isAbsolute(relativeToWorkspace)
     ) continue;
-    if (!(await statPath(path.join(absoluteSkillDir, "SKILL.md")))?.isFile()) continue;
+    if (!(await hasExactSkillFile(absoluteSkillDir))) continue;
     discovered.set(absoluteSkillDir, {
       directoryRoot: relativeSkillDir === "." ? "." : path.posix.dirname(relativeSkillDir),
       relativePath: relativeSkillDir,
@@ -1466,7 +1474,7 @@ export async function discoverProjectWorkspaceSkillDirectories(
       const absoluteSkillDir = path.resolve(absoluteRoot, entry.name);
       const entryStat = entry.isSymbolicLink() ? await statPath(absoluteSkillDir) : null;
       if (!entry.isDirectory() && !entryStat?.isDirectory()) continue;
-      if (!(await statPath(path.join(absoluteSkillDir, "SKILL.md")))?.isFile()) continue;
+      if (!(await hasExactSkillFile(absoluteSkillDir))) continue;
       discovered.set(absoluteSkillDir, {
         directoryRoot: relativeRoot,
         relativePath: normalizePortablePath(path.relative(workspaceRoot, absoluteSkillDir)),
@@ -4852,7 +4860,7 @@ export function companySkillService(db: Db) {
         path: entryPath,
         kind: entry.isDirectory() ? "directory" : "file",
         isSkill: entry.isDirectory()
-          ? Boolean((await statPath(path.join(targetPath, entry.name, "SKILL.md")))?.isFile())
+          ? await hasExactSkillFile(path.join(targetPath, entry.name))
           : entry.name === "SKILL.md",
       });
     }
@@ -4948,8 +4956,8 @@ export function companySkillService(db: Db) {
         });
         if (workspaceFilter.size > 0 && !workspaceFilter.has(workspace.id)) continue;
         if (selectiveImport && !selectedWorkspaceIds.has(workspace.id)) continue;
-        const workspaceCwd = asString(workspace.cwd);
-        if (!workspaceCwd) {
+        const configuredWorkspaceCwd = asString(workspace.cwd);
+        if (!configuredWorkspaceCwd) {
           skipped.push({
             projectId: project.id,
             projectName: project.name,
@@ -4961,15 +4969,16 @@ export function companySkillService(db: Db) {
           continue;
         }
 
-        const workspaceStat = await statPath(workspaceCwd);
-        if (!workspaceStat?.isDirectory()) {
+        const workspaceCwd = await fs.realpath(path.resolve(configuredWorkspaceCwd)).catch(() => null);
+        const workspaceStat = workspaceCwd ? await statPath(workspaceCwd) : null;
+        if (!workspaceCwd || !workspaceStat?.isDirectory()) {
           skipped.push({
             projectId: project.id,
             projectName: project.name,
             workspaceId: workspace.id,
             workspaceName: workspace.name,
-            path: workspaceCwd,
-            reason: trackWarning(`Skipped ${project.name} / ${workspace.name}: local workspace path is not available at ${workspaceCwd}.`),
+            path: configuredWorkspaceCwd,
+            reason: trackWarning(`Skipped ${project.name} / ${workspace.name}: local workspace path is not available at ${configuredWorkspaceCwd}.`),
           });
           continue;
         }

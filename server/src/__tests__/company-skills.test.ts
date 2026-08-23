@@ -18,7 +18,7 @@ afterEach(async () => {
 });
 
 async function makeTempDir(prefix: string) {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
+  const dir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), prefix)));
   cleanupDirs.add(dir);
   return dir;
 }

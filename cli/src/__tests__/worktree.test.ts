@@ -169,7 +169,9 @@ function buildSourceConfig(): PaperclipConfig {
 
 describe("worktree helpers", () => {
   it("uses the repo-local config for the current worktree", () => {
-    const targetRoot = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-current-worktree-"));
+    const targetRoot = fs.realpathSync(
+      fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-current-worktree-")),
+    );
     try {
       const localConfig = path.join(targetRoot, ".paperclip", "config.json");
       fs.mkdirSync(path.dirname(localConfig), { recursive: true });
@@ -189,7 +191,9 @@ describe("worktree helpers", () => {
   });
 
   it("uses the repository config from a nested working directory", () => {
-    const targetRoot = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-current-worktree-nested-"));
+    const targetRoot = fs.realpathSync(
+      fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-current-worktree-nested-")),
+    );
     try {
       execFileSync("git", ["init", "-q"], { cwd: targetRoot });
       const nestedDirectory = path.join(targetRoot, "packages", "example", "src");
