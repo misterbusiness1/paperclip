@@ -98,8 +98,10 @@ write_failure_receipt() {
 backup_volume() {
   local volume="$1"
   local archive="$2"
+  local archive_owner
+  archive_owner="$(id -u):$(id -g)"
   timeout 120 docker run --pull never --rm --entrypoint sh --volume "$volume:/source:ro" --volume "$backup_dir:/backup" "$prior_image_id" \
-    -c "cd /source && tar -czf /backup/$archive ."
+    -c "cd /source && tar -czf /backup/$archive . && chown $archive_owner /backup/$archive"
   chmod 600 "$backup_dir/$archive"
 }
 
