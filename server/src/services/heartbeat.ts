@@ -6642,7 +6642,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     cancelWorkForScope: cancelBudgetScopeWork,
   };
   const budgets = budgetService(db, budgetHooks);
-  const recovery = recoveryService(db, { enqueueWakeup });
+  const recovery = recoveryService(db, {
+    enqueueWakeup,
+    isRunExecutionActive: (runId) => activeRunExecutions.has(runId),
+  });
 
   function isPlanApprovalConfirmationPayload(payload: unknown) {
     const target = parseObject(parseObject(payload).target);
@@ -15075,10 +15078,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           contextSnapshot: context,
           updatedAt: new Date(),
         })
-        .where(eq(heartbeatRuns.id, run.id))
+        .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "running")))
         .returning()
         .then((rows) => rows[0] ?? null);
-      if (runningWithSession) run = runningWithSession;
+      if (!runningWithSession) {
+        const terminalRun = await getRun(run.id);
+        logger.info(
+          { runId: run.id, currentStatus: terminalRun?.status ?? null },
+          "execution-start aborted: run already left running state",
+        );
+        if (terminalRun && isHeartbeatRunTerminalStatus(terminalRun.status)) {
+          await releaseIssueExecutionAndPromote(terminalRun, { suppressImmediateRecovery: true });
+        }
+        return;
+      }
+      run = runningWithSession;
 
       // Pause Durability: flip to "running" ONLY if the agent is still invokable.
       // Atomic conditional UPDATE is the sole gate (no read-then-write); 0 rows => abort.
@@ -16669,6 +16683,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               },
             };
           }
+        }
+
+        if (issue.status === "done" || issue.status === "cancelled") {
+          const now = new Date();
+          await tx
+            .update(agentWakeupRequests)
+            .set({
+              status: "cancelled",
+              finishedAt: now,
+              error: `Deferred wake cancelled because issue is terminal (${issue.status})`,
+              updatedAt: now,
+            })
+            .where(eq(agentWakeupRequests.id, deferred.id));
+          continue;
         }
 
         const promotedReason = readNonEmptyString(deferred.reason) ?? "issue_execution_promoted";

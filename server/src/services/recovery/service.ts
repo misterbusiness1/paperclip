@@ -762,7 +762,10 @@ function buildLivenessOriginalIssueComment(finding: IssueLivenessFinding, escala
   ].join("\n");
 }
 
-export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup }) {
+export function recoveryService(
+  db: Db,
+  deps: { enqueueWakeup: RecoveryWakeup; isRunExecutionActive?: (runId: string) => boolean },
+) {
   const issuesSvc = issueService(db);
   const recoveryActionsSvc = issueRecoveryActionService(db);
   const treeControlSvc = issueTreeControlService(db);
@@ -5522,6 +5525,13 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     // retry. Neither is orphaned, so this function must not terminalize them.
     if (run.status !== "running") return { terminalized: false, status: run.status };
 
+    // An issue can reach a terminal status while executeRun is still preparing
+    // or finishing its adapter. That in-process execution remains authoritative;
+    // its own finalizer will reconcile the run and release the issue lock.
+    if (deps.isRunExecutionActive?.(run.id)) {
+      return { terminalized: false, status: run.status };
+    }
+
     const pid = run.processPid ?? null;
     const processGroupId = run.processGroupId ?? null;
 
@@ -5645,7 +5655,98 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       cleared: 0,
       issueIds: [] as string[],
       terminalizedRunIds: [] as string[],
+      retiredDeferredWakeups: 0,
+      retiredDeferredWakeupIds: [] as string[],
     };
+
+    const retired = await db.transaction(async (tx) => {
+      const terminalDeferredWakeups = await tx
+        .select({
+          id: agentWakeupRequests.id,
+          companyId: agentWakeupRequests.companyId,
+        })
+        .from(agentWakeupRequests)
+        .innerJoin(
+          issues,
+          and(
+            eq(issues.companyId, agentWakeupRequests.companyId),
+            sql`${issues.id}::text = coalesce(
+              ${agentWakeupRequests.payload} ->> 'issueId',
+              ${agentWakeupRequests.payload} -> '_paperclipWakeContext' ->> 'issueId',
+              ${agentWakeupRequests.payload} -> '_paperclipWakeContext' ->> 'taskId'
+            )`,
+          ),
+        )
+        .where(
+          and(
+            eq(agentWakeupRequests.status, "deferred_issue_execution"),
+            inArray(issues.status, ["done", "cancelled"]),
+            isNull(issues.executionRunId),
+            isNull(issues.checkoutRunId),
+            // Stay outside a healthy finalizer's run-status/release window.
+            sql`${agentWakeupRequests.updatedAt} < now() - interval '5 minutes'`,
+            sql`not exists (
+              select 1
+              from heartbeat_runs live_run
+              where live_run.company_id = ${agentWakeupRequests.companyId}
+                and live_run.status in ('queued', 'running', 'scheduled_retry')
+                and coalesce(
+                  live_run.context_snapshot ->> 'issueId',
+                  live_run.context_snapshot ->> 'taskId'
+                ) = ${issues.id}::text
+            )`,
+          ),
+        )
+        .orderBy(asc(agentWakeupRequests.requestedAt), asc(agentWakeupRequests.id))
+        .limit(500);
+
+      if (terminalDeferredWakeups.length === 0) return [];
+
+      const now = new Date();
+      const cancelled = await tx
+        .update(agentWakeupRequests)
+        .set({
+          status: "cancelled",
+          finishedAt: now,
+          error: "Deferred wake cancelled because its issue is terminal and has no active execution path",
+          updatedAt: now,
+        })
+        .where(
+          and(
+            inArray(agentWakeupRequests.id, terminalDeferredWakeups.map((wake) => wake.id)),
+            eq(agentWakeupRequests.status, "deferred_issue_execution"),
+          ),
+        )
+        .returning({ id: agentWakeupRequests.id, companyId: agentWakeupRequests.companyId });
+
+      const cancelledByCompany = new Map<string, typeof cancelled>();
+      for (const wake of cancelled) {
+        const companyWakeups = cancelledByCompany.get(wake.companyId) ?? [];
+        companyWakeups.push(wake);
+        cancelledByCompany.set(wake.companyId, companyWakeups);
+      }
+      for (const [companyId, wakeups] of cancelledByCompany) {
+        await logActivity(tx as unknown as Db, {
+          companyId,
+          actorType: "system",
+          actorId: "system",
+          agentId: null,
+          runId: null,
+          action: "heartbeat.terminal_deferred_wakes_retired",
+          entityType: "company",
+          entityId: companyId,
+          details: {
+            source: "recovery.sweep_stale_issue_locks",
+            count: wakeups.length,
+            wakeupRequestIds: wakeups.map((wake) => wake.id),
+          },
+        });
+      }
+      return cancelled;
+    });
+
+    result.retiredDeferredWakeupIds = retired.map((wake) => wake.id);
+    result.retiredDeferredWakeups = retired.length;
 
     const candidates = await db
       .select({
@@ -5783,14 +5884,20 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       });
     }
 
-    if (result.cleared > 0 || result.terminalizedRunIds.length > 0) {
+    if (
+      result.cleared > 0 ||
+      result.terminalizedRunIds.length > 0 ||
+      result.retiredDeferredWakeups > 0
+    ) {
       logger.warn(
         {
           cleared: result.cleared,
           issueIds: result.issueIds,
           terminalizedRunIds: result.terminalizedRunIds,
+          retiredDeferredWakeups: result.retiredDeferredWakeups,
+          retiredDeferredWakeupIds: result.retiredDeferredWakeupIds,
         },
-        "swept stale issue lock columns",
+        "swept stale issue execution state",
       );
     }
 
