@@ -260,13 +260,21 @@ function runVitest(args, label) {
   const tempRootParent = process.platform === "win32" ? os.tmpdir() : "/tmp";
   const testRoot = mkdtempSync(path.join(tempRootParent, `pcvt-${process.pid}-${invocationIndex}-`));
   // Keep per-run paths compact so Unix socket fixtures stay under macOS path limits.
+  const testHome = path.join(testRoot, "h");
+  const testInstanceId = `vt-${process.pid}-${invocationIndex}`;
   const env = {
     ...process.env,
     NODE_ENV: "test",
-    PAPERCLIP_HOME: path.join(testRoot, "h"),
-    PAPERCLIP_INSTANCE_ID: `vt-${process.pid}-${invocationIndex}`,
+    PAPERCLIP_HOME: testHome,
+    PAPERCLIP_INSTANCE_ID: testInstanceId,
+    PAPERCLIP_CONFIG: path.join(testHome, "instances", testInstanceId, "config.json"),
+    PAPERCLIP_CONTEXT: path.join(testHome, "context.json"),
     TMPDIR: path.join(testRoot, "t"),
   };
+  delete env.PAPERCLIP_IN_WORKTREE;
+  delete env.PAPERCLIP_WORKTREE_NAME;
+  delete env.PAPERCLIP_WORKTREE_COLOR;
+  delete env.PAPERCLIP_WORKTREES_DIR;
   mkdirSync(env.PAPERCLIP_HOME, { recursive: true });
   mkdirSync(env.TMPDIR, { recursive: true });
   const result = spawnSync("pnpm", ["exec", "vitest", "run", ...generatedOutputVitestArgs, ...args], {
