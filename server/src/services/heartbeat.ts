@@ -46,6 +46,7 @@ import {
   documentRevisions,
   issueDocuments,
   executionWorkspaces,
+  environmentLeases,
   heartbeatRunEvents,
   heartbeatRuns,
   issueApprovals,
@@ -6959,6 +6960,46 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         "failed to release environment lease for heartbeat run",
       );
     }
+    return releaseResult;
+  }
+
+  async function reconcileTerminalEnvironmentLeases() {
+    const terminalRuns = await db
+      .selectDistinct({
+        runId: heartbeatRuns.id,
+        companyId: heartbeatRuns.companyId,
+        agentId: heartbeatRuns.agentId,
+        status: heartbeatRuns.status,
+        error: heartbeatRuns.error,
+      })
+      .from(environmentLeases)
+      .innerJoin(heartbeatRuns, eq(environmentLeases.heartbeatRunId, heartbeatRuns.id))
+      .where(and(
+        eq(environmentLeases.status, "active"),
+        inArray(heartbeatRuns.status, [...HEARTBEAT_RUN_TERMINAL_STATUSES]),
+      ));
+
+    let released = 0;
+    let failed = 0;
+    for (const run of terminalRuns) {
+      const result = await releaseEnvironmentLeasesForRun({
+        runId: run.runId,
+        companyId: run.companyId,
+        agentId: run.agentId,
+        status: run.status,
+        failureReason: run.error,
+      });
+      released += result?.released.length ?? 0;
+      failed += result ? result.errors.length : 1;
+    }
+
+    if (released > 0 || failed > 0) {
+      logger.warn(
+        { released, failed, runIds: terminalRuns.slice(0, 100).map((run) => run.runId) },
+        "reconciled environment leases left active after terminal heartbeat runs",
+      );
+    }
+    return { released, failed, runIds: terminalRuns.map((run) => run.runId) };
   }
 
   async function hasUnsafeTextProjectionDatabase() {
@@ -13095,6 +13136,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   async function reapOrphanedRuns(opts?: { staleThresholdMs?: number }) {
+    await reconcileTerminalEnvironmentLeases();
     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
     const now = new Date();
 
@@ -17752,6 +17794,33 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
 
         if (!activeExecutionRun && dependencyReadiness && !dependencyReadiness.isDependencyReady && !blockedInteractionWake) {
+          const unresolvedBlockerIssueIds = [...dependencyReadiness.unresolvedBlockerIssueIds].sort();
+          const previousIssueWake = await tx
+            .select({
+              payload: agentWakeupRequests.payload,
+              reason: agentWakeupRequests.reason,
+              status: agentWakeupRequests.status,
+            })
+            .from(agentWakeupRequests)
+            .where(and(
+              eq(agentWakeupRequests.companyId, agent.companyId),
+              eq(agentWakeupRequests.agentId, agentId),
+              sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
+            ))
+            .orderBy(desc(agentWakeupRequests.requestedAt))
+            .limit(1)
+            .then((rows) => rows[0] ?? null);
+          const previousBlockerIssueIds = parseObject(previousIssueWake?.payload).unresolvedBlockerIssueIds;
+          if (
+            previousIssueWake?.status === "skipped" &&
+            previousIssueWake.reason === "issue_dependencies_blocked" &&
+            Array.isArray(previousBlockerIssueIds) &&
+            JSON.stringify(previousBlockerIssueIds.filter((value): value is string => typeof value === "string").sort()) ===
+              JSON.stringify(unresolvedBlockerIssueIds)
+          ) {
+            return { kind: "skipped" as const };
+          }
+
           await tx.insert(agentWakeupRequests).values({
             companyId: agent.companyId,
             agentId,
@@ -17761,7 +17830,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             payload: {
               ...(payload ?? {}),
               issueId,
-              unresolvedBlockerIssueIds: dependencyReadiness.unresolvedBlockerIssueIds,
+              unresolvedBlockerIssueIds,
             },
             status: "skipped",
             requestedByActorType: opts.requestedByActorType ?? null,
@@ -18997,6 +19066,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     reconcileStrandedAssignedIssues,
 
     terminalizeRunOnLeaseRelease,
+    reconcileTerminalEnvironmentLeases,
 
     sweepStaleIssueLocks,
 

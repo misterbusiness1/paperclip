@@ -42,7 +42,9 @@ const SENSITIVE_KEYS = new Set<string>([
 ]);
 
 const MAX_DEPTH = 6;
+const MAX_STRING_LENGTH = 2_048;
 const REDACTED = "[REDACTED]";
+const TRUNCATED = "...[TRUNCATED]";
 const URLISH_KEYS = new Set<string>([
   "href",
   "locator",
@@ -77,8 +79,15 @@ function stripSecretBearingUrlParts(value: string): string {
   }
 }
 
+function truncateString(value: string): string {
+  return value.length <= MAX_STRING_LENGTH
+    ? value
+    : `${value.slice(0, MAX_STRING_LENGTH - TRUNCATED.length)}${TRUNCATED}`;
+}
+
 export function redactSensitive(value: unknown, depth = 0): unknown {
   if (depth > MAX_DEPTH) return undefined;
+  if (typeof value === "string") return truncateString(value);
   if (value === null || typeof value !== "object") return value;
   if (Array.isArray(value)) {
     if (depth + 1 > MAX_DEPTH) return undefined;
@@ -91,7 +100,7 @@ export function redactSensitive(value: unknown, depth = 0): unknown {
       continue;
     }
     if (typeof entry === "string" && isUrlishKey(key)) {
-      out[key] = stripSecretBearingUrlParts(entry);
+      out[key] = truncateString(stripSecretBearingUrlParts(entry));
       continue;
     }
     out[key] = redactSensitive(entry, depth + 1);

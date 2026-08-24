@@ -2,9 +2,12 @@ import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
+  activityLog,
   agents,
   companies,
   createDb,
+  environmentLeases,
+  environments,
   heartbeatRunEvents,
   heartbeatRuns,
   issues,
@@ -40,10 +43,13 @@ describeEmbeddedPostgres("heartbeat terminalizeRunOnLeaseRelease", () => {
   }, 20_000);
 
   afterEach(async () => {
+    await db.delete(environmentLeases);
+    await db.delete(activityLog);
     await db.delete(heartbeatRunEvents);
     await db.delete(issues);
     await db.delete(heartbeatRuns);
     await db.delete(agents);
+    await db.delete(environments);
     await db.delete(companies);
   });
 
@@ -208,5 +214,48 @@ describeEmbeddedPostgres("heartbeat terminalizeRunOnLeaseRelease", () => {
       .where(eq(heartbeatRunEvents.runId, runId))
       .then((rows) => rows.length);
     expect(eventCount).toBe(0);
+  });
+
+  it("releases active leases left behind by terminal runs", async () => {
+    const { companyId, issueId, runId } = await seed({ issueStatus: "done", runStatus: "succeeded" });
+    const environmentId = randomUUID();
+    const leaseId = randomUUID();
+
+    await db.insert(environments).values({
+      id: environmentId,
+      name: `Local ${environmentId}`,
+      driver: "local",
+      status: "active",
+      config: {},
+    });
+    await db.insert(environmentLeases).values({
+      id: leaseId,
+      companyId,
+      environmentId,
+      issueId,
+      heartbeatRunId: runId,
+      status: "active",
+      leasePolicy: "ephemeral",
+      provider: "local",
+      metadata: { driver: "local" },
+    });
+
+    const heartbeat = heartbeatService(db);
+    await expect(heartbeat.reconcileTerminalEnvironmentLeases()).resolves.toMatchObject({
+      released: 1,
+      failed: 0,
+    });
+
+    const leaseStatus = await db
+      .select({ status: environmentLeases.status })
+      .from(environmentLeases)
+      .where(eq(environmentLeases.id, leaseId))
+      .then((rows) => rows[0]?.status);
+    expect(leaseStatus).toBe("released");
+
+    await expect(heartbeat.reconcileTerminalEnvironmentLeases()).resolves.toMatchObject({
+      released: 0,
+      failed: 0,
+    });
   });
 });

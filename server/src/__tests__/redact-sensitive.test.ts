@@ -73,6 +73,15 @@ describe("redactSensitive", () => {
     expect(redactSensitive(undefined)).toBe(undefined);
   });
 
+  it("bounds long request strings without mutating the source", () => {
+    const description = "x".repeat(5_000);
+    const out = redactSensitive({ description }) as Record<string, string>;
+
+    expect(out.description).toHaveLength(2_048);
+    expect(out.description).toMatch(/\.\.\.\[TRUNCATED\]$/);
+    expect(description).toHaveLength(5_000);
+  });
+
   it("caps recursion depth so cycles do not pin the logger", () => {
     const cycle: Record<string, unknown> = { name: "root" };
     cycle.self = cycle;
