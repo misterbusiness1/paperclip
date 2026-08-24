@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
@@ -85,6 +87,55 @@ test("shard flags are rejected for the workspaces-b group", () => {
 test("the stable runner excludes generated test output", () => {
   const result = dryRunJson(["--mode", "general", "--group", "general-workspaces-b"]);
   assert.deepEqual(result.vitestExcludePatterns, ["**/dist/**"]);
+});
+
+test("vitest subprocesses cannot inherit a live config or worktree identity", { skip: process.platform === "win32" }, () => {
+  const tempRoot = mkdtempSync(path.join(os.tmpdir(), "paperclip-vitest-env-"));
+  try {
+    const capturePath = path.join(tempRoot, "env.json");
+    const fakePnpm = path.join(tempRoot, "pnpm");
+    writeFileSync(
+      fakePnpm,
+      `#!/usr/bin/env node\nconst fs = require("node:fs");\nfs.writeFileSync(process.env.CAPTURE_PATH, JSON.stringify(process.env));\n`,
+    );
+    chmodSync(fakePnpm, 0o700);
+
+    const result = spawnSync(process.execPath, [script, "--mode", "serialized"], {
+      cwd: repoRoot,
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        PATH: `${tempRoot}:${process.env.PATH ?? ""}`,
+        CAPTURE_PATH: capturePath,
+        PAPERCLIP_CONFIG: "/production/config.json",
+        PAPERCLIP_CONTEXT: "/production/context.json",
+        PAPERCLIP_IN_WORKTREE: "true",
+        PAPERCLIP_WORKTREE_NAME: "production-worktree",
+        PAPERCLIP_WORKTREE_COLOR: "#123456",
+        PAPERCLIP_WORKTREES_DIR: "/production/worktrees",
+      },
+    });
+    assert.equal(result.status, 0, result.stderr);
+
+    const captured = JSON.parse(readFileSync(capturePath, "utf8"));
+    assert.match(captured.PAPERCLIP_HOME, /[/\\]pcvt-[^/\\]+[/\\]h$/);
+    assert.match(captured.PAPERCLIP_INSTANCE_ID, /^vt-\d+-\d+$/);
+    assert.equal(
+      captured.PAPERCLIP_CONFIG,
+      path.join(captured.PAPERCLIP_HOME, "instances", captured.PAPERCLIP_INSTANCE_ID, "config.json"),
+    );
+    assert.equal(captured.PAPERCLIP_CONTEXT, path.join(captured.PAPERCLIP_HOME, "context.json"));
+    for (const key of [
+      "PAPERCLIP_IN_WORKTREE",
+      "PAPERCLIP_WORKTREE_NAME",
+      "PAPERCLIP_WORKTREE_COLOR",
+      "PAPERCLIP_WORKTREES_DIR",
+    ]) {
+      assert.equal(captured[key], undefined, `${key} must not reach Vitest`);
+    }
+  } finally {
+    rmSync(tempRoot, { recursive: true, force: true });
+  }
 });
 
 test("workspaces-a shards map to Vitest native --shard slices over a stable project list", () => {
