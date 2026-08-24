@@ -138,6 +138,39 @@ test("vitest subprocesses cannot inherit a live config or worktree identity", { 
   }
 });
 
+test("watch mode keeps the isolated environment and forwards Vitest arguments", { skip: process.platform === "win32" }, () => {
+  const tempRoot = mkdtempSync(path.join(os.tmpdir(), "paperclip-vitest-watch-"));
+  try {
+    const capturePath = path.join(tempRoot, "watch.json");
+    const fakePnpm = path.join(tempRoot, "pnpm");
+    writeFileSync(
+      fakePnpm,
+      `#!/usr/bin/env node\nconst fs = require("node:fs");\nfs.writeFileSync(process.env.CAPTURE_PATH, JSON.stringify({ argv: process.argv.slice(2), env: process.env }));\n`,
+    );
+    chmodSync(fakePnpm, 0o700);
+
+    const testFile = "server/src/__tests__/redact-sensitive.test.ts";
+    const result = spawnSync(process.execPath, [script, "--watch", "--", testFile], {
+      cwd: repoRoot,
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        PATH: `${tempRoot}:${process.env.PATH ?? ""}`,
+        CAPTURE_PATH: capturePath,
+        PAPERCLIP_CONFIG: "/production/config.json",
+      },
+    });
+    assert.equal(result.status, 0, result.stderr);
+
+    const captured = JSON.parse(readFileSync(capturePath, "utf8"));
+    assert.deepEqual(captured.argv, ["exec", "vitest", "--exclude", "**/dist/**", testFile]);
+    assert.match(captured.env.PAPERCLIP_HOME, /[/\\]pcvt-[^/\\]+[/\\]h$/);
+    assert.notEqual(captured.env.PAPERCLIP_CONFIG, "/production/config.json");
+  } finally {
+    rmSync(tempRoot, { recursive: true, force: true });
+  }
+});
+
 test("workspaces-a shards map to Vitest native --shard slices over a stable project list", () => {
   const shards = [0, 1].map((index) =>
     dryRunJson([

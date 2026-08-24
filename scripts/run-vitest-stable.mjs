@@ -140,10 +140,18 @@ function parseCliOptions(argv) {
   let shardCount = null;
   let group = null;
   let dryRun = false;
+  let watch = false;
+  let vitestArgs = [];
 
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
     if (arg === "--") {
+      vitestArgs = argv.slice(index + 1);
+      break;
+    }
+
+    if (arg === "--watch") {
+      watch = true;
       continue;
     }
 
@@ -238,6 +246,8 @@ function parseCliOptions(argv) {
       shardCount: shardCount ?? 1,
       group: null,
       dryRun,
+      watch,
+      vitestArgs,
     };
   }
 
@@ -247,6 +257,8 @@ function parseCliOptions(argv) {
     shardCount,
     group,
     dryRun,
+    watch,
+    vitestArgs,
   };
 }
 
@@ -254,7 +266,7 @@ function selectSerializedSuites(routeTests, shardIndex, shardCount) {
   return routeTests.filter((_, index) => index % shardCount === shardIndex);
 }
 
-function runVitest(args, label) {
+function runVitest(args, label, watch = false) {
   console.log(`\n[test:run] ${label}`);
   invocationIndex += 1;
   const tempRootParent = process.platform === "win32" ? os.tmpdir() : "/tmp";
@@ -277,7 +289,7 @@ function runVitest(args, label) {
   delete env.PAPERCLIP_WORKTREES_DIR;
   mkdirSync(env.PAPERCLIP_HOME, { recursive: true });
   mkdirSync(env.TMPDIR, { recursive: true });
-  const result = spawnSync("pnpm", ["exec", "vitest", "run", ...generatedOutputVitestArgs, ...args], {
+  const result = spawnSync("pnpm", ["exec", "vitest", ...(watch ? [] : ["run"]), ...generatedOutputVitestArgs, ...args], {
     cwd: repoRoot,
     env,
     stdio: "inherit",
@@ -410,6 +422,11 @@ const generalServerTestFiles = walk(serverSrcDir)
   .sort((a, b) => a.localeCompare(b));
 
 const options = parseCliOptions(process.argv.slice(2));
+if (options.watch) {
+  runVitest(options.vitestArgs, "watch mode", true);
+  process.exit(0);
+}
+
 if (options.dryRun) {
   const serializedSuites =
     options.mode === serializedModeName

@@ -1,6 +1,7 @@
 import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { approvalComments, approvals } from "@paperclipai/db";
+import { isUuidLike } from "@paperclipai/shared";
 import { notFound, unprocessable } from "../errors.js";
 import { redactCurrentUserText } from "../log-redaction.js";
 import { agentService } from "./agents.js";
@@ -32,6 +33,7 @@ export function approvalService(db: Db) {
   }
 
   async function getExistingApproval(id: string) {
+    if (!isUuidLike(id)) throw notFound("Approval not found");
     const existing = await db
       .select()
       .from(approvals)
@@ -93,11 +95,13 @@ export function approvalService(db: Db) {
     },
 
     getById: (id: string) =>
-      db
-        .select()
-        .from(approvals)
-        .where(eq(approvals.id, id))
-        .then((rows) => rows[0] ?? null),
+      isUuidLike(id)
+        ? db
+          .select()
+          .from(approvals)
+          .where(eq(approvals.id, id))
+          .then((rows) => rows[0] ?? null)
+        : Promise.resolve(null),
 
     findOpenHireApprovalForAgent: async (companyId: string, agentId: string) => {
       const rows = await db
@@ -125,6 +129,7 @@ export function approvalService(db: Db) {
     // decision — e.g. when its paired agent is terminated during duplicate
     // cleanup. Idempotent: a no-op on already-resolved approvals.
     cancel: async (id: string, reason?: string | null) => {
+      if (!isUuidLike(id)) return null;
       const now = new Date();
       const updated = await db
         .update(approvals)

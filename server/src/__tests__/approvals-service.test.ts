@@ -26,9 +26,11 @@ type ApprovalRecord = {
   requestedByAgentId: string | null;
 };
 
+const APPROVAL_ID = "11111111-1111-4111-8111-111111111111";
+
 function createApproval(status: string): ApprovalRecord {
   return {
-    id: "approval-1",
+    id: APPROVAL_ID,
     companyId: "company-1",
     type: "hire_agent",
     status,
@@ -71,7 +73,7 @@ describe("approvalService resolution idempotency", () => {
     );
 
     const svc = approvalService(dbStub.db as any);
-    const result = await svc.approve("approval-1", "board", "ship it");
+    const result = await svc.approve(APPROVAL_ID, "board", "ship it");
 
     expect(result.applied).toBe(false);
     expect(result.approval.status).toBe("approved");
@@ -86,7 +88,7 @@ describe("approvalService resolution idempotency", () => {
     );
 
     const svc = approvalService(dbStub.db as any);
-    const result = await svc.reject("approval-1", "board", "not now");
+    const result = await svc.reject(APPROVAL_ID, "board", "not now");
 
     expect(result.applied).toBe(false);
     expect(result.approval.status).toBe("rejected");
@@ -98,7 +100,7 @@ describe("approvalService resolution idempotency", () => {
     const dbStub = createDbStub([[createApproval("pending")]], [approved]);
 
     const svc = approvalService(dbStub.db as any);
-    const result = await svc.approve("approval-1", "board", "ship it");
+    const result = await svc.approve(APPROVAL_ID, "board", "ship it");
 
     expect(result.applied).toBe(true);
     expect(mockAgentService.activatePendingApproval).toHaveBeenCalledWith("agent-1", approved.payload);
@@ -124,7 +126,7 @@ describe("approvalService resolution idempotency", () => {
     const dbStub = createDbStub([[{ ...createApproval("pending"), payload: approved.payload }]], [approved]);
 
     const svc = approvalService(dbStub.db as any);
-    const result = await svc.approve("approval-1", "board", "ship it");
+    const result = await svc.approve(APPROVAL_ID, "board", "ship it");
 
     expect(result.applied).toBe(true);
     expect(mockAgentService.create).toHaveBeenCalledWith(
@@ -133,6 +135,15 @@ describe("approvalService resolution idempotency", () => {
         adapterConfig: approved.payload.adapterConfig,
       }),
     );
+  });
+
+  it("rejects malformed approval ids before querying Postgres", async () => {
+    const dbStub = createDbStub([], []);
+    const svc = approvalService(dbStub.db as any);
+
+    await expect(svc.approve("not-a-uuid", "board")).rejects.toMatchObject({ status: 404 });
+    await expect(svc.getById("not-a-uuid")).resolves.toBeNull();
+    expect(dbStub.db.select).not.toHaveBeenCalled();
   });
 });
 
