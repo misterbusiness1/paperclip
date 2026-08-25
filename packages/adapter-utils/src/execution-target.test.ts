@@ -4,6 +4,7 @@ import * as serverUtils from "./server-utils.js";
 import {
   adapterExecutionTargetUsesManagedHome,
   ensureAdapterExecutionTargetRuntimeCommandInstalled,
+  maybeRunSandboxInstallCommand,
   resolveAdapterExecutionTargetCwd,
   runAdapterExecutionTargetProcess,
   runAdapterExecutionTargetShellCommand,
@@ -324,7 +325,7 @@ describe("ensureAdapterExecutionTargetRuntimeCommandInstalled", () => {
     }));
   });
 
-  it("skips install commands for SSH targets", async () => {
+  it("runs install commands for SSH targets", async () => {
     const runSshCommandSpy = vi.spyOn(ssh, "runSshCommand").mockResolvedValue({
       stdout: "",
       stderr: "",
@@ -352,7 +353,51 @@ describe("ensureAdapterExecutionTargetRuntimeCommandInstalled", () => {
       env: {},
     });
 
-    expect(runSshCommandSpy).not.toHaveBeenCalled();
+    expect(runSshCommandSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ host: "ssh.example.test" }),
+      "npm install -g @google/gemini-cli",
+      expect.objectContaining({ env: {} }),
+    );
+  });
+
+  it("runs diagnostic install commands for SSH targets", async () => {
+    const runSshCommandSpy = vi.spyOn(ssh, "runSshCommand").mockResolvedValue({
+      stdout: "installed\n",
+      stderr: "",
+    });
+
+    const result = await maybeRunSandboxInstallCommand({
+      runId: "run-diagnostic-install",
+      target: {
+        kind: "remote",
+        transport: "ssh",
+        remoteCwd: "/srv/paperclip/workspace",
+        spec: {
+          host: "ssh.example.test",
+          port: 22,
+          username: "ssh-user",
+          remoteCwd: "/srv/paperclip/workspace",
+          remoteWorkspacePath: "/srv/paperclip/workspace",
+          privateKey: null,
+          knownHosts: null,
+          strictHostKeyChecking: true,
+        },
+      },
+      adapterKey: "codex",
+      installCommand: "npm install -g @openai/codex",
+      env: {},
+    });
+
+    expect(runSshCommandSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ host: "ssh.example.test" }),
+      "npm install -g @openai/codex",
+      expect.objectContaining({ env: {} }),
+    );
+    expect(result).toMatchObject({
+      code: "codex_install_command_run",
+      level: "info",
+      message: "Install command ran: npm install -g @openai/codex",
+    });
   });
 });
 

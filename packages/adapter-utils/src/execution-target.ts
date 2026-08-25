@@ -540,8 +540,8 @@ export interface AdapterSandboxInstallCommandCheck {
   hint?: string;
 }
 
-// Best-effort run of an adapter-supplied install command on a sandbox target
-// before the resolvability + hello probe. Returns null for non-sandbox
+// Best-effort run of an adapter-supplied install command on a remote target
+// before the resolvability + hello probe. Returns null for local
 // targets so callers can no-op. Returns a structured check otherwise — never
 // throws — so the rest of the test still runs and reports the post-install
 // state honestly. Caller pushes the check into its result array; the test
@@ -557,7 +557,7 @@ export async function maybeRunSandboxInstallCommand(input: {
   timeoutSec?: number;
 }): Promise<AdapterSandboxInstallCommandCheck | null> {
   const { target, adapterKey, installCommand } = input;
-  if (!target || target.kind !== "remote" || target.transport !== "sandbox") {
+  if (!target || target.kind !== "remote") {
     return null;
   }
   const trimmed = installCommand.trim();
@@ -664,7 +664,7 @@ export async function ensureAdapterExecutionTargetRuntimeCommandInstalled(input:
   onLog?: AdapterExecutionTargetShellOptions["onLog"];
 }): Promise<void> {
   const installCommand = input.installCommand?.trim();
-  if (!installCommand || input.target?.kind !== "remote" || input.target.transport !== "sandbox") {
+  if (!installCommand || input.target?.kind !== "remote") {
     return;
   }
 
@@ -700,9 +700,10 @@ export async function ensureAdapterExecutionTargetRuntimeCommandInstalled(input:
   );
 
   // A failed or timed-out install is not necessarily fatal: the CLI may already
-  // be on PATH from a previous lease's install, the template image, or another
-  // path entry. Re-run the detect probe (when one is configured) so a transient
-  // install failure does not abort the agent run when the binary is reachable.
+  // be on PATH from a previous lease's install, the template image, an SSH user
+  // profile, or another path entry. Re-run the detect probe (when one is
+  // configured) so a transient install failure does not abort the agent run when
+  // the binary is reachable.
   const installFailed = result.timedOut || (result.exitCode ?? 0) !== 0;
   if (!installFailed) {
     return;
