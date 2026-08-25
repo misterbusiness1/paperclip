@@ -1589,7 +1589,13 @@ async function buildRuntime(input: {
     if (isForbiddenConfigEnvKey(key)) continue;
     if (isPaperclipRuntimeEnvKey(key) && key in env) continue;
     env[key] = value;
-    resolvedAdapterEnv[key] = value;
+    // Scratch roots are run-scoped lifecycle inputs, not stable adapter
+    // configuration. Keep them out of the compatibility fingerprint so the
+    // warm-handle guard below can explicitly retire the prior process and
+    // start a fresh session under the new root.
+    if (key !== "PAPERCLIP_RUN_SCRATCH_DIR" && key !== "PAPERCLIP_TASK_SCRATCH_DIR") {
+      resolvedAdapterEnv[key] = value;
+    }
   }
   if (authToken) env.PAPERCLIP_API_KEY = authToken;
   // For the claude agent, set model via ANTHROPIC_MODEL at startup rather than
@@ -2011,7 +2017,7 @@ async function buildRuntime(input: {
             Object.assign(env, paperclip.env);
             await input.ctx.onLog("stdout", "[paperclip] Sandbox ACP API callback bridge enabled for this run.\n");
           }
-          return (runtimeEnv = await resolveRuntimeEnv(env, runId));
+          return (runtimeEnv = await resolveRuntimeEnv(env, runId, false));
         })());
       const processSessionStart = measureStartupStep(input.ctx, nowMs, "bridge.process-session", () =>
         startAdapterExecutionTargetProcessSessionBridge({
@@ -2046,7 +2052,7 @@ async function buildRuntime(input: {
     } else {
       // Local / runner-less lanes never start a bridge, but the returned prepared
       // runtime and the log builder still read `runtimeEnv`.
-      runtimeEnv = await resolveRuntimeEnv(env, runId);
+      runtimeEnv = await resolveRuntimeEnv(env, runId, true);
     }
   } catch (err) {
     // On a partial concurrent bring-up failure, ONE bridge may have started while
@@ -2186,13 +2192,20 @@ async function applySessionConfigOptions(input: {
  * narrowed to string values. Shared by the remote concurrent bring-up and the
  * local / runner-less lane so both resolve the runtime env identically.
  */
-async function resolveRuntimeEnv(env: Record<string, string>, runId: string): Promise<Record<string, string>> {
+async function resolveRuntimeEnv(
+  env: Record<string, string>,
+  runId: string,
+  localChildProcess: boolean,
+): Promise<Record<string, string>> {
   const merged = Object.fromEntries(
     Object.entries(ensurePathInEnv({ ...sanitizeInheritedPaperclipEnv(process.env), ...env })).filter(
       (entry): entry is [string, string] => typeof entry[1] === "string",
     ),
   );
-  return prepareRunOwnedPaperclipEnv(merged, runId);
+  // Runner-backed ACP processes launch inside the remote target. Preparing
+  // selectors on the host would create paths that do not exist there; that
+  // lane owns its environment through staging/bridge preparation instead.
+  return localChildProcess ? prepareRunOwnedPaperclipEnv(merged, runId) : merged;
 }
 
 /**
@@ -3272,7 +3285,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
 
       const previousParams = parseObject(ctx.runtime.sessionParams);
       const canResume = isCompatibleSession(previousParams, prepared);
-      const resumeSessionId = canResume ? asString(previousParams.acpSessionId, "") || undefined : undefined;
+      let resumeSessionId = canResume ? asString(previousParams.acpSessionId, "") || undefined : undefined;
       let cached = canResume ? warmHandles.get(prepared.sessionKey) : undefined;
       // A warm local ACP process cannot receive a new process environment. If
       // the next heartbeat has a different run-owned selector root, retire the
@@ -3286,6 +3299,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           reason: "paperclip run environment changed",
         });
         cached = undefined;
+        resumeSessionId = undefined;
       }
       const childStderrState = cached?.childStderrState ?? { logPath: null, pendingLiveLine: "" };
       const processIdentitySink = cached?.processIdentitySink ?? {
