@@ -13,6 +13,7 @@ const mockRoutineService = vi.hoisted(() => ({
   get: vi.fn(),
   getDetail: vi.fn(),
   getDescriptionDocument: vi.fn(),
+  getScheduleCollisionWarning: vi.fn(),
   update: vi.fn(),
 }));
 const mockAnnotationService = vi.hoisted(() => ({
@@ -164,6 +165,7 @@ describe("routine description annotation routes", () => {
 
     mockRoutineService.get.mockResolvedValue(routine);
     mockRoutineService.getDescriptionDocument.mockResolvedValue(updatedDescriptionDocument);
+    mockRoutineService.getScheduleCollisionWarning.mockResolvedValue(null);
     mockRoutineService.update.mockResolvedValue({
       ...routine,
       description: "Alpha updated selected text omega",
