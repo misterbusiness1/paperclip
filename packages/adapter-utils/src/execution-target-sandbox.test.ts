@@ -1,6 +1,7 @@
 import { createServer } from "node:http";
 import net from "node:net";
 import { execFile, spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -652,6 +653,91 @@ describe("sandbox adapter execution targets", () => {
       await bridge?.stop();
     }
   });
+
+  it("reaps the full sandbox process tree when the bridge stops", async () => {
+    if (process.platform === "win32") return;
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-process-session-stop-tree-"));
+    cleanupDirs.push(rootDir);
+    const childPidPath = path.join(rootDir, "child.pid");
+    const grandchildPidPath = path.join(rootDir, "grandchild.pid");
+    const childPath = path.join(rootDir, "process-tree-child.mjs");
+    await writeFile(
+      childPath,
+      [
+        'import { spawn } from "node:child_process";',
+        'import { writeFileSync } from "node:fs";',
+        `writeFileSync(${JSON.stringify(childPidPath)}, String(process.pid));`,
+        'const grandchild = spawn("sh", ["-c", "trap \'\' TERM; sleep 300"], { stdio: "ignore" });',
+        `writeFileSync(${JSON.stringify(grandchildPidPath)}, String(grandchild.pid));`,
+        'process.stdin.resume();',
+      ].join("\n"),
+      "utf8",
+    );
+    const target: AdapterSandboxExecutionTarget = {
+      kind: "remote",
+      transport: "sandbox",
+      providerKey: "local-test",
+      remoteCwd: rootDir,
+      timeoutMs: 30_000,
+      runner: createLocalSandboxRunner(),
+    };
+
+    const bridge = await startAdapterExecutionTargetProcessSessionBridge({
+      runId: "run-process-session-stop-tree",
+      target,
+      runtimeRootDir: path.posix.join(rootDir, ".paperclip-runtime", "acpx"),
+      adapterKey: "acpx",
+      command: process.execPath,
+      args: [childPath],
+      cwd: rootDir,
+      env: {},
+      timeoutSec: 5,
+      onLog: async () => {},
+    });
+    expect(bridge).not.toBeNull();
+
+    const readPid = async (file: string) => {
+      await waitForCondition(
+        () => existsSync(file),
+        `Timed out waiting for ${path.basename(file)}.`,
+        3_000,
+      );
+      return Number.parseInt(await readFile(file, "utf8"), 10);
+    };
+    const childPid = await readPid(childPidPath);
+    const grandchildPid = await readPid(grandchildPidPath);
+    const { stdout: wrapperParent } = await execFileAsync("ps", ["-o", "ppid=", "-p", String(childPid)]);
+    const wrapperPid = Number.parseInt(wrapperParent.trim(), 10);
+    const isAlive = (pid: number) => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+
+    try {
+      expect(isAlive(wrapperPid)).toBe(true);
+      expect(isAlive(childPid)).toBe(true);
+      expect(isAlive(grandchildPid)).toBe(true);
+      await bridge!.stop();
+      await waitForCondition(
+        () => !isAlive(wrapperPid) && !isAlive(childPid) && !isAlive(grandchildPid),
+        "Timed out waiting for the sandbox process tree to exit.",
+        8_000,
+      );
+    } finally {
+      await bridge?.stop();
+      for (const pid of [wrapperPid, childPid, grandchildPid]) {
+        try {
+          process.kill(pid, "SIGKILL");
+        } catch {
+          // Already gone.
+        }
+      }
+    }
+  }, 15_000);
 
   it("buffers sandbox process session output until the local proxy connects", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-process-session-buffer-"));

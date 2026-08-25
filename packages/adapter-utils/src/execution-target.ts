@@ -1297,6 +1297,8 @@ const PROCESS_SESSION_REMOTE_SCRIPT = "paperclip-process-session-remote.mjs";
 const PROCESS_SESSION_REMOTE_STREAM_SCRIPT = "paperclip-process-session-remote-stream.mjs";
 const PROCESS_SESSION_AUTH_TIMEOUT_MS = 5_000;
 
+const PROCESS_SESSION_CHILD_KILL_GRACE_MS = 3_000;
+
 function jsonLine(value: unknown): string {
   return `${JSON.stringify(value)}\n`;
 }
@@ -1482,36 +1484,6 @@ export async function startAdapterExecutionTargetProcessSessionBridge(input: {
     env: sanitizeRemoteExecutionEnv(launchEnv),
   }), "utf8").toString("base64");
 
-  // Legacy poll path: background the wrapper with `nohup` and read its output
-  // event files with the host poll below. The streamed path launches the wrapper
-  // as one foreground session command further down instead, so skip this.
-  if (!streamOutput) {
-    await onLog("stdout", `[paperclip] Starting ACP process session bridge in sandbox (${target.providerKey ?? "provider"}).\n`);
-    const startResult = await runner.execute({
-      command: shellCommand,
-      args: shellCommandArgs(
-        [
-          `mkdir -p ${shellQuote(stdinDir)} ${shellQuote(eventsDir)}`,
-          `PAPERCLIP_PROCESS_SESSION_DIR=${shellQuote(sessionDir)} ` +
-            `PAPERCLIP_PROCESS_SESSION_COMMAND_B64=${shellQuote(commandPayload)} ` +
-            `nohup node ${shellQuote(remoteScriptPath)} >/dev/null 2>&1 < /dev/null &`,
-          "printf '%s\\n' \"$!\"",
-        ].join("\n"),
-      ),
-      cwd: target.remoteCwd,
-      env: {
-        PAPERCLIP_SANDBOX_EXEC_CHANNEL: "bridge",
-      },
-      timeoutMs,
-      // The wrapper launch is bridge plumbing. Keep it off the persistent
-      // session so it never queues behind an in-run session command.
-      bypassSession: true,
-    });
-    if (startResult.timedOut || (startResult.exitCode ?? 1) !== 0) {
-      throw new Error(`Failed to start sandbox ACP process session bridge: ${startResult.stderr || startResult.stdout}`);
-    }
-  }
-
   let socket: net.Socket | null = null;
   let stopping = false;
   let stdinSeq = 0;
@@ -1677,8 +1649,47 @@ export async function startAdapterExecutionTargetProcessSessionBridge(input: {
     pollTimer.unref?.();
   };
 
-  const port = await waitForLocalServerListen(server);
-  const agentCommand = await writeProcessSessionProxyScript(proxyDir, port, token);
+  let agentCommand: string;
+  try {
+    const port = await waitForLocalServerListen(server);
+    agentCommand = await writeProcessSessionProxyScript(proxyDir, port, token);
+  } catch (error) {
+    await new Promise<void>((resolve) => server.close(() => resolve())).catch(() => undefined);
+    await fs.rm(proxyDir, { recursive: true, force: true }).catch(() => undefined);
+    throw error;
+  }
+
+  // Prepare the local control plane before backgrounding the legacy wrapper.
+  // Once this launch succeeds, no fallible setup remains before the cleanup
+  // handle is returned.
+  if (!streamOutput) {
+    try {
+      await onLog("stdout", `[paperclip] Starting ACP process session bridge in sandbox (${target.providerKey ?? "provider"}).\n`);
+      const startResult = await runner.execute({
+        command: shellCommand,
+        args: shellCommandArgs(
+          [
+            `mkdir -p ${shellQuote(stdinDir)} ${shellQuote(eventsDir)}`,
+            `PAPERCLIP_PROCESS_SESSION_DIR=${shellQuote(sessionDir)} ` +
+              `PAPERCLIP_PROCESS_SESSION_COMMAND_B64=${shellQuote(commandPayload)} ` +
+              `nohup node ${shellQuote(remoteScriptPath)} >/dev/null 2>&1 < /dev/null &`,
+          ].join("\n"),
+        ),
+        cwd: target.remoteCwd,
+        env: { PAPERCLIP_SANDBOX_EXEC_CHANNEL: "bridge" },
+        timeoutMs,
+        bypassSession: true,
+      });
+      if (startResult.timedOut || (startResult.exitCode ?? 1) !== 0) {
+        throw new Error(`Failed to start sandbox ACP process session bridge: ${startResult.stderr || startResult.stdout}`);
+      }
+    } catch (error) {
+      await new Promise<void>((resolve) => server.close(() => resolve())).catch(() => undefined);
+      await client.remove(sessionDir).catch(() => undefined);
+      await fs.rm(proxyDir, { recursive: true, force: true }).catch(() => undefined);
+      throw error;
+    }
+  }
 
   if (streamOutput) {
     // Streamed output path. Run the wrapper as one long-lived session command;
@@ -1843,11 +1854,90 @@ socket.on("close", () => {
 `;
 }
 
-function getProcessSessionRemoteSource(input?: { outputToStdout?: boolean }): string {
+export function getProcessSessionRemoteSource(input?: { outputToStdout?: boolean }): string {
   return input?.outputToStdout === true
     ? getProcessSessionRemoteStreamSource()
     : getProcessSessionRemoteEventFileSource();
 }
+
+const PROCESS_SESSION_TEARDOWN_TAIL = `let tearingDown = false;
+let stdinEndTimer = null;
+let teardownPoll = null;
+let teardownForce = null;
+const childKillGraceMs = ${PROCESS_SESSION_CHILD_KILL_GRACE_MS};
+
+function signalChildTree(signal) {
+  if (process.platform !== "win32" && typeof child.pid === "number" && child.pid > 0) {
+    try {
+      process.kill(-child.pid, signal);
+      return;
+    } catch {
+      // Fall back to the direct child when the process group is already gone.
+    }
+  }
+  try {
+    process.kill(child.pid, signal);
+  } catch {
+    // The child already exited.
+  }
+}
+
+function childTreeAlive() {
+  try {
+    process.kill(process.platform === "win32" ? child.pid : -child.pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function finishTeardown(exitCode) {
+  if (teardownPoll) clearInterval(teardownPoll);
+  if (teardownForce) clearTimeout(teardownForce);
+  teardownPoll = null;
+  teardownForce = null;
+  process.exitCode = exitCode;
+}
+
+function teardown(exitCode) {
+  if (tearingDown) return;
+  tearingDown = true;
+  stdinClosed = true;
+  if (stdinEndTimer) clearTimeout(stdinEndTimer);
+  signalChildTree("SIGTERM");
+  if (!childTreeAlive()) {
+    finishTeardown(exitCode);
+    return;
+  }
+  teardownPoll = setInterval(() => {
+    if (!childTreeAlive()) finishTeardown(exitCode);
+  }, 50);
+  teardownForce = setTimeout(() => {
+    signalChildTree("SIGKILL");
+    finishTeardown(exitCode);
+  }, childKillGraceMs);
+}
+
+function endChildStdin() {
+  if (stdinClosed) return;
+  stdinClosed = true;
+  child.stdin.end();
+  stdinEndTimer = setTimeout(() => teardown(0), childKillGraceMs);
+}
+
+function finishAfterChildClose(exitCode) {
+  if (stdinEndTimer) clearTimeout(stdinEndTimer);
+  stdinEndTimer = null;
+  if (childTreeAlive()) {
+    teardown(exitCode);
+  } else {
+    process.exitCode = exitCode;
+  }
+}
+
+process.on("SIGTERM", () => teardown(143));
+process.on("SIGINT", () => teardown(130));
+`;
 
 // The shared stdin drain. Both wrappers read newline-delimited stdin messages
 // from the stdin file queue and write them to the child, then end the child
@@ -1857,7 +1947,17 @@ const PROCESS_SESSION_STDIN_POLL_TAIL = `child.stdin.on("error", () => {});
 
 async function pollStdin() {
   while (!stdinClosed) {
-    const entries = (await fs.readdir(stdinDir).catch(() => [])).filter((name) => name.endsWith(".json")).sort();
+    let names;
+    try {
+      names = await fs.readdir(stdinDir);
+    } catch (error) {
+      if (error && error.code === "ENOENT") {
+        teardown(0);
+        return;
+      }
+      throw error;
+    }
+    const entries = names.filter((name) => name.endsWith(".json")).sort();
     for (const name of entries) {
       const file = path.posix.join(stdinDir, name);
       const raw = await fs.readFile(file, "utf8").catch(() => null);
@@ -1867,8 +1967,7 @@ async function pollStdin() {
       if (message.type === "stdin" && typeof message.data === "string") {
         if (!stdinClosed) child.stdin.write(Buffer.from(message.data, "base64"));
       } else if (message.type === "stdinEnd") {
-        stdinClosed = true;
-        child.stdin.end();
+        endChildStdin();
         break;
       }
     }
@@ -1876,7 +1975,11 @@ async function pollStdin() {
   }
 }
 
-void pollStdin().catch((error) => void writeEvent({ type: "error", message: error instanceof Error ? error.message : String(error) }));
+void pollStdin().catch((error) => {
+  void Promise.resolve(
+    writeEvent({ type: "error", message: error instanceof Error ? error.message : String(error) }),
+  ).finally(() => teardown(1));
+});
 `;
 
 // Streamed variant: the wrapper writes each output frame as one newline-
@@ -1912,6 +2015,7 @@ function writeEvent(event) {
 const child = spawn(config.command, Array.isArray(config.args) ? config.args : [], {
   cwd: config.cwd || process.cwd(),
   env: { ...process.env, ...(config.env || {}) },
+  detached: process.platform !== "win32",
   stdio: ["pipe", "pipe", "pipe"],
 });
 
@@ -1924,9 +2028,10 @@ child.on("error", (error) => writeEvent({ type: "error", message: error.message 
 child.on("close", (code, signal) => {
   writeEvent({ type: "exit", code, signal });
   stdinClosed = true;
-  process.exitCode = typeof code === "number" ? code : 1;
+  finishAfterChildClose(typeof code === "number" ? code : 1);
 });
 
+${PROCESS_SESSION_TEARDOWN_TAIL}
 ${PROCESS_SESSION_STDIN_POLL_TAIL}`;
 }
 
@@ -1964,6 +2069,7 @@ function writeEvent(event) {
 const child = spawn(config.command, Array.isArray(config.args) ? config.args : [], {
   cwd: config.cwd || process.cwd(),
   env: { ...process.env, ...(config.env || {}) },
+  detached: process.platform !== "win32",
   stdio: ["pipe", "pipe", "pipe"],
 });
 
@@ -1972,8 +2078,13 @@ child.stderr.on("data", (chunk) => void writeEvent({ type: "data", stream: "stde
 child.on("error", (error) => void writeEvent({ type: "error", message: error.message }));
 // "close" (not "exit") so stdout/stderr fully drain before the exit event;
 // the write chain then guarantees the exit file lands after every data file.
-child.on("close", (code, signal) => void writeEvent({ type: "exit", code, signal }));
+child.on("close", (code, signal) => {
+  void writeEvent({ type: "exit", code, signal });
+  stdinClosed = true;
+  finishAfterChildClose(typeof code === "number" ? code : 1);
+});
 
+${PROCESS_SESSION_TEARDOWN_TAIL}
 ${PROCESS_SESSION_STDIN_POLL_TAIL}`;
 }
 
