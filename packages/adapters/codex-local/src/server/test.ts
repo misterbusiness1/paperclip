@@ -274,7 +274,7 @@ export async function testEnvironment(
     } else {
       const execArgs = buildCodexExecArgs(
         { ...config, fastMode: false },
-        { skipGitRepoCheck: targetIsSandbox },
+        { skipGitRepoCheck: true },
       );
       const args = execArgs.args;
       if (execArgs.fastModeIgnoredReason) {
@@ -285,14 +285,12 @@ export async function testEnvironment(
           hint: "Switch the agent model to GPT-5.4 or enter a manual model ID to enable Codex Fast mode.",
         });
       }
-      if (targetIsSandbox) {
-        checks.push({
-          code: "codex_git_repo_check_skipped",
-          level: "info",
-          message: "Added --skip-git-repo-check for sandbox hello probes.",
-          hint: "Codex requires an explicit trust bypass in headless remote sandbox workspaces.",
-        });
-      }
+      checks.push({
+        code: "codex_git_repo_check_skipped",
+        level: "info",
+        message: "Added --skip-git-repo-check for headless Codex hello probes.",
+        hint: "Codex requires an explicit trust bypass in headless local, SSH, and sandbox workspaces.",
+      });
 
       // Codex CLI (>= 0.122) ignores the OPENAI_API_KEY env var and only reads
       // credentials from $CODEX_HOME/auth.json. When we have a key available,
