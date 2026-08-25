@@ -102,6 +102,7 @@ const mockRoutineService = vi.hoisted(() => ({
   get: vi.fn(),
   getDetail: vi.fn(),
   getDescriptionDocument: vi.fn(),
+  getScheduleCollisionWarning: vi.fn(),
   update: vi.fn(),
   create: vi.fn(),
   listRevisions: vi.fn(),
@@ -200,6 +201,7 @@ describe("routine routes", () => {
     mockRoutineService.create.mockResolvedValue(routine);
     mockRoutineService.get.mockResolvedValue(routine);
     mockRoutineService.getTrigger.mockResolvedValue(trigger);
+    mockRoutineService.getScheduleCollisionWarning.mockResolvedValue(null);
     mockRoutineService.update.mockResolvedValue({ ...routine, assigneeAgentId: otherAgentId });
     mockRoutineService.listRevisions.mockResolvedValue([revision]);
     mockRoutineService.restoreRevision.mockResolvedValue({
@@ -598,6 +600,27 @@ describe("routine routes", () => {
     expect(res.status).toBe(403);
     expect(res.body.error).toContain("tasks:assign");
     expect(mockRoutineService.updateTrigger).not.toHaveBeenCalled();
+  });
+
+  it("warns when a trigger creates an identical active schedule for one assignee", async () => {
+    mockRoutineService.createTrigger.mockResolvedValue({ trigger, secretMaterial: null, revision });
+    mockRoutineService.getScheduleCollisionWarning.mockResolvedValue(
+      "Another active routine (aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa) assigned to this agent uses the same cron expression and timezone.",
+    );
+    const app = await createApp({
+      type: "board",
+      userId: "board-user",
+      source: "session",
+      isInstanceAdmin: true,
+      companyIds: [companyId],
+    });
+
+    const res = await request(app)
+      .post(`/api/routines/${routineId}/triggers`)
+      .send({ kind: "schedule", cronExpression: "0 10 * * *", timezone: "UTC" });
+
+    expect(res.status).toBe(201);
+    expect(res.headers["x-paperclip-warning"]).toContain("Another active routine");
   });
 
   it("requires tasks:assign permission to manually run a routine", async () => {

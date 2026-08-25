@@ -815,6 +815,33 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     expect(listed?.triggers[0]?.cronExpression).toBe(cronExpression);
   });
 
+  it("finds identical active schedules assigned to the same agent", async () => {
+    const { companyId, agentId, projectId, routine, svc } = await seedFixture();
+    await svc.createTrigger(routine.id, {
+      kind: "schedule",
+      cronExpression: "0 9 * * 1",
+      timezone: "America/New_York",
+    }, {});
+    const other = await svc.create(companyId, {
+      projectId,
+      title: "Another Monday routine",
+      assigneeAgentId: agentId,
+      priority: "medium",
+      status: "active",
+      concurrencyPolicy: "coalesce_if_active",
+      catchUpPolicy: "skip_missed",
+    }, {});
+    await svc.createTrigger(other.id, {
+      kind: "schedule",
+      cronExpression: "0 9 * * 1",
+      timezone: "America/New_York",
+    }, {});
+
+    await expect(svc.getScheduleCollisionWarning(routine.id)).resolves.toContain(other.id);
+    await svc.update(other.id, { status: "paused" }, {});
+    await expect(svc.getScheduleCollisionWarning(routine.id)).resolves.toBeNull();
+  });
+
   it("blocks agents from restoring routine revisions assigned to another agent", async () => {
     const { companyId, routine, svc } = await seedFixture();
     const otherAgentId = randomUUID();

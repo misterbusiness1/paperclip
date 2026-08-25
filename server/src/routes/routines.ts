@@ -1,4 +1,4 @@
-import { Router, type Request } from "express";
+import { Router, type Request, type Response } from "express";
 import type { Db } from "@paperclipai/db";
 import {
   createRoutineSchema,
@@ -94,6 +94,11 @@ export function routineRoutes(
     if (!allowed) {
       throw forbidden("Missing permission: tasks:assign");
     }
+  }
+
+  async function setScheduleCollisionWarning(res: Response, routineId: string) {
+    const warning = await svc.getScheduleCollisionWarning(routineId);
+    if (warning) res.set("X-Paperclip-Warning", warning);
   }
 
   function assertCanManageCompanyRoutine(req: Request, companyId: string, assigneeAgentId?: string | null) {
@@ -415,6 +420,7 @@ export function routineRoutes(
         triggerCount: null,
       });
     }
+    if (updated) await setScheduleCollisionWarning(res, routine.id);
     res.json(updated);
   });
 
@@ -450,6 +456,7 @@ export function routineRoutes(
       },
     });
     await remapRoutineDescriptionAnnotations(req, routine.id);
+    await setScheduleCollisionWarning(res, routine.id);
     res.json(result);
   });
 
@@ -494,6 +501,7 @@ export function routineRoutes(
       changeSummary: created.revision.changeSummary,
       triggerCount: created.revision.snapshot.triggers.length,
     });
+    await setScheduleCollisionWarning(res, routine.id);
     res.status(201).json(created);
   });
 
@@ -536,6 +544,7 @@ export function routineRoutes(
         changeSummary: updated.revision.changeSummary,
         triggerCount: updated.revision.snapshot.triggers.length,
       });
+      await setScheduleCollisionWarning(res, routine.id);
     }
     res.json(updated?.trigger ?? null);
   });

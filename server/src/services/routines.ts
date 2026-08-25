@@ -641,6 +641,44 @@ export function routineService(
       .then((rows) => rows[0] ?? null);
   }
 
+  async function getScheduleCollisionWarning(routineId: string) {
+    const routine = await getRoutineById(routineId);
+    if (!routine || routine.status !== "active" || !routine.assigneeAgentId) return null;
+
+    const schedules = await db
+      .select({
+        routineId: routines.id,
+        cronExpression: routineTriggers.cronExpression,
+        timezone: routineTriggers.timezone,
+      })
+      .from(routineTriggers)
+      .innerJoin(routines, eq(routineTriggers.routineId, routines.id))
+      .where(
+        and(
+          eq(routines.companyId, routine.companyId),
+          eq(routines.status, "active"),
+          eq(routines.assigneeAgentId, routine.assigneeAgentId),
+          eq(routineTriggers.kind, "schedule"),
+          eq(routineTriggers.enabled, true),
+          isNotNull(routineTriggers.cronExpression),
+          isNotNull(routineTriggers.timezone),
+        ),
+      );
+    const ownSchedules = new Set(
+      schedules
+        .filter((schedule) => schedule.routineId === routineId)
+        .map((schedule) => `${schedule.cronExpression}\0${schedule.timezone}`),
+    );
+    const collision = schedules.find(
+      (schedule) => schedule.routineId !== routineId &&
+        ownSchedules.has(`${schedule.cronExpression}\0${schedule.timezone}`),
+    );
+
+    return collision
+      ? `Another active routine (${collision.routineId}) assigned to this agent uses the same cron expression and timezone.`
+      : null;
+  }
+
   async function getManagedRoutineBinding(routine: typeof routines.$inferSelect) {
     return db
       .select({
@@ -2075,6 +2113,8 @@ export function routineService(
     },
 
     getDescriptionDocument: async (routineId: string) => getRoutineDescriptionDocument(routineId),
+
+    getScheduleCollisionWarning,
 
     create: async (companyId: string, input: CreateRoutine, actor: Actor): Promise<Routine> => {
       await assertProject(companyId, input.projectId ?? null);
