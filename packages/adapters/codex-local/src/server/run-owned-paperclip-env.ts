@@ -16,6 +16,13 @@ export type RunOwnedPaperclipEnvironment = {
   cleanup: () => Promise<void>;
 };
 
+type RunOwnedPaperclipFs = {
+  mkdtemp: (prefix: string) => Promise<string>;
+  mkdir: (directory: string, options: { recursive: true; mode: number }) => Promise<unknown>;
+  writeFile: (file: string, data: string, options: { encoding: "utf8"; mode: number }) => Promise<void>;
+  rm: (directory: string, options: { recursive: true; force: true }) => Promise<void>;
+};
+
 /**
  * Give a local Codex process and every command below it a private Paperclip
  * instance. The directory lives for one adapter invocation and is removed
@@ -24,17 +31,23 @@ export type RunOwnedPaperclipEnvironment = {
  */
 export async function prepareRunOwnedPaperclipEnvironment(
   inputEnv: Record<string, string>,
+  fileSystem: RunOwnedPaperclipFs = fs,
 ): Promise<RunOwnedPaperclipEnvironment> {
-  const rootDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-run-"));
+  const rootDir = await fileSystem.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-run-"));
   const homeDir = path.join(rootDir, "home");
   const configPath = path.join(rootDir, "config.json");
   const contextPath = path.join(rootDir, "context.json");
 
-  await fs.mkdir(homeDir, { recursive: true, mode: 0o700 });
-  await Promise.all([
-    fs.writeFile(configPath, "{}\n", { encoding: "utf8", mode: 0o600 }),
-    fs.writeFile(contextPath, "{}\n", { encoding: "utf8", mode: 0o600 }),
-  ]);
+  try {
+    await fileSystem.mkdir(homeDir, { recursive: true, mode: 0o700 });
+    await Promise.all([
+      fileSystem.writeFile(configPath, "{}\n", { encoding: "utf8", mode: 0o600 }),
+      fileSystem.writeFile(contextPath, "{}\n", { encoding: "utf8", mode: 0o600 }),
+    ]);
+  } catch (error) {
+    await fileSystem.rm(rootDir, { recursive: true, force: true }).catch(() => undefined);
+    throw error;
+  }
 
   const env = { ...inputEnv };
   for (const key of INHERITED_WORKTREE_SELECTORS) delete env[key];
@@ -46,6 +59,6 @@ export async function prepareRunOwnedPaperclipEnvironment(
   return {
     env,
     rootDir,
-    cleanup: () => fs.rm(rootDir, { recursive: true, force: true }),
+    cleanup: () => fileSystem.rm(rootDir, { recursive: true, force: true }),
   };
 }

@@ -948,12 +948,24 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const billingType = resolveCodexBillingType(effectiveEnv);
     const networkScope = parseLocalProcessNetworkScope(config.networkScope);
     const filesystemScope = parseLocalProcessFilesystemScope(config.filesystemScope);
+    const unisolatedRuntimeEnv = Object.fromEntries(
+      Object.entries(ensurePathInEnv(effectiveEnv)).filter(
+        (entry): entry is [string, string] => typeof entry[1] === "string",
+      ),
+    );
+    runOwnedPaperclip = !executionTargetIsRemote
+      ? await prepareRunOwnedPaperclipEnvironment(unisolatedRuntimeEnv)
+      : null;
+    const runtimeEnv = runOwnedPaperclip?.env ?? unisolatedRuntimeEnv;
     const localProcessSandbox: LocalProcessSandboxOptions | null =
       (filesystemScope || networkScope) && !executionTargetIsRemote
         ? {
             workspaceDir: effectiveExecutionCwd,
             filesystemScope,
-            managedPaths: [{ path: effectiveCodexHome, access: "rw" }],
+            managedPaths: [
+              { path: effectiveCodexHome, access: "rw" },
+              ...(runOwnedPaperclip ? [{ path: runOwnedPaperclip.rootDir, access: "rw" as const }] : []),
+            ],
             extraPaths: parseLocalProcessSandboxExtraPaths(config.filesystemExtraPaths),
             pathAliases: targetWorkspaceRealization?.mode === "copy"
               ? targetWorkspaceRealization.pathAliases
@@ -978,15 +990,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         `[paperclip] Confining Codex with ${scopes} scope.\n`,
       );
     }
-    const unisolatedRuntimeEnv = Object.fromEntries(
-      Object.entries(ensurePathInEnv(effectiveEnv)).filter(
-        (entry): entry is [string, string] => typeof entry[1] === "string",
-      ),
-    );
-    runOwnedPaperclip = !executionTargetIsRemote
-      ? await prepareRunOwnedPaperclipEnvironment(unisolatedRuntimeEnv)
-      : null;
-    const runtimeEnv = runOwnedPaperclip?.env ?? unisolatedRuntimeEnv;
     await ensureAdapterExecutionTargetRuntimeCommandInstalled({
       runId,
       target: executionTarget,
