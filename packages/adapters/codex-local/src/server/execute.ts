@@ -86,7 +86,6 @@ import {
 } from "./auth-precedence.js";
 import { prepareCodexRuntimeConfig } from "./runtime-config.js";
 import { resolveCodexDesiredSkillNames } from "./skills.js";
-import { prepareRunOwnedPaperclipEnvironment } from "./run-owned-paperclip-env.js";
 import { buildCodexExecArgs } from "./codex-args.js";
 import { SANDBOX_INSTALL_COMMAND } from "../index.js";
 import {
@@ -699,7 +698,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   // here so the outer `finally` can remove it on every exit path (teardown and
   // error), never only the happy path.
   let stagedCodexHomeDir: string | null = null;
-  let runOwnedPaperclip: Awaited<ReturnType<typeof prepareRunOwnedPaperclipEnvironment>> | null = null;
   try {
     for (const note of preparedRuntimeConfig.notes) {
       await onLog("stdout", `[paperclip] ${note}\n`);
@@ -948,24 +946,17 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const billingType = resolveCodexBillingType(effectiveEnv);
     const networkScope = parseLocalProcessNetworkScope(config.networkScope);
     const filesystemScope = parseLocalProcessFilesystemScope(config.filesystemScope);
-    const unisolatedRuntimeEnv = Object.fromEntries(
+    const runtimeEnv = Object.fromEntries(
       Object.entries(ensurePathInEnv(effectiveEnv)).filter(
         (entry): entry is [string, string] => typeof entry[1] === "string",
       ),
     );
-    runOwnedPaperclip = !executionTargetIsRemote
-      ? await prepareRunOwnedPaperclipEnvironment(unisolatedRuntimeEnv)
-      : null;
-    const runtimeEnv = runOwnedPaperclip?.env ?? unisolatedRuntimeEnv;
     const localProcessSandbox: LocalProcessSandboxOptions | null =
       (filesystemScope || networkScope) && !executionTargetIsRemote
         ? {
             workspaceDir: effectiveExecutionCwd,
             filesystemScope,
-            managedPaths: [
-              { path: effectiveCodexHome, access: "rw" },
-              ...(runOwnedPaperclip ? [{ path: runOwnedPaperclip.rootDir, access: "rw" as const }] : []),
-            ],
+            managedPaths: [{ path: effectiveCodexHome, access: "rw" }],
             extraPaths: parseLocalProcessSandboxExtraPaths(config.filesystemExtraPaths),
             pathAliases: targetWorkspaceRealization?.mode === "copy"
               ? targetWorkspaceRealization.pathAliases
@@ -1542,18 +1533,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       }
     }
   } finally {
-    // The local child and all nested commands share this private instance.
-    // Remove it after process teardown, including setup and spawn failures.
-    if (runOwnedPaperclip) {
-      await runOwnedPaperclip.cleanup().catch(async (error) => {
-        await onLog(
-          "stderr",
-          `[paperclip] Failed to remove run-owned Paperclip instance "${runOwnedPaperclip?.rootDir}": ${
-            error instanceof Error ? error.message : String(error)
-          }\n`,
-        );
-      });
-    }
     // Remove the staged CODEX_HOME allowlist temp dir on every exit path
     // (teardown AND error), never only the happy path. Cleanup failure is
     // logged, not fatal — a leaked temp dir must not crash the run.

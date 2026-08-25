@@ -1470,6 +1470,7 @@ describe("shared ACPX engine runtime behavior", () => {
 
   it("passes Paperclip env through ACPX session options instead of process.env", async () => {
     let observedSessionEnv: Record<string, string> | undefined;
+    const runScratch = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-acp-env-"));
     const execute = createAcpxEngineExecutor({
       createRuntime: () => ({
         ensureSession: async (input: { sessionOptions?: { env?: Record<string, string> } }) => {
@@ -1491,7 +1492,18 @@ describe("shared ACPX engine runtime behavior", () => {
         runId: "run-1",
         agent: { id: "agent-1", companyId: "company-1" },
         runtime: {},
-        config: { agent: "custom", agentCommand: "node ./fake-acp.js" },
+        config: {
+          agent: "custom",
+          agentCommand: "node ./fake-acp.js",
+          env: {
+            PAPERCLIP_RUN_SCRATCH_DIR: runScratch,
+            PAPERCLIP_HOME: "/paperclip/instances/default",
+            PAPERCLIP_CONFIG: "/paperclip/instances/default/config.json",
+            PAPERCLIP_CONTEXT: "/paperclip/instances/default/context.json",
+            PAPERCLIP_INSTANCE_ID: "default",
+            PAPERCLIP_IN_WORKTREE: "true",
+          },
+        },
         context: {},
         authToken: "runtime-key",
         onLog: async () => {},
@@ -1499,10 +1511,15 @@ describe("shared ACPX engine runtime behavior", () => {
       } as never);
       expect(result.exitCode).toBe(0);
       expect(observedSessionEnv?.PAPERCLIP_API_KEY).toBe("runtime-key");
+      expect(observedSessionEnv?.PAPERCLIP_HOME).toBe(path.join(runScratch, "child-paperclip-instance", "home"));
+      expect(observedSessionEnv?.PAPERCLIP_CONFIG).toBe(path.join(runScratch, "child-paperclip-instance", "config.json"));
+      expect(observedSessionEnv?.PAPERCLIP_CONTEXT).toBe(path.join(runScratch, "child-paperclip-instance", "context.json"));
+      expect(observedSessionEnv?.PAPERCLIP_INSTANCE_ID).toMatch(/^run-/);
       expect(process.env.PAPERCLIP_API_KEY).toBeUndefined();
     } finally {
       if (previousApiKey === undefined) delete process.env.PAPERCLIP_API_KEY;
       else process.env.PAPERCLIP_API_KEY = previousApiKey;
+      await fs.rm(runScratch, { recursive: true, force: true });
     }
   });
 
