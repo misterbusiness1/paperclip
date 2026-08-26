@@ -184,6 +184,25 @@ describeEmbeddedPostgres("heartbeat archived-company guard", () => {
     });
   });
 
+  it("does not scan archived-company issues for stranded assignment recovery", async () => {
+    const { companyId, agentId } = await insertArchivedAgent();
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Archived assigned work",
+      status: "todo",
+      assigneeAgentId: agentId,
+    });
+
+    const result = await heartbeatService(db).reconcileStrandedAssignedIssues();
+
+    expect(result.assignmentDispatched).toBe(0);
+    expect(result.skipped).toBe(0);
+    expect(await db.select().from(agentWakeupRequests)).toHaveLength(0);
+    expect(await db.select().from(heartbeatRuns)).toHaveLength(0);
+  });
+
   it("does not advance issue monitors for archived companies", async () => {
     const { companyId, agentId } = await insertArchivedAgent();
     const issueId = randomUUID();
