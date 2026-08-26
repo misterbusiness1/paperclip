@@ -28,6 +28,9 @@ const adapterUtilsPackage = JSON.parse(
 const dbPackage = JSON.parse(
   await readFile(new URL("../packages/db/package.json", import.meta.url), "utf8"),
 );
+const codexLocalPackage = JSON.parse(
+  await readFile(new URL("../packages/adapters/codex-local/package.json", import.meta.url), "utf8"),
+);
 const releaseScript = await readFile(new URL("./release.sh", import.meta.url), "utf8");
 const releaseLib = await readFile(new URL("./release-lib.sh", import.meta.url), "utf8");
 const buildNpmScript = await readFile(new URL("./build-npm.sh", import.meta.url), "utf8");
@@ -51,6 +54,15 @@ test("published packages preserve the patched embedded-postgres runtime", () => 
   assert.deepEqual(dbPackage.bundleDependencies, ["embedded-postgres"]);
   assert.equal(bundledCliNpmDependencies.has("embedded-postgres"), true);
   assert.equal(cliEsbuildConfig.external.includes("embedded-postgres"), false);
+});
+
+test("published Codex adapters preserve the patched codex-acp runtime", () => {
+  assert.equal(
+    rootPackage.pnpm.patchedDependencies["@agentclientprotocol/codex-acp@1.1.7"],
+    "patches/@agentclientprotocol__codex-acp@1.1.7.patch",
+  );
+  assert.equal(codexLocalPackage.dependencies["@agentclientprotocol/codex-acp"], "1.1.7");
+  assert.deepEqual(codexLocalPackage.bundleDependencies, ["@agentclientprotocol/codex-acp"]);
 });
 
 test("bundled package staging materializes publishConfig entrypoints", () => {
@@ -97,7 +109,7 @@ test("bundled package staging installs only dependencies included in the tarball
   assert.deepEqual(installManifest.bundleDependencies, ["embedded-postgres"]);
 });
 
-test("bundled package staging rebuilds npm dependencies and applies the acpx patch", (t) => {
+test("bundled package staging packs patched ACP runtimes", (t) => {
   const fixtureDir = mkdtempSync(join(tmpdir(), "paperclip-bundled-stage-"));
   const sourceDir = join(fixtureDir, "source");
   const destinationDir = join(fixtureDir, "destination");
@@ -108,7 +120,14 @@ test("bundled package staging rebuilds npm dependencies and applies the acpx pat
   writeFileSync(join(sourceDir, "dist", "index.js"), "export {};\n");
   mkdirSync(destinationDir);
   mkdirSync(binDir);
-  writeFileSync(join(sourceDir, "package.json"), JSON.stringify(adapterUtilsPackage));
+  writeFileSync(join(sourceDir, "package.json"), JSON.stringify({
+    ...adapterUtilsPackage,
+    dependencies: {
+      ...adapterUtilsPackage.dependencies,
+      "@agentclientprotocol/codex-acp": "1.1.7",
+    },
+    bundleDependencies: ["acpx", "@agentclientprotocol/codex-acp"],
+  }));
   writeFileSync(callLog, "");
   t.after(() => rmSync(fixtureDir, { recursive: true, force: true }));
 
@@ -133,6 +152,8 @@ printf 'npm %s\\n' "$*" >> "$FAKE_CALL_LOG"
 [ "$*" = "install --omit=dev --ignore-scripts --no-audit --no-fund" ]
 mkdir -p node_modules/acpx/dist
 printf 'unpatched runtime\\n' > node_modules/acpx/dist/runtime.js
+mkdir -p node_modules/@agentclientprotocol/codex-acp/dist
+printf 'unpatched createErrorEvent runtime\\n' > node_modules/@agentclientprotocol/codex-acp/dist/index.js
 `,
   );
   writeExecutable(
@@ -150,8 +171,13 @@ while [ "$#" -gt 0 ]; do
   fi
 done
 patch_input="$(cat)"
-grep -q onAgentStderr <<< "$patch_input"
-printf 'patched onAgentStderr runtime\\n' > "$target/dist/runtime.js"
+if [[ "$target" == */@agentclientprotocol/codex-acp ]]; then
+  grep -q RequestError.internalError <<< "$patch_input"
+  printf 'patched createErrorEvent internalError runtime\\n' > "$target/dist/index.js"
+else
+  grep -q onAgentStderr <<< "$patch_input"
+  printf 'patched onAgentStderr runtime\\n' > "$target/dist/runtime.js"
+fi
 `,
   );
 
@@ -178,6 +204,27 @@ printf 'patched onAgentStderr runtime\\n' > "$target/dist/runtime.js"
     readFileSync(callLog, "utf8"),
     /patch -p1 --forward -d .*node_modules\/acpx/,
   );
+  assert.match(
+    readFileSync(callLog, "utf8"),
+    /patch -p1 --forward -d .*node_modules\/@agentclientprotocol\/codex-acp/,
+  );
+
+  const tarballName = execFileSync("npm", ["pack", "--pack-destination", fixtureDir], {
+    cwd: destinationDir,
+    encoding: "utf8",
+  }).trim().split(/\r?\n/).at(-1);
+  const packedRuntime = execFileSync(
+    "tar",
+    ["-xOf", join(fixtureDir, tarballName), "package/node_modules/acpx/dist/runtime.js"],
+    { encoding: "utf8" },
+  );
+  assert.match(packedRuntime, /patched onAgentStderr runtime/);
+  const packedCodexRuntime = execFileSync(
+    "tar",
+    ["-xOf", join(fixtureDir, tarballName), "package/node_modules/@agentclientprotocol/codex-acp/dist/index.js"],
+    { encoding: "utf8" },
+  );
+  assert.match(packedCodexRuntime, /patched createErrorEvent internalError runtime/);
 });
 
 test("bundled package dry runs preview without querying published versions", () => {
