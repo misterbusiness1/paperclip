@@ -5204,7 +5204,8 @@ export function recoveryService(
           totalCount: sql<number>`count(*) over()::int`,
         })
         .from(issues)
-        .where(and(...filters))
+        .innerJoin(companies, eq(companies.id, issues.companyId))
+        .where(and(...filters, eq(companies.status, "active")))
         .orderBy(asc(issues.id))
         .limit(RESOLVED_DEPENDENCY_WAKE_BACKSTOP_CANDIDATE_LIMIT);
     };
