@@ -232,12 +232,13 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
   async function seedResolvedDependencyBackstopFixture(opts: {
     workspaceState?: "none" | "not_finalized" | "finalized";
     assignee?: "agent" | null;
+    blockedIssueId?: string;
   } = {}) {
     const workspaceState = opts.workspaceState ?? "none";
     const companyId = randomUUID();
     const agentId = randomUUID();
     const ownerUserId = randomUUID();
-    const blockedIssueId = randomUUID();
+    const blockedIssueId = opts.blockedIssueId ?? randomUUID();
     const blockerIssueId = randomUUID();
     const projectId = randomUUID();
     const projectWorkspaceId = randomUUID();
@@ -531,6 +532,68 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
       .where(and(eq(activityLog.companyId, companyId), eq(activityLog.action, "issue.blockers_resolved_wake_emitted")));
     expect(events).toHaveLength(1);
     expect(events[0]).toMatchObject({ entityId: blockedIssueId });
+  });
+
+  it("filters non-ready blocked issues before applying the candidate page limit", async () => {
+    const readyBlockedIssueId = "ffffffff-ffff-4fff-bfff-ffffffffffff";
+    const { companyId, agentId, blockedIssueId } = await seedResolvedDependencyBackstopFixture({
+      workspaceState: "none",
+      blockedIssueId: readyBlockedIssueId,
+    });
+    const unfinishedBlockerIssueId = "10000000-0000-4000-8000-ffffffffffff";
+    const missingBlockerIssueId = "10000000-0000-4000-9000-ffffffffffff";
+    const unresolvedDependentIds = Array.from(
+      { length: 501 },
+      (_, index) => `10000000-0000-4000-8000-${index.toString(16).padStart(12, "0")}`,
+    );
+
+    await db.insert(issues).values([
+      {
+        id: unfinishedBlockerIssueId,
+        companyId,
+        title: "Unfinished blocker",
+        status: "todo",
+        priority: "medium",
+        issueNumber: 3,
+        identifier: "PAGE-3",
+      },
+      {
+        id: missingBlockerIssueId,
+        companyId,
+        title: "Blocked without a blocker relation",
+        status: "blocked",
+        priority: "medium",
+        assigneeAgentId: agentId,
+        issueNumber: 4,
+        identifier: "PAGE-4",
+      },
+      ...unresolvedDependentIds.map((id, index) => ({
+        id,
+        companyId,
+        title: `Blocked on unfinished dependency ${index + 1}`,
+        status: "blocked",
+        priority: "medium",
+        assigneeAgentId: agentId,
+        issueNumber: index + 5,
+        identifier: `PAGE-${index + 5}`,
+      })),
+    ]);
+    await db.insert(issueRelations).values(
+      unresolvedDependentIds.map((relatedIssueId) => ({
+        companyId,
+        issueId: unfinishedBlockerIssueId,
+        relatedIssueId,
+        type: "blocks" as const,
+      })),
+    );
+
+    const result = await heartbeatService(db).reconcileIssueGraphLiveness();
+
+    expect(result.dependencyWakeBackstopChecked).toBe(1);
+    expect(result.dependencyWakeCandidateLimitSkipped).toBe(0);
+    expect(result.dependencyWakeNotReadySkipped).toBe(0);
+    expect(result.dependencyWakesHealed).toBe(1);
+    expect(result.dependencyWakeIssueIds).toEqual([blockedIssueId]);
   });
 
   it("reconciles a resolved blocked dependency after the assignee-null window closes", async () => {
