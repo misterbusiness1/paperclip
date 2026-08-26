@@ -82,8 +82,7 @@
   "pnpm": {
     "patchedDependencies": {
       "embedded-postgres@18.1.0-beta.16": "patches/embedded-postgres@18.1.0-beta.16.patch",
-      "acpx@0.12.0": "patches/acpx@0.12.0.patch",
-      "@agentclientprotocol/codex-acp@1.1.7": "patches/@agentclientprotocol__codex-acp@1.1.7.patch"
+      "acpx@0.12.0": "patches/acpx@0.12.0.patch"
     },
     "overrides": {
       "rollup": ">=4.59.0",

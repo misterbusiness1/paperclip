@@ -45,9 +45,6 @@
     "dist",
     "skills"
   ],
-  "bundleDependencies": [
-    "@agentclientprotocol/codex-acp"
-  ],
   "scripts": {
     "build": "tsc && cp src/server/codex-auth-merge-decision.cjs src/server/codex-auth-merge-extract.sh dist/server/",
     "clean": "rm -rf dist",
