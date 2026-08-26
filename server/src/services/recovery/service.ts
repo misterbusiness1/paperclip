@@ -3646,6 +3646,11 @@ export function recoveryService(
       .from(issues)
       .where(
         and(
+          sql<boolean>`exists (
+            select 1 from companies recovery_company
+            where recovery_company.id = ${issues.companyId}
+              and recovery_company.status = 'active'
+          )`,
           isNull(issues.assigneeUserId),
           inArray(issues.status, ["todo", "in_progress", "in_review"]),
           or(
