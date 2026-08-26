@@ -5152,6 +5152,27 @@ export function recoveryService(
       if (opts?.companyId) filters.push(eq(issues.companyId, opts.companyId));
       if (afterIssueId) filters.push(gt(issues.id, afterIssueId));
 
+      if (!opts?.blockerIssueId) {
+        filters.push(
+          sql<boolean>`exists (
+            select 1
+            from issue_relations blocker_relation
+            where blocker_relation.company_id = ${issues.companyId}
+              and blocker_relation.type = 'blocks'
+              and blocker_relation.related_issue_id = ${issues.id}
+          )`,
+          sql<boolean>`not exists (
+            select 1
+            from issue_relations blocker_relation
+            inner join issues blocker_issue on blocker_issue.id = blocker_relation.issue_id
+            where blocker_relation.company_id = ${issues.companyId}
+              and blocker_relation.type = 'blocks'
+              and blocker_relation.related_issue_id = ${issues.id}
+              and blocker_issue.status <> 'done'
+          )`,
+        );
+      }
+
       if (opts?.blockerIssueId) {
         filters.push(
           eq(issueRelations.companyId, issues.companyId),
