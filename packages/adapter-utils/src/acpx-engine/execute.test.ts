@@ -1341,6 +1341,11 @@ describe("shared ACPX engine runtime behavior", () => {
     );
     expect(payloadEnv.PAPERCLIP_API_KEY).toBeTruthy();
     expect(payloadEnv.PAPERCLIP_API_KEY).not.toBe("real-run-jwt");
+    // A runner-backed process launches remotely. The host must not prepare a
+    // run-owned selector tree and forward those host-only paths to the target.
+    expect(payloadEnv.PAPERCLIP_HOME).toBeUndefined();
+    expect(payloadEnv.PAPERCLIP_CONFIG).toBeUndefined();
+    expect(payloadEnv.PAPERCLIP_CONTEXT).toBeUndefined();
   });
 
   it("keeps the session fingerprint stable when only the host spawn cwd changes", async () => {
@@ -1468,8 +1473,70 @@ describe("shared ACPX engine runtime behavior", () => {
     await expect(fs.readFile(path.join(stateDir, "run-stderr", "run-warm-2.log"), "utf8")).resolves.toContain("current-run-stderr");
   });
 
+  it("retires a warm ACP handle when the run scratch root changes", async () => {
+    const root = await makeTempRoot();
+    const stateDir = path.join(root, "state");
+    const firstScratch = path.join(root, "run-a");
+    const secondScratch = path.join(root, "run-b");
+    await Promise.all([
+      fs.mkdir(firstScratch, { recursive: true }),
+      fs.mkdir(secondScratch, { recursive: true }),
+    ]);
+    const warmHandles = new Map();
+    const ensureInputs: Record<string, unknown>[] = [];
+    let closeCount = 0;
+    let runtimeCount = 0;
+    const execute = createAcpxEngineExecutor({
+      warmHandles,
+      createRuntime: () => {
+        runtimeCount += 1;
+        return {
+          ...buildRuntime(undefined, (input) => ensureInputs.push(input)),
+          close: async () => {
+            closeCount += 1;
+          },
+        } as never;
+      },
+    });
+    const config = {
+      agent: "custom",
+      agentCommand: "node ./fake-acp.js",
+      stateDir,
+      mode: "persistent",
+      warmHandleIdleMs: 60_000,
+      env: { PAPERCLIP_RUN_SCRATCH_DIR: firstScratch },
+    };
+    const first = await execute({
+      runId: "run-a",
+      agent: { id: "agent-1", companyId: "company-1" },
+      runtime: {},
+      config,
+      context: {},
+      onLog: async () => {},
+      onMeta: async () => {},
+    } as never);
+
+    config.env.PAPERCLIP_RUN_SCRATCH_DIR = secondScratch;
+    const second = await execute({
+      runId: "run-b",
+      agent: { id: "agent-1", companyId: "company-1" },
+      runtime: { sessionParams: first.sessionParams },
+      config,
+      context: {},
+      onLog: async () => {},
+      onMeta: async () => {},
+    } as never);
+
+    expect(second.exitCode).toBe(0);
+    expect(closeCount).toBe(1);
+    expect(runtimeCount).toBe(2);
+    expect(ensureInputs).toHaveLength(2);
+    expect(ensureInputs[1]!.resumeSessionId).toBeUndefined();
+  });
+
   it("passes Paperclip env through ACPX session options instead of process.env", async () => {
     let observedSessionEnv: Record<string, string> | undefined;
+    const runScratch = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-acp-env-"));
     const execute = createAcpxEngineExecutor({
       createRuntime: () => ({
         ensureSession: async (input: { sessionOptions?: { env?: Record<string, string> } }) => {
@@ -1491,7 +1558,18 @@ describe("shared ACPX engine runtime behavior", () => {
         runId: "run-1",
         agent: { id: "agent-1", companyId: "company-1" },
         runtime: {},
-        config: { agent: "custom", agentCommand: "node ./fake-acp.js" },
+        config: {
+          agent: "custom",
+          agentCommand: "node ./fake-acp.js",
+          env: {
+            PAPERCLIP_RUN_SCRATCH_DIR: runScratch,
+            PAPERCLIP_HOME: "/paperclip/instances/default",
+            PAPERCLIP_CONFIG: "/paperclip/instances/default/config.json",
+            PAPERCLIP_CONTEXT: "/paperclip/instances/default/context.json",
+            PAPERCLIP_INSTANCE_ID: "default",
+            PAPERCLIP_IN_WORKTREE: "true",
+          },
+        },
         context: {},
         authToken: "runtime-key",
         onLog: async () => {},
@@ -1499,10 +1577,15 @@ describe("shared ACPX engine runtime behavior", () => {
       } as never);
       expect(result.exitCode).toBe(0);
       expect(observedSessionEnv?.PAPERCLIP_API_KEY).toBe("runtime-key");
+      expect(observedSessionEnv?.PAPERCLIP_HOME).toBe(path.join(runScratch, "child-paperclip-instance", "home"));
+      expect(observedSessionEnv?.PAPERCLIP_CONFIG).toBe(path.join(runScratch, "child-paperclip-instance", "config.json"));
+      expect(observedSessionEnv?.PAPERCLIP_CONTEXT).toBe(path.join(runScratch, "child-paperclip-instance", "context.json"));
+      expect(observedSessionEnv?.PAPERCLIP_INSTANCE_ID).toMatch(/^run-/);
       expect(process.env.PAPERCLIP_API_KEY).toBeUndefined();
     } finally {
       if (previousApiKey === undefined) delete process.env.PAPERCLIP_API_KEY;
       else process.env.PAPERCLIP_API_KEY = previousApiKey;
+      await fs.rm(runScratch, { recursive: true, force: true });
     }
   });
 

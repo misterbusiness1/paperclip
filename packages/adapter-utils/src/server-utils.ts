@@ -2254,6 +2254,55 @@ export function sanitizeInheritedPaperclipEnv(baseEnv: NodeJS.ProcessEnv): NodeJ
   return env;
 }
 
+const PAPERCLIP_DISCOVERY_SELECTORS = [
+  "PAPERCLIP_IN_WORKTREE",
+  "PAPERCLIP_WORKTREES_DIR",
+  "PAPERCLIP_WORKTREE_COLOR",
+  "PAPERCLIP_WORKTREE_NAME",
+  "PAPERCLIP_WORKTREE_START_POINT",
+] as const;
+
+/**
+ * Bind a local adapter process to the run scratch tree. The server owns that
+ * tree's lifecycle, so nested commands and warm runtimes cannot outlive a
+ * helper-created temp directory. Remote process environments are shaped by
+ * their execution target instead and must not call this helper.
+ */
+export async function prepareRunOwnedPaperclipEnv(
+  inputEnv: NodeJS.ProcessEnv | Record<string, string>,
+  runId: string,
+): Promise<Record<string, string>> {
+  const env = Object.fromEntries(
+    Object.entries(inputEnv).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
+  );
+  const scratchRoot = env.PAPERCLIP_RUN_SCRATCH_DIR || env.PAPERCLIP_TASK_SCRATCH_DIR;
+  const rootDir = scratchRoot
+    ? path.join(scratchRoot, "child-paperclip-instance")
+    // Standalone adapter-utils consumers do not have the server's run scratch
+    // lifecycle. Keep their warm process on one process-owned fallback root;
+    // production runs always take the run-scratch branch above.
+    : path.join(os.tmpdir(), `paperclip-child-process-${process.pid}`);
+  const homeDir = path.join(rootDir, "home");
+  const configPath = path.join(rootDir, "config.json");
+  const contextPath = path.join(rootDir, "context.json");
+
+  await fs.mkdir(homeDir, { recursive: true, mode: 0o700 });
+  await Promise.all([
+    fs.writeFile(configPath, "{}\n", { encoding: "utf8", mode: 0o600, flag: "wx" }).catch((error: NodeJS.ErrnoException) => {
+      if (error.code !== "EEXIST") throw error;
+    }),
+    fs.writeFile(contextPath, "{}\n", { encoding: "utf8", mode: 0o600, flag: "wx" }).catch((error: NodeJS.ErrnoException) => {
+      if (error.code !== "EEXIST") throw error;
+    }),
+  ]);
+  for (const key of PAPERCLIP_DISCOVERY_SELECTORS) delete env[key];
+  env.PAPERCLIP_HOME = homeDir;
+  env.PAPERCLIP_CONFIG = configPath;
+  env.PAPERCLIP_INSTANCE_ID = `run-${createHash("sha256").update(runId).digest("hex").slice(0, 16)}`;
+  env.PAPERCLIP_CONTEXT = contextPath;
+  return env;
+}
+
 export function defaultPathForPlatform() {
   if (process.platform === "win32") {
     return "C:\\Windows\\System32;C:\\Windows;C:\\Windows\\System32\\Wbem";
@@ -3210,10 +3259,22 @@ export async function runChildProcess(
   },
 ): Promise<RunProcessResult> {
   const onLogError = opts.onLogError ?? ((err, id, msg) => console.warn({ err, runId: id }, msg));
+  const localEnv = opts.remoteExecution
+    ? opts.env
+    : await prepareRunOwnedPaperclipEnv(opts.env, runId);
+  const localProcessSandbox = opts.localProcessSandbox && !opts.remoteExecution
+    ? {
+        ...opts.localProcessSandbox,
+        managedPaths: [
+          ...(opts.localProcessSandbox.managedPaths ?? []),
+          { path: path.dirname(localEnv.PAPERCLIP_HOME), access: "rw" as const },
+        ],
+      }
+    : opts.localProcessSandbox;
   return new Promise<RunProcessResult>((resolve, reject) => {
     const rawMerged: NodeJS.ProcessEnv = {
       ...sanitizeInheritedPaperclipEnv(process.env),
-      ...opts.env,
+      ...localEnv,
     };
 
     // Strip Claude Code nesting-guard env vars so spawned `claude` processes
@@ -3238,7 +3299,7 @@ export async function runChildProcess(
     void resolveSpawnTarget(command, args, opts.cwd, mergedEnv, {
       remoteExecution: opts.remoteExecution ?? null,
       remoteEnv: opts.remoteExecution ? opts.env : null,
-      localProcessSandbox: opts.localProcessSandbox ?? null,
+      localProcessSandbox: localProcessSandbox ?? null,
     })
       .then((target) => {
         const childEnv = { ...mergedEnv, ...target.env };
