@@ -534,6 +534,27 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     expect(events[0]).toMatchObject({ entityId: blockedIssueId });
   });
 
+  it("excludes archived companies from global dependency wake recovery while healing active companies", async () => {
+    const archived = await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
+    await db
+      .update(companies)
+      .set({ status: "archived" })
+      .where(eq(companies.id, archived.companyId));
+    const active = await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
+
+    const result = await heartbeatService(db).reconcileIssueGraphLiveness();
+
+    expect(result.dependencyWakeBackstopChecked).toBe(1);
+    expect(result.dependencyWakesHealed).toBe(1);
+    expect(result.dependencyWakeIssueIds).toEqual([active.blockedIssueId]);
+
+    const archivedWakes = await db
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.companyId, archived.companyId));
+    expect(archivedWakes).toHaveLength(0);
+  });
+
   it("filters non-ready blocked issues before applying the candidate page limit", async () => {
     const readyBlockedIssueId = "ffffffff-ffff-4fff-bfff-ffffffffffff";
     const { companyId, agentId, blockedIssueId } = await seedResolvedDependencyBackstopFixture({
