@@ -472,6 +472,32 @@ describe("codex_local ACP lane", () => {
     });
   });
 
+  it("maps the Codex bypass flag to the ACP agent full-access mode", () => {
+    expect(buildCodexAcpConfig({
+      dangerouslyBypassApprovalsAndSandbox: true,
+      env: { ONECLI_AGENT: "fixture" },
+    })).toMatchObject({
+      env: {
+        INITIAL_AGENT_MODE: "agent-full-access",
+        ONECLI_AGENT: "fixture",
+      },
+    });
+
+    expect(buildCodexAcpConfig({
+      dangerouslyBypassApprovalsAndSandbox: true,
+      env: { INITIAL_AGENT_MODE: "read-only" },
+    })).toMatchObject({ env: { INITIAL_AGENT_MODE: "agent-full-access" } });
+
+    expect(buildCodexAcpConfig({ dangerouslyBypassSandbox: true })).toMatchObject({
+      env: { INITIAL_AGENT_MODE: "agent-full-access" },
+    });
+
+    expect(buildCodexAcpConfig({
+      dangerouslyBypassApprovalsAndSandbox: false,
+      dangerouslyBypassSandbox: true,
+    }).env).toBeUndefined();
+  });
+
   it("normalizes the legacy bare gpt-5.6 alias to gpt-5.6-sol", () => {
     expect(buildCodexAcpConfig({ engine: "acp", model: "gpt-5.6" })).toMatchObject({
       model: "gpt-5.6-sol",

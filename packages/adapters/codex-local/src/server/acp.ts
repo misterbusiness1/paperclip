@@ -31,6 +31,7 @@ import type {
   AcpxRemoteManagedHomeResult,
 } from "@paperclipai/adapter-utils/acpx-engine/execute";
 import {
+  asBoolean,
   asNumber,
   asString,
   parseObject,
@@ -136,6 +137,11 @@ function firstNonEmptyString(...values: unknown[]): string | undefined {
 export function buildCodexAcpConfig(config: Record<string, unknown>): Record<string, unknown> {
   const agentCommand = firstNonEmptyString(config.agentCommand, config.acpAgentCommand);
   const stateDir = firstNonEmptyString(config.stateDir, config.acpStateDir);
+  const env = parseObject(config.env);
+  const bypass = asBoolean(
+    config.dangerouslyBypassApprovalsAndSandbox,
+    asBoolean(config.dangerouslyBypassSandbox, false),
+  );
   const mode = firstNonEmptyString(config.mode, config.acpMode) ?? DEFAULT_ACP_ENGINE_MODE;
   const permissionMode =
     firstNonEmptyString(config.permissionMode, config.acpPermissionMode) ??
@@ -163,6 +169,9 @@ export function buildCodexAcpConfig(config: Record<string, unknown>): Record<str
     ...(normalizedModel ? { model: normalizedModel } : {}),
     ...(agentCommand ? { agentCommand } : {}),
     ...(stateDir ? { stateDir } : {}),
+    ...(bypass
+      ? { env: { ...env, INITIAL_AGENT_MODE: "agent-full-access" } }
+      : {}),
   };
 }
 
