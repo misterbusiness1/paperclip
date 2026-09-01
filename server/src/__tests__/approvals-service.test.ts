@@ -294,4 +294,102 @@ describe("approvalService creation idempotency", () => {
       ),
     ).rejects.toMatchObject({ status: 409 });
   });
+
+  it("recovers the losing concurrent same-request insert as a replay", async () => {
+    const winner = {
+      ...createApproval("pending"),
+      type: "request_board_approval",
+      idempotencyKey: "approval:OXFA-2794",
+      idempotencyRequestHash: "set-by-insert",
+    } as ApprovalRecord & { idempotencyKey: string; idempotencyRequestHash: string };
+    const data = {
+      type: "request_board_approval",
+      requestedByAgentId: "requester-1",
+      requestedByUserId: null,
+      status: "pending",
+      payload: { agentId: "agent-1" },
+      decisionNote: null,
+      decidedByUserId: null,
+      decidedAt: null,
+      updatedAt: new Date("2026-08-03T00:00:00.000Z"),
+    } as any;
+    let persisted: typeof winner | null = null;
+    let releaseSelects!: () => void;
+    const bothSelected = new Promise<void>((resolve) => {
+      releaseSelects = resolve;
+    });
+    let initialSelectCount = 0;
+    const selectWhere = vi.fn(async () => {
+      if (persisted) return [persisted];
+      initialSelectCount += 1;
+      if (initialSelectCount === 2) releaseSelects();
+      await bothSelected;
+      return [];
+    });
+    const insertValues = vi.fn((values: any) => ({
+      returning: vi.fn(async () => {
+        if (!persisted) {
+          persisted = { ...winner, idempotencyRequestHash: values.idempotencyRequestHash };
+          return [persisted];
+        }
+        throw {
+          code: "23505",
+          constraint: "approvals_company_idempotency_key_uq",
+        };
+      }),
+    }));
+    const db = {
+      select: vi.fn(() => ({ from: vi.fn(() => ({ where: selectWhere })) })),
+      insert: vi.fn(() => ({ values: insertValues })),
+    };
+    const svc = approvalService(db as any);
+
+    const results = await Promise.all([
+      svc.createWithIdempotency("company-1", data, "approval:OXFA-2794"),
+      svc.createWithIdempotency("company-1", data, "approval:OXFA-2794"),
+    ]);
+
+    expect(results.map((result) => result.replayed).sort()).toEqual([false, true]);
+    expect(results[0]?.approval.id).toBe(results[1]?.approval.id);
+    expect(insertValues).toHaveBeenCalledTimes(2);
+  });
+
+  it("returns a stable conflict when a concurrent different request wins the key", async () => {
+    const winner = {
+      ...createApproval("pending"),
+      idempotencyKey: "approval:OXFA-2794",
+      idempotencyRequestHash: "different-request-hash",
+    } as ApprovalRecord & { idempotencyKey: string; idempotencyRequestHash: string };
+    const dbStub = createApprovalCreateDbStub([[], [winner]], []);
+    dbStub.values.mockImplementationOnce(() => ({
+      returning: vi.fn(async () => {
+        throw {
+          code: "23505",
+          constraint_name: "approvals_company_idempotency_key_uq",
+        };
+      }),
+    }));
+
+    await expect(
+      approvalService(dbStub.db as any).createWithIdempotency(
+        "company-1",
+        {
+          type: "request_board_approval",
+          requestedByAgentId: "requester-1",
+          requestedByUserId: null,
+          status: "pending",
+          payload: { subject: "Loser" },
+          decisionNote: null,
+          decidedByUserId: null,
+          decidedAt: null,
+          updatedAt: new Date("2026-08-03T00:00:00.000Z"),
+        } as any,
+        "approval:OXFA-2794",
+      ),
+    ).rejects.toMatchObject({
+      status: 409,
+      message: "Approval idempotency key already exists for a different request",
+      details: { idempotencyKey: "approval:OXFA-2794" },
+    });
+  });
 });

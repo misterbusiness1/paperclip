@@ -10,6 +10,15 @@ import { budgetService } from "./budgets.js";
 import { notifyHireApproved } from "./hire-hook.js";
 import { instanceSettingsService } from "./instance-settings.js";
 
+const APPROVAL_IDEMPOTENCY_CONSTRAINT = "approvals_company_idempotency_key_uq";
+
+function isApprovalIdempotencyConflict(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  const err = error as { code?: string; constraint?: string; constraint_name?: string };
+  const constraint = err.constraint ?? err.constraint_name;
+  return err.code === "23505" && constraint === APPROVAL_IDEMPOTENCY_CONSTRAINT;
+}
+
 export function approvalService(db: Db) {
   const agentsSvc = agentService(db);
   const budgets = budgetService(db);
@@ -173,11 +182,25 @@ export function approvalService(db: Db) {
         return { approval: existing, replayed: true };
       }
 
-      const inserted = await db
-        .insert(approvals)
-        .values({ ...data, companyId, idempotencyKey, idempotencyRequestHash: requestHash })
-        .returning()
-        .then((rows) => rows[0]);
+      let inserted: ApprovalRecord;
+      try {
+        inserted = await db
+          .insert(approvals)
+          .values({ ...data, companyId, idempotencyKey, idempotencyRequestHash: requestHash })
+          .returning()
+          .then((rows) => rows[0]);
+      } catch (error) {
+        if (!isApprovalIdempotencyConflict(error)) throw error;
+
+        const winner = await findByIdempotencyKey(companyId, idempotencyKey);
+        if (!winner) throw error;
+        if (winner.idempotencyRequestHash !== requestHash) {
+          throw conflict("Approval idempotency key already exists for a different request", {
+            idempotencyKey,
+          });
+        }
+        return { approval: winner, replayed: true };
+      }
 
       return { approval: inserted, replayed: false };
     },
