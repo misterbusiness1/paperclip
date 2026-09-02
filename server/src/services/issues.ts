@@ -1206,6 +1206,28 @@ async function listUnresolvedBlockerIssueIds(
     )
     .then((rows) => rows.map((row) => row.id));
 }
+
+async function assertValidUnresolvedBlockerIssueIds(
+  dbOrTx: Pick<Db, "select">,
+  companyId: string,
+  blockerIssueIds: string[],
+) {
+  const uniqueBlockerIssueIds = [...new Set(blockerIssueIds)];
+  if (uniqueBlockerIssueIds.length === 0 || uniqueBlockerIssueIds.some((id) => !id)) {
+    throw unprocessable("Blocked assignment to a paused agent requires an unresolved blocker issue");
+  }
+  const rows = await dbOrTx
+    .select({ id: issues.id, status: issues.status })
+    .from(issues)
+    .where(and(eq(issues.companyId, companyId), inArray(issues.id, uniqueBlockerIssueIds)));
+  if (
+    rows.length !== uniqueBlockerIssueIds.length
+    || rows.some((row) => row.status === "done" || row.status === "cancelled")
+  ) {
+    throw unprocessable("Blocked-by issues must exist in the same company and remain unresolved");
+  }
+  return true;
+}
 async function getProjectDefaultGoalId(
   db: ProjectGoalReader,
   companyId: string,
@@ -6197,7 +6219,7 @@ export function issueService(db: Db) {
         labelIds: inputLabelIds,
         blockedByIssueIds,
         inheritExecutionWorkspaceFromIssueId,
-        assignmentGuardBlockerComment,
+        assignmentGuardBlockerComment: _assignmentGuardBlockerComment,
         skipExecutionWorkspaceInheritance,
         watchdog,
         watchdogActorRunId,
@@ -6236,11 +6258,14 @@ export function issueService(db: Db) {
           .where(eq(agents.id, issueData.assigneeAgentId))
           .then((rows: Array<{ id: string; status: string }>) => rows[0] ?? null)
         : null;
+      const hasUnresolvedBlocker = nextAssigneeAgent?.status === "paused" && nextStatus === "blocked"
+        ? await assertValidUnresolvedBlockerIssueIds(db, companyId, blockedByIssueIds ?? [])
+        : false;
       assertIssueAssigneeExecutableState({
         status: nextStatus,
         assigneeAgentId: issueData.assigneeAgentId ?? null,
         assigneeStatus: nextAssigneeAgent?.status ?? null,
-        blockerComment: assignmentGuardBlockerComment,
+        hasUnresolvedBlocker,
       });
       const created = await db.transaction(async (tx) => {
         const idempotencyKey = rawIdempotencyKey?.trim() || null;
@@ -6591,7 +6616,7 @@ export function issueService(db: Db) {
         blockedByIssueIds,
         actorAgentId,
         actorUserId,
-        assignmentGuardBlockerComment,
+        assignmentGuardBlockerComment: _assignmentGuardBlockerComment,
         actorRunId,
         capacityOverride,
         ...issueData
@@ -6653,11 +6678,24 @@ export function issueService(db: Db) {
           .where(eq(agents.id, nextAssigneeAgentId))
           .then((rows: Array<{ id: string; status: string }>) => rows[0] ?? null)
         : null;
+      let hasUnresolvedBlocker = false;
+      if (nextAssigneeAgent?.status === "paused" && nextStatus === "blocked") {
+        if (blockedByIssueIds !== undefined) {
+          hasUnresolvedBlocker = await assertValidUnresolvedBlockerIssueIds(
+            dbOrTx,
+            existing.companyId,
+            blockedByIssueIds,
+          );
+        } else {
+          const readiness = await listIssueDependencyReadinessMap(dbOrTx, existing.companyId, [id]);
+          hasUnresolvedBlocker = (readiness.get(id)?.unresolvedBlockerIssueIds.length ?? 0) > 0;
+        }
+      }
       assertIssueAssigneeExecutableState({
         status: nextStatus,
         assigneeAgentId: nextAssigneeAgentId,
         assigneeStatus: nextAssigneeAgent?.status ?? null,
-        blockerComment: assignmentGuardBlockerComment,
+        hasUnresolvedBlocker,
       });
       let nextProjectId = issueData.projectId !== undefined ? issueData.projectId : existing.projectId;
       const nextProjectWorkspaceId =

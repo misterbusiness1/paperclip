@@ -832,7 +832,6 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
       status: "todo",
       priority: "medium",
     });
-
     await expect(
       svc.list(companyId, { assigneeAgentId: "not-a-uuid" }),
     ).rejects.toThrow(/assigneeAgentId/i);
@@ -6308,6 +6307,7 @@ describeEmbeddedPostgres("issueService mutation guardrails", () => {
     const pendingApprovalAgentId = randomUUID();
     const activeAgentId = randomUUID();
     const issueId = randomUUID();
+    const blockerId = randomUUID();
     const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
 
     await db.insert(companies).values({
@@ -6374,6 +6374,16 @@ describeEmbeddedPostgres("issueService mutation guardrails", () => {
       issueNumber: 1,
       identifier: `${issuePrefix}-1`,
     });
+    await db.insert(issues).values({
+      id: blockerId,
+      companyId,
+      title: "Live blocker",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: activeAgentId,
+      issueNumber: 2,
+      identifier: `${issuePrefix}-2`,
+    });
 
     return {
       companyId,
@@ -6382,6 +6392,7 @@ describeEmbeddedPostgres("issueService mutation guardrails", () => {
       terminatedAgentId,
       pendingApprovalAgentId,
       activeAgentId,
+      blockerId,
     };
   }
 
@@ -6394,18 +6405,25 @@ describeEmbeddedPostgres("issueService mutation guardrails", () => {
     })).rejects.toThrow(/Cannot assign todo work to paused agents/);
   });
 
-  it("allows blocked assignment to paused agents only with a blocker comment", async () => {
-    const { issueId, pausedAgentId } = await seedMutationGuardFixture();
+  it("allows blocked assignment to paused agents only with a live dependency", async () => {
+    const { issueId, pausedAgentId, blockerId } = await seedMutationGuardFixture();
 
     await expect(svc.update(issueId, {
       assigneeAgentId: pausedAgentId,
       status: "blocked",
     })).rejects.toThrow(/Cannot assign blocked work to paused agents/);
 
-    const updated = await svc.update(issueId, {
+    await expect(svc.update(issueId, {
       assigneeAgentId: pausedAgentId,
       status: "blocked",
       assignmentGuardBlockerComment: "Blocked while the assigned agent is paused pending recovery.",
+    })).rejects.toThrow(/Cannot assign blocked work to paused agents/);
+
+    const updated = await svc.update(issueId, {
+      assigneeAgentId: pausedAgentId,
+      status: "blocked",
+      blockedByIssueIds: [blockerId],
+      assignmentGuardBlockerComment: "Explanatory metadata only.",
     });
 
     expect(updated?.status).toBe("blocked");
@@ -6440,22 +6458,31 @@ describeEmbeddedPostgres("issueService mutation guardrails", () => {
     })).rejects.toThrow(expectedError);
   });
 
-  it("allows blocked create-time assignment to a paused agent only with a blocker comment", async () => {
-    const { companyId, pausedAgentId } = await seedMutationGuardFixture();
+  it("allows blocked create-time assignment to a paused agent only with a live dependency", async () => {
+    const { companyId, pausedAgentId, blockerId } = await seedMutationGuardFixture();
 
     await expect(svc.create(companyId, {
       title: "Blocked create-path assignment without comment",
       status: "blocked",
       priority: "medium",
       assigneeAgentId: pausedAgentId,
-    })).rejects.toThrow(/Cannot assign blocked work to paused agents/);
+    })).rejects.toThrow(/requires an unresolved blocker issue/);
 
-    const created = await svc.create(companyId, {
+    await expect(svc.create(companyId, {
       title: "Blocked create-path assignment with comment",
       status: "blocked",
       priority: "medium",
       assigneeAgentId: pausedAgentId,
       assignmentGuardBlockerComment: "Blocked while the assigned agent is paused pending recovery.",
+    })).rejects.toThrow(/requires an unresolved blocker issue/);
+
+    const created = await svc.create(companyId, {
+      title: "Blocked create-path assignment with dependency",
+      status: "blocked",
+      priority: "medium",
+      assigneeAgentId: pausedAgentId,
+      blockedByIssueIds: [blockerId],
+      assignmentGuardBlockerComment: "Explanatory metadata only.",
     });
 
     expect(created.status).toBe("blocked");
