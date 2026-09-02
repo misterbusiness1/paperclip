@@ -400,6 +400,43 @@ describe("approval routes idempotent retries", () => {
     );
   });
 
+  it("accepts the generic board approval payload documented by the bundled skill", async () => {
+    const payload = {
+      title: "Approve monthly hosting spend",
+      summary: "Estimated cost is $42/month for provider X.",
+      recommendedAction: "Approve provider X and continue setup.",
+      reasoning: "Provider X meets the requirements at the quoted monthly cost.",
+      pros: ["Setup can continue with a bounded $42 monthly commitment."],
+      risks: ["Costs may increase with usage."],
+    };
+    mockApprovalService.create.mockResolvedValue({
+      id: "approval-generic",
+      companyId: "company-1",
+      type: "request_board_approval",
+      requestedByAgentId: "agent-1",
+      requestedByUserId: null,
+      status: "pending",
+      payload: { ...payload, requestedByAgentId: "agent-1" },
+    });
+
+    const res = await request(await createAgentApp())
+      .post("/api/companies/company-1/approvals")
+      .send({
+        type: "request_board_approval",
+        issueIds: ["00000000-0000-0000-0000-000000000001"],
+        payload,
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockApprovalService.create).toHaveBeenCalledWith(
+      "company-1",
+      expect.objectContaining({
+        payload: { ...payload, requestedByAgentId: "agent-1" },
+        requestedByAgentId: "agent-1",
+      }),
+    );
+  });
+
   it("blocks status-only recovery runs from creating approvals", async () => {
     const res = await request(await createAgentApp({
       contextSnapshot: {

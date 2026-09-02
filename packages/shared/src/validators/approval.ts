@@ -74,10 +74,36 @@ export const gateBBoardApprovalPayloadSchema = requestedByAgentPayloadField.exte
   }).strict()).min(1).optional(),
 }).strict();
 
-export const requestBoardApprovalPayloadSchema = z.discriminatedUnion("gate", [
-  gateABoardApprovalPayloadSchema.strict(),
-  gateBBoardApprovalPayloadSchema,
-]);
+const genericBoardApprovalPayloadWithDiscriminatorSchema = requestedByAgentPayloadField.extend({
+  gate: z.literal("generic"),
+  title: z.string().trim().min(1),
+  summary: multilineTextSchema.pipe(z.string().min(1)),
+  recommendedAction: multilineTextSchema.pipe(z.string().min(1)),
+  reasoning: multilineTextSchema.pipe(z.string().min(1)).optional(),
+  pros: z.array(multilineTextSchema.pipe(z.string().min(1))).min(1).optional(),
+  risks: z.array(multilineTextSchema.pipe(z.string().min(1))).min(1),
+  context: z.record(z.string(), z.unknown()).optional(),
+}).strict();
+
+export const genericBoardApprovalPayloadSchema = genericBoardApprovalPayloadWithDiscriminatorSchema
+  .omit({ gate: true });
+
+export const requestBoardApprovalPayloadSchema = z.preprocess(
+  (payload) => (
+    typeof payload === "object" && payload !== null && !("gate" in payload)
+      ? { ...payload, gate: "generic" }
+      : payload
+  ),
+  z.discriminatedUnion("gate", [
+    gateABoardApprovalPayloadSchema.strict(),
+    gateBBoardApprovalPayloadSchema,
+    genericBoardApprovalPayloadWithDiscriminatorSchema,
+  ]).transform((payload) => {
+    if (payload.gate !== "generic") return payload;
+    const { gate: _gate, ...genericPayload } = payload;
+    return genericPayload;
+  }),
+);
 
 const requestBoardApprovalSchema = z.object({
   type: z.literal("request_board_approval"),

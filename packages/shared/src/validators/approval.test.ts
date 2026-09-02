@@ -81,7 +81,7 @@ describe("approval validators", () => {
     });
 
     expect(parsed.type).toBe("request_board_approval");
-    expect(parsed.payload.gate).toBe("gate_a");
+    expect(parsed.payload).toMatchObject({ gate: "gate_a" });
   });
 
   it("rejects malformed Gate A board approval payloads with field-specific errors", () => {
@@ -120,7 +120,7 @@ describe("approval validators", () => {
     });
 
     expect(parsed.type).toBe("request_board_approval");
-    expect(parsed.payload.gate).toBe("gate_b");
+    expect(parsed.payload).toMatchObject({ gate: "gate_b" });
   });
 
   it("rejects email Gate B payloads without the exact required subject", () => {
@@ -133,7 +133,23 @@ describe("approval validators", () => {
     );
   });
 
-  it("rejects arbitrary request_board_approval payloads", () => {
+  it("accepts strict generic board-decision payloads", () => {
+    const result = createApprovalSchema.safeParse({
+      type: "request_board_approval",
+      payload: {
+        title: "Approve monthly hosting spend",
+        summary: "Estimated cost is $42/month for provider X.",
+        recommendedAction: "Approve provider X and continue setup.",
+        reasoning: "Provider X meets the requirements at the quoted monthly cost.",
+        pros: ["Setup can continue with a bounded monthly commitment."],
+        risks: ["Costs may increase with usage."],
+      },
+    });
+
+    expect(result.success).toBe(true);
+  });
+
+  it("rejects incomplete generic request_board_approval payloads", () => {
     const result = createApprovalSchema.safeParse({
       type: "request_board_approval",
       payload: { title: "Approve something" },
@@ -141,7 +157,26 @@ describe("approval validators", () => {
 
     expect(result.success).toBe(false);
     expect(result.success ? [] : result.error.issues).toEqual(
-      expect.arrayContaining([expect.objectContaining({ path: ["payload", "gate"] })]),
+      expect.arrayContaining([
+        expect.objectContaining({ path: ["payload", "summary"] }),
+        expect.objectContaining({ path: ["payload", "recommendedAction"] }),
+        expect.objectContaining({ path: ["payload", "risks"] }),
+      ]),
     );
+  });
+
+  it("rejects unknown fields on generic board-decision payloads", () => {
+    const result = createApprovalSchema.safeParse({
+      type: "request_board_approval",
+      payload: {
+        title: "Approve something",
+        summary: "A bounded decision is needed.",
+        recommendedAction: "Approve it.",
+        risks: ["The decision may need revisiting."],
+        arbitrary: true,
+      },
+    });
+
+    expect(result.success).toBe(false);
   });
 });
