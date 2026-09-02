@@ -6413,6 +6413,19 @@ describeEmbeddedPostgres("issueService mutation guardrails", () => {
   });
 
   it.each([
+    ["terminated", "terminatedAgentId", /Cannot assign work to terminated agents/],
+    ["pending_approval", "pendingApprovalAgentId", /Cannot assign work to pending approval agents/],
+  ] as const)("rejects blocked update assignment with a blocker comment to %s agents", async (_status, agentKey, expectedError) => {
+    const fixture = await seedMutationGuardFixture();
+
+    await expect(svc.update(fixture.issueId, {
+      assigneeAgentId: fixture[agentKey],
+      status: "blocked",
+      assignmentGuardBlockerComment: "This comment must not bypass the non-executable assignee guard.",
+    })).rejects.toThrow(expectedError);
+  });
+
+  it.each([
     ["paused", "pausedAgentId", /Cannot assign todo work to paused agents/],
     ["terminated", "terminatedAgentId", /Cannot assign work to terminated agents/],
     ["pending_approval", "pendingApprovalAgentId", /Cannot assign work to pending approval agents/],
@@ -6447,5 +6460,20 @@ describeEmbeddedPostgres("issueService mutation guardrails", () => {
 
     expect(created.status).toBe("blocked");
     expect(created.assigneeAgentId).toBe(pausedAgentId);
+  });
+
+  it.each([
+    ["terminated", "terminatedAgentId", /Cannot assign work to terminated agents/],
+    ["pending_approval", "pendingApprovalAgentId", /Cannot assign work to pending approval agents/],
+  ] as const)("rejects blocked create-time assignment with a blocker comment to %s agents", async (_status, agentKey, expectedError) => {
+    const fixture = await seedMutationGuardFixture();
+
+    await expect(svc.create(fixture.companyId, {
+      title: `Blocked create-path assignment for ${agentKey}`,
+      status: "blocked",
+      priority: "medium",
+      assigneeAgentId: fixture[agentKey],
+      assignmentGuardBlockerComment: "This comment must not bypass the non-executable assignee guard.",
+    })).rejects.toThrow(expectedError);
   });
 });

@@ -15,6 +15,10 @@ export function assertIssueAssigneeExecutableState(input: {
   if (!input.assigneeAgentId || !input.assigneeStatus || !NON_INVOCABLE_AGENT_STATUSES.has(input.assigneeStatus)) {
     return;
   }
-  if (input.status === "blocked" && hasConcreteBlockerComment(input.blockerComment)) return;
+  if (
+    input.assigneeStatus === "paused"
+    && input.status === "blocked"
+    && hasConcreteBlockerComment(input.blockerComment)
+  ) return;
   throw conflict(`Cannot assign ${input.status} work to ${input.assigneeStatus} agents`);
 }
