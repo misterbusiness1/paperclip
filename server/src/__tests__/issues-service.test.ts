@@ -6489,6 +6489,65 @@ describeEmbeddedPostgres("issueService mutation guardrails", () => {
     expect(created.assigneeAgentId).toBe(pausedAgentId);
   });
 
+  it("rejects a blocked create when its blocker completes before relation synchronization", async () => {
+    const { companyId, pausedAgentId, blockerId } = await seedMutationGuardFixture();
+    const blockerLocked = deferred<void>();
+    const completionCanCommit = deferred<void>();
+
+    const concurrentCompletion = db.transaction(async (tx) => {
+      await tx.execute(sql`select ${issues.id} from ${issues} where ${issues.id} = ${blockerId} for update`);
+      blockerLocked.resolve();
+      await completionCanCommit.promise;
+      await tx.update(issues).set({ status: "done", completedAt: new Date() }).where(eq(issues.id, blockerId));
+    });
+
+    await blockerLocked.promise;
+    const createPromise = svc.create(companyId, {
+      title: "Create racing blocker completion",
+      status: "blocked",
+      priority: "medium",
+      assigneeAgentId: pausedAgentId,
+      blockedByIssueIds: [blockerId],
+    });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    completionCanCommit.resolve();
+    await concurrentCompletion;
+
+    await expect(createPromise).rejects.toThrow(/remain unresolved/);
+    const created = await db.select({ id: issues.id }).from(issues)
+      .where(eq(issues.title, "Create racing blocker completion"));
+    expect(created).toHaveLength(0);
+  });
+
+  it("rejects a blocked update when its blocker completes before relation synchronization", async () => {
+    const { issueId, pausedAgentId, blockerId } = await seedMutationGuardFixture();
+    const blockerLocked = deferred<void>();
+    const completionCanCommit = deferred<void>();
+
+    const concurrentCompletion = db.transaction(async (tx) => {
+      await tx.execute(sql`select ${issues.id} from ${issues} where ${issues.id} = ${blockerId} for update`);
+      blockerLocked.resolve();
+      await completionCanCommit.promise;
+      await tx.update(issues).set({ status: "done", completedAt: new Date() }).where(eq(issues.id, blockerId));
+    });
+
+    await blockerLocked.promise;
+    const updatePromise = svc.update(issueId, {
+      assigneeAgentId: pausedAgentId,
+      status: "blocked",
+      blockedByIssueIds: [blockerId],
+    });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    completionCanCommit.resolve();
+    await concurrentCompletion;
+
+    await expect(updatePromise).rejects.toThrow(/remain unresolved/);
+    const unchanged = await db.select({ status: issues.status, assigneeAgentId: issues.assigneeAgentId })
+      .from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]);
+    expect(unchanged).toMatchObject({ status: "todo" });
+    expect(unchanged?.assigneeAgentId).not.toBe(pausedAgentId);
+  });
+
   it.each([
     ["terminated", "terminatedAgentId", /Cannot assign work to terminated agents/],
     ["pending_approval", "pendingApprovalAgentId", /Cannot assign work to pending approval agents/],
