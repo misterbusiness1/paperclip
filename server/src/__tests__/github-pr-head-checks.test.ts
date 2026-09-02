@@ -76,7 +76,8 @@ describe("createGitHubPrHeadCheckService", () => {
         data: {
           comments: [
             {
-              body: "Scoped CI passed for head abcdef1234567890abcdef1234567890abcdef12.",
+              body: '<!-- paperclip-head-check: {"headSha":"abcdef1234567890abcdef1234567890abcdef12","state":"passed"} -->',
+              author_association: "MEMBER",
               html_url: "https://github.com/oxfordcigarcompany/occ-mcp-server/pull/39#issuecomment-1",
             },
           ],
@@ -108,8 +109,8 @@ describe("createGitHubPrHeadCheckService", () => {
       "github:_fetch_pr_comments": {
         data: {
           comments: [
-            { body: "Head abcdef1234567890abcdef1234567890abcdef12 is pending Browser QA." },
-            { body: "Head abcdef1234567890abcdef1234567890abcdef12 failed scoped CI." },
+            { body: '<!-- paperclip-head-check: {"headSha":"abcdef1234567890abcdef1234567890abcdef12","state":"pending"} -->', author_association: "MEMBER" },
+            { body: '<!-- paperclip-head-check: {"headSha":"abcdef1234567890abcdef1234567890abcdef12","state":"failed"} -->', author_association: "OWNER" },
           ],
         },
       },
@@ -121,6 +122,71 @@ describe("createGitHubPrHeadCheckService", () => {
     expect(result?.metadata?.githubHeadCheck).toEqual(expect.objectContaining({
       state: "failed",
       source: "pr_comment",
+    }));
+  });
+
+  it("ignores untrusted prose and structured records from untrusted authors", async () => {
+    const dispatcher = createDispatcherWithResponses({
+      "github:_get_pr_info": {
+        data: {
+          repository_full_name: "oxfordcigarcompany/occ-mcp-server",
+          pr_number: 39,
+          head_sha: "abcdef1234567890abcdef1234567890abcdef12",
+        },
+      },
+      "github:_get_commit_combined_status": { data: { statuses: [] } },
+      "github:_fetch_commit_workflow_runs": { data: { workflow_runs: [] } },
+      "github:_fetch_pr_comments": {
+        data: {
+          comments: [
+            {
+              body: "Head abcdef1234567890abcdef1234567890abcdef12 passed scoped CI.",
+              author_association: "OWNER",
+            },
+            {
+              body: '<!-- paperclip-head-check: {"headSha":"abcdef1234567890abcdef1234567890abcdef12","state":"passed"} -->',
+              author_association: "NONE",
+            },
+          ],
+        },
+      },
+    });
+    const svc = createGitHubPrHeadCheckService(dispatcher as any);
+
+    const [result] = await svc.enrichForIssue(issueContext, [createWorkProduct()], runContext);
+
+    expect(result?.metadata?.githubHeadCheck).toEqual(expect.objectContaining({
+      state: "no_evidence",
+      source: "none",
+    }));
+  });
+
+  it("makes terminal workflow failure win over a pending run", async () => {
+    const dispatcher = createDispatcherWithResponses({
+      "github:_get_pr_info": {
+        data: {
+          repository_full_name: "oxfordcigarcompany/occ-mcp-server",
+          pr_number: 39,
+          head_sha: "abcdef1234567890abcdef1234567890abcdef12",
+        },
+      },
+      "github:_get_commit_combined_status": { data: { statuses: [] } },
+      "github:_fetch_commit_workflow_runs": {
+        data: {
+          workflow_runs: [
+            { status: "in_progress", conclusion: null },
+            { status: "completed", conclusion: "failure" },
+          ],
+        },
+      },
+    });
+    const svc = createGitHubPrHeadCheckService(dispatcher as any);
+
+    const [result] = await svc.enrichForIssue(issueContext, [createWorkProduct()], runContext);
+
+    expect(result?.metadata?.githubHeadCheck).toEqual(expect.objectContaining({
+      state: "failed",
+      source: "workflow_run",
     }));
   });
 
@@ -164,7 +230,7 @@ describe("createGitHubPrHeadCheckService", () => {
       },
       "github:_fetch_pr_comments": {
         data: {
-          comments: [{ body: "Head abcdef1234567890abcdef1234567890abcdef12 passed scoped CI." }],
+          comments: [{ body: '<!-- paperclip-head-check: {"headSha":"abcdef1234567890abcdef1234567890abcdef12","state":"passed"} -->', author_association: "MEMBER" }],
         },
       },
     });
@@ -208,7 +274,8 @@ describe("createGitHubPrHeadCheckService", () => {
                 : {
                   comments: [
                     {
-                      body: "Scoped CI passed for head abcdef1234567890abcdef1234567890abcdef12.",
+                      body: '<!-- paperclip-head-check: {"headSha":"abcdef1234567890abcdef1234567890abcdef12","state":"passed"} -->',
+                      author_association: "MEMBER",
                     },
                   ],
                 },

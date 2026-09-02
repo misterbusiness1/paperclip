@@ -94,7 +94,7 @@
       "@lexical/rich-text": "0.46.0",
       "@lexical/selection": "0.46.0",
       "@lexical/utils": "0.46.0",
-      "fast-uri": ">=3.1.5 <4",
+      "fast-uri": ">=3.1.6 <4",
       "hono": ">=4.12.25 <5",
       "ip-address": ">=10.3.1 <11",
       "js-yaml": ">=4.3.1 <5",

@@ -31,15 +31,13 @@ type PullRequestRef = {
 };
 
 const GITHUB_PR_URL_RE = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)(?:\/.*)?$/i;
-const PASS_RE = /\b(pass(?:ed|ing)?|green|clear|success(?:ful|fully)?|succeed(?:ed|ing)?)\b/i;
-const PENDING_RE = /\b(pending|queued|queueing|running|waiting|in[\s_-]?progress)\b/i;
-const FAIL_RE = /\b(fail(?:ed|ure|ing)?|error|red|blocked|broken|cancelled|canceled|timed[\s_-]?out)\b/i;
-const NO_EVIDENCE_RE = /\b(no[\s_-]?evidence|no[\s_-]?checks?|native[\s_-]?checks? empty)\b/i;
 const SUCCESS_CONCLUSIONS = new Set(["success", "neutral", "skipped"]);
 const FAILED_CONCLUSIONS = new Set(["action_required", "cancelled", "failure", "startup_failure", "stale", "timed_out"]);
 const PENDING_STATUSES = new Set(["in_progress", "pending", "queued", "requested", "waiting"]);
 const SUCCESS_STATUS_STATES = new Set(["success", "passed"]);
 const FAILED_STATUS_STATES = new Set(["error", "failed", "failure"]);
+const TRUSTED_AUTHOR_ASSOCIATIONS = new Set(["collaborator", "member", "owner"]);
+const HEAD_CHECK_RECORD_RE = /<!--\s*paperclip-head-check\s*:\s*(\{[^\n]*\})\s*-->/gi;
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
@@ -155,13 +153,13 @@ function mapWorkflowRunsState(payload: Record<string, unknown> | null): GitHubHe
 
   for (const runRaw of runs) {
     const run = asRecord(runRaw);
-    const status = asString(run?.status)?.toLowerCase() ?? null;
-    if (status && PENDING_STATUSES.has(status)) return "pending";
+    const conclusion = asString(run?.conclusion)?.toLowerCase() ?? null;
+    if (conclusion && FAILED_CONCLUSIONS.has(conclusion)) return "failed";
   }
   for (const runRaw of runs) {
     const run = asRecord(runRaw);
-    const conclusion = asString(run?.conclusion)?.toLowerCase() ?? null;
-    if (conclusion && FAILED_CONCLUSIONS.has(conclusion)) return "failed";
+    const status = asString(run?.status)?.toLowerCase() ?? null;
+    if (status && PENDING_STATUSES.has(status)) return "pending";
   }
   for (const runRaw of runs) {
     const run = asRecord(runRaw);
@@ -171,18 +169,20 @@ function mapWorkflowRunsState(payload: Record<string, unknown> | null): GitHubHe
   return null;
 }
 
-function commentReferencesHeadSha(body: string, headSha: string): boolean {
-  const escapedHeadSha = headSha.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  if (new RegExp(`\\b${escapedHeadSha}\\b`, "i").test(body)) return true;
-  const shortHeadSha = headSha.slice(0, 7);
-  return shortHeadSha.length >= 7 && new RegExp(`\\b${shortHeadSha}\\b`, "i").test(body);
-}
-
-function mapCommentState(body: string): GitHubHeadCheckState | null {
-  if (NO_EVIDENCE_RE.test(body)) return "no_evidence";
-  if (FAIL_RE.test(body)) return "failed";
-  if (PENDING_RE.test(body)) return "pending";
-  if (PASS_RE.test(body)) return "passed";
+function parseHeadCheckRecord(body: string, headSha: string): GitHubHeadCheckState | null {
+  for (const match of body.matchAll(HEAD_CHECK_RECORD_RE)) {
+    try {
+      const record = asRecord(JSON.parse(match[1]!));
+      const recordHeadSha = asString(record?.headSha);
+      const state = asString(record?.state)?.toLowerCase() ?? null;
+      if (recordHeadSha?.toLowerCase() !== headSha.toLowerCase()) continue;
+      if (state === "passed" || state === "pending" || state === "failed" || state === "no_evidence") {
+        return state;
+      }
+    } catch {
+      continue;
+    }
+  }
   return null;
 }
 
@@ -193,8 +193,10 @@ function resolveCommentFallback(payload: Record<string, unknown> | null, headSha
   for (let index = comments.length - 1; index >= 0; index -= 1) {
     const comment = asRecord(comments[index]);
     const body = asString(comment?.body) ?? asString(comment?.comment) ?? asString(comment?.text);
-    if (!body || !commentReferencesHeadSha(body, headSha)) continue;
-    const state = mapCommentState(body);
+    const authorAssociation = asString(comment?.author_association)?.toLowerCase()
+      ?? asString(comment?.authorAssociation)?.toLowerCase();
+    if (!body || !authorAssociation || !TRUSTED_AUTHOR_ASSOCIATIONS.has(authorAssociation)) continue;
+    const state = parseHeadCheckRecord(body, headSha);
     if (!state) continue;
     return {
       state,

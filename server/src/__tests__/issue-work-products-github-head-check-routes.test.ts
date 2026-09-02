@@ -174,7 +174,8 @@ function createApp() {
             data: {
               comments: [
                 {
-                  body: "Scoped CI passed for head abcdef1234567890abcdef1234567890abcdef12.",
+                  body: '<!-- paperclip-head-check: {"headSha":"abcdef1234567890abcdef1234567890abcdef12","state":"passed"} -->',
+                  author_association: "MEMBER",
                 },
               ],
             },
