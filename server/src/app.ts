@@ -447,6 +447,7 @@ export async function createApp(
   api.use(issueRoutes(db, opts.storageService, {
     feedbackExportService: opts.feedbackExportService,
     pluginWorkerManager: workerManager,
+    toolDispatcher,
     approveToolActionRequest: (input) => toolGateway.approveActionRequest(input),
   }));
   app.use(mcpGatewayProtocolRoutes(toolGateway));

@@ -226,6 +226,9 @@ import {
   observeCrossIssueInfluence,
   type CrossIssueInfluenceKind,
 } from "../services/cross-issue-influence-limit.js";
+import type { PluginToolDispatcher } from "../services/plugin-tool-dispatcher.js";
+import { createGitHubPrHeadCheckService } from "../services/github-pr-head-checks.js";
+import type { ToolRunContext } from "@paperclipai/plugin-sdk";
 
 const MAX_ISSUE_COMMENT_LIMIT = 500;
 const updateIssueRouteSchema = updateIssueSchema.extend({
@@ -2667,6 +2670,7 @@ export function issueRoutes(
     searchService?: CompanySearchService;
     searchRateLimiter?: CompanySearchRateLimiter;
     pluginWorkerManager?: PluginWorkerManager;
+    toolDispatcher?: PluginToolDispatcher;
     taskWatchdogEnqueueWakeup?: TaskWatchdogServiceDeps["enqueueWakeup"] | null;
     recoveryActionEnqueueWakeup?: (
       agentId: string,
@@ -2711,6 +2715,24 @@ export function issueRoutes(
   const recoveryActionsSvc = issueRecoveryActionService(db);
   const executionWorkspacesSvc = executionWorkspaceServiceDirect(db);
   const workProductsSvc = workProductService(db);
+  const githubPrHeadChecks = createGitHubPrHeadCheckService(opts.toolDispatcher);
+  function authenticatedToolRunContext(req: Request, issue: { companyId: string; projectId: string | null }): ToolRunContext | null {
+    if (
+      req.actor.type !== "agent"
+      || !req.actor.agentId
+      || !req.actor.runId
+      || !issue.projectId
+      || req.actor.companyId !== issue.companyId
+    ) {
+      return null;
+    }
+    return {
+      agentId: req.actor.agentId,
+      runId: req.actor.runId,
+      companyId: issue.companyId,
+      projectId: issue.projectId,
+    };
+  }
   const documentsSvc = documentService(db);
   const companySkillsSvc = companySkillService(db);
   const documentAnnotationsSvc = documentAnnotationService(db);
@@ -6036,7 +6058,11 @@ export function issueRoutes(
     const currentExecutionWorkspace = issue.executionWorkspaceId
       ? await executionWorkspacesSvc.getById(issue.executionWorkspaceId)
       : null;
-    const workProducts = await workProductsSvc.listForIssue(issue.id);
+    const workProducts = await githubPrHeadChecks.enrichForIssue(
+      issue,
+      await workProductsSvc.listForIssue(issue.id),
+      authenticatedToolRunContext(req, issue),
+    );
     res.json({
       ...issue,
       ...inboxArchiveFields,
@@ -6354,7 +6380,11 @@ export function issueRoutes(
     const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
     if (!issue) return;
     if (!(await assertIssueReadAllowed(req, res, issue))) return;
-    const workProducts = await workProductsSvc.listForIssue(issue.id);
+    const workProducts = await githubPrHeadChecks.enrichForIssue(
+      issue,
+      await workProductsSvc.listForIssue(issue.id),
+      authenticatedToolRunContext(req, issue),
+    );
     res.json(workProducts);
   });
 
