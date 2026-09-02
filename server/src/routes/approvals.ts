@@ -43,6 +43,7 @@ function isStatusOnlyCheapRecoveryContext(contextSnapshot: unknown) {
 
 function verifyGateBBodyHash(payload: Record<string, unknown>) {
   if (payload.gate !== "gate_b") return;
+  if (payload.bodyHash === undefined) return;
   const body = typeof payload.body === "string" ? payload.body : "";
   const expectedHash = `sha256:${createHash("sha256").update(body, "utf8").digest("hex")}`;
   if (payload.bodyHash !== expectedHash) {

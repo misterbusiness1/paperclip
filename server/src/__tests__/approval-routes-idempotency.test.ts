@@ -610,6 +610,43 @@ describe("approval routes idempotent retries", () => {
     );
   });
 
+  it("lets agents create Gate B approval requests without optional bodyHash", async () => {
+    const body = "Send the customer this approved response.";
+    mockApprovalService.create.mockImplementation(async (_companyId, approval) => ({
+      id: "approval-gate-b-without-hash",
+      companyId: "company-1",
+      ...approval,
+      createdAt: new Date("2026-04-06T00:00:00.000Z"),
+    }));
+
+    const res = await request(await createAgentApp())
+      .post("/api/companies/company-1/approvals")
+      .send({
+        type: "request_board_approval",
+        payload: {
+          gate: "gate_b",
+          recipient: "customer@example.com",
+          channel: "email",
+          subject: "Your order update",
+          body,
+          threadOrOrderRef: "gmail-thread-1",
+        },
+      });
+
+    expect(res.status).toBe(201);
+    expect(mockApprovalService.create).toHaveBeenCalledWith(
+      "company-1",
+      expect.objectContaining({
+        payload: expect.objectContaining({
+          gate: "gate_b",
+          body,
+          requestedByAgentId: "agent-1",
+        }),
+      }),
+    );
+    expect(mockApprovalService.create.mock.calls[0]?.[1].payload).not.toHaveProperty("bodyHash");
+  });
+
   it("rejects Gate B approval requests when bodyHash does not match body", async () => {
     const res = await request(await createAgentApp())
       .post("/api/companies/company-1/approvals")
