@@ -175,7 +175,7 @@ function createApp() {
               comments: [
                 {
                   body: '<!-- paperclip-head-check: {"headSha":"abcdef1234567890abcdef1234567890abcdef12","state":"passed"} -->',
-                  author_association: "MEMBER",
+                  user: { login: "occ-review-bot[bot]" },
                 },
               ],
             },

@@ -77,7 +77,7 @@ describe("createGitHubPrHeadCheckService", () => {
           comments: [
             {
               body: '<!-- paperclip-head-check: {"headSha":"abcdef1234567890abcdef1234567890abcdef12","state":"passed"} -->',
-              author_association: "MEMBER",
+              user: { login: "occ-review-bot[bot]" },
               html_url: "https://github.com/oxfordcigarcompany/occ-mcp-server/pull/39#issuecomment-1",
             },
           ],
@@ -109,8 +109,8 @@ describe("createGitHubPrHeadCheckService", () => {
       "github:_fetch_pr_comments": {
         data: {
           comments: [
-            { body: '<!-- paperclip-head-check: {"headSha":"abcdef1234567890abcdef1234567890abcdef12","state":"pending"} -->', author_association: "MEMBER" },
-            { body: '<!-- paperclip-head-check: {"headSha":"abcdef1234567890abcdef1234567890abcdef12","state":"failed"} -->', author_association: "OWNER" },
+            { body: '<!-- paperclip-head-check: {"headSha":"abcdef1234567890abcdef1234567890abcdef12","state":"pending"} -->', user: { login: "occ-review-bot[bot]" } },
+            { body: '<!-- paperclip-head-check: {"headSha":"abcdef1234567890abcdef1234567890abcdef12","state":"failed"} -->', user: { login: "occ-review-bot[bot]" } },
           ],
         },
       },
@@ -125,7 +125,7 @@ describe("createGitHubPrHeadCheckService", () => {
     }));
   });
 
-  it("ignores untrusted prose and structured records from untrusted authors", async () => {
+  it("ignores human MEMBER structured records and unstructured bot prose", async () => {
     const dispatcher = createDispatcherWithResponses({
       "github:_get_pr_info": {
         data: {
@@ -141,11 +141,12 @@ describe("createGitHubPrHeadCheckService", () => {
           comments: [
             {
               body: "Head abcdef1234567890abcdef1234567890abcdef12 passed scoped CI.",
-              author_association: "OWNER",
+              user: { login: "occ-review-bot[bot]" },
             },
             {
               body: '<!-- paperclip-head-check: {"headSha":"abcdef1234567890abcdef1234567890abcdef12","state":"passed"} -->',
-              author_association: "NONE",
+              author_association: "MEMBER",
+              user: { login: "repository-member" },
             },
           ],
         },
@@ -230,7 +231,7 @@ describe("createGitHubPrHeadCheckService", () => {
       },
       "github:_fetch_pr_comments": {
         data: {
-          comments: [{ body: '<!-- paperclip-head-check: {"headSha":"abcdef1234567890abcdef1234567890abcdef12","state":"passed"} -->', author_association: "MEMBER" }],
+          comments: [{ body: '<!-- paperclip-head-check: {"headSha":"abcdef1234567890abcdef1234567890abcdef12","state":"passed"} -->', user: { login: "occ-review-bot[bot]" } }],
         },
       },
     });
@@ -275,7 +276,7 @@ describe("createGitHubPrHeadCheckService", () => {
                   comments: [
                     {
                       body: '<!-- paperclip-head-check: {"headSha":"abcdef1234567890abcdef1234567890abcdef12","state":"passed"} -->',
-                      author_association: "MEMBER",
+                      user: { login: "occ-review-bot[bot]" },
                     },
                   ],
                 },

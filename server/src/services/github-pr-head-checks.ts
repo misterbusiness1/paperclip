@@ -36,7 +36,7 @@ const FAILED_CONCLUSIONS = new Set(["action_required", "cancelled", "failure", "
 const PENDING_STATUSES = new Set(["in_progress", "pending", "queued", "requested", "waiting"]);
 const SUCCESS_STATUS_STATES = new Set(["success", "passed"]);
 const FAILED_STATUS_STATES = new Set(["error", "failed", "failure"]);
-const TRUSTED_AUTHOR_ASSOCIATIONS = new Set(["collaborator", "member", "owner"]);
+const TRUSTED_HEAD_CHECK_PRODUCERS = new Set(["occ-review-bot[bot]"]);
 const HEAD_CHECK_RECORD_RE = /<!--\s*paperclip-head-check\s*:\s*(\{[^\n]*\})\s*-->/gi;
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -193,9 +193,11 @@ function resolveCommentFallback(payload: Record<string, unknown> | null, headSha
   for (let index = comments.length - 1; index >= 0; index -= 1) {
     const comment = asRecord(comments[index]);
     const body = asString(comment?.body) ?? asString(comment?.comment) ?? asString(comment?.text);
-    const authorAssociation = asString(comment?.author_association)?.toLowerCase()
-      ?? asString(comment?.authorAssociation)?.toLowerCase();
-    if (!body || !authorAssociation || !TRUSTED_AUTHOR_ASSOCIATIONS.has(authorAssociation)) continue;
+    const user = asRecord(comment?.user);
+    const author = asRecord(comment?.author);
+    const producerLogin = asString(user?.login)?.toLowerCase()
+      ?? asString(author?.login)?.toLowerCase();
+    if (!body || !producerLogin || !TRUSTED_HEAD_CHECK_PRODUCERS.has(producerLogin)) continue;
     const state = parseHeadCheckRecord(body, headSha);
     if (!state) continue;
     return {
