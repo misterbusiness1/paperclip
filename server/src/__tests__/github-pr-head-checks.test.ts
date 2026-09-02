@@ -1,6 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
 import type { ToolResult } from "@paperclipai/plugin-sdk";
+import type { PaperclipPluginManifestV1 } from "@paperclipai/shared";
 import { createGitHubPrHeadCheckService } from "../services/github-pr-head-checks.ts";
+import { createPluginToolDispatcher } from "../services/plugin-tool-dispatcher.ts";
+import type { PluginWorkerManager } from "../services/plugin-worker-manager.ts";
 
 function createDispatcherWithResponses(responses: Record<string, ToolResult>) {
   return {
@@ -50,6 +53,13 @@ const issueContext = {
   projectId: "project-1",
 };
 
+const runContext = {
+  agentId: "agent-1",
+  runId: "run-1",
+  companyId: "company-1",
+  projectId: "project-1",
+};
+
 describe("createGitHubPrHeadCheckService", () => {
   it("falls back to PR comments when native GitHub checks are empty and marks passed", async () => {
     const dispatcher = createDispatcherWithResponses({
@@ -75,7 +85,7 @@ describe("createGitHubPrHeadCheckService", () => {
     });
     const svc = createGitHubPrHeadCheckService(dispatcher as any);
 
-    const [result] = await svc.enrichForIssue(issueContext, [createWorkProduct()]);
+    const [result] = await svc.enrichForIssue(issueContext, [createWorkProduct()], runContext);
 
     expect(result?.metadata?.githubHeadCheck).toEqual(expect.objectContaining({
       state: "passed",
@@ -106,7 +116,7 @@ describe("createGitHubPrHeadCheckService", () => {
     });
     const svc = createGitHubPrHeadCheckService(dispatcher as any);
 
-    const [result] = await svc.enrichForIssue(issueContext, [createWorkProduct()]);
+    const [result] = await svc.enrichForIssue(issueContext, [createWorkProduct()], runContext);
 
     expect(result?.metadata?.githubHeadCheck).toEqual(expect.objectContaining({
       state: "failed",
@@ -129,7 +139,7 @@ describe("createGitHubPrHeadCheckService", () => {
     });
     const svc = createGitHubPrHeadCheckService(dispatcher as any);
 
-    const [result] = await svc.enrichForIssue(issueContext, [createWorkProduct()]);
+    const [result] = await svc.enrichForIssue(issueContext, [createWorkProduct()], runContext);
 
     expect(result?.metadata?.githubHeadCheck).toEqual(expect.objectContaining({
       state: "no_evidence",
@@ -160,7 +170,7 @@ describe("createGitHubPrHeadCheckService", () => {
     });
     const svc = createGitHubPrHeadCheckService(dispatcher as any);
 
-    const [result] = await svc.enrichForIssue(issueContext, [createWorkProduct()]);
+    const [result] = await svc.enrichForIssue(issueContext, [createWorkProduct()], runContext);
 
     expect(result?.metadata?.githubHeadCheck).toEqual(expect.objectContaining({
       state: "failed",
@@ -208,11 +218,73 @@ describe("createGitHubPrHeadCheckService", () => {
     const svc = createGitHubPrHeadCheckService(dispatcher as any);
 
     toolsAvailable = true;
-    const [result] = await svc.enrichForIssue(issueContext, [createWorkProduct()]);
+    const [result] = await svc.enrichForIssue(issueContext, [createWorkProduct()], runContext);
 
     expect(result?.metadata?.githubHeadCheck).toEqual(expect.objectContaining({
       state: "passed",
       source: "pr_comment",
     }));
+  });
+
+  it("does not execute plugin tools without an authenticated agent run context", async () => {
+    const dispatcher = createDispatcherWithResponses({});
+    const svc = createGitHubPrHeadCheckService(dispatcher as any);
+    const workProduct = createWorkProduct();
+
+    const [result] = await svc.enrichForIssue(issueContext, [workProduct]);
+
+    expect(result).toBe(workProduct);
+    expect(dispatcher.executeTool).not.toHaveBeenCalled();
+  });
+
+  it("propagates the authenticated identity across the real dispatcher boundary", async () => {
+    const call = vi.fn(async (_pluginId: string, _method: string, params: any) => ({
+      data: params.toolName === "_get_pr_info"
+        ? {
+          repository_full_name: "oxfordcigarcompany/occ-mcp-server",
+          pr_number: 39,
+          head_sha: "abcdef1234567890abcdef1234567890abcdef12",
+        }
+        : params.toolName === "_get_commit_combined_status"
+          ? { statuses: [{ state: "success" }] }
+          : {},
+    }));
+    const workerManager = {
+      isRunning: vi.fn(() => true),
+      call,
+    } as unknown as PluginWorkerManager;
+    const dispatcher = createPluginToolDispatcher({ workerManager });
+    dispatcher.registerPluginTools("github", {
+      id: "github",
+      apiVersion: 1,
+      version: "1.0.0",
+      displayName: "GitHub",
+      description: "Test fixture",
+      author: "Paperclip",
+      categories: ["automation"],
+      capabilities: [],
+      entrypoints: { worker: "dist/worker.js" },
+      tools: [
+        "_get_pr_info",
+        "_get_commit_combined_status",
+        "_fetch_commit_workflow_runs",
+        "_fetch_pr_comments",
+      ].map((name) => ({
+        name,
+        displayName: name,
+        description: name,
+        parametersSchema: { type: "object", properties: {} },
+      })),
+    } as unknown as PaperclipPluginManifestV1, "github-plugin-db-id");
+    const svc = createGitHubPrHeadCheckService(dispatcher);
+
+    const [result] = await svc.enrichForIssue(issueContext, [createWorkProduct()], runContext);
+
+    expect(result?.metadata?.githubHeadCheck).toEqual(expect.objectContaining({ state: "passed" }));
+    expect(call).toHaveBeenCalledWith(
+      "github-plugin-db-id",
+      "executeTool",
+      expect.objectContaining({ runContext }),
+    );
   });
 });

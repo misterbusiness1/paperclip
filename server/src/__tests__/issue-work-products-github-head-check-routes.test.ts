@@ -130,10 +130,11 @@ function createApp() {
   app.use(express.json());
   app.use((req, _res, next) => {
     (req as any).actor = {
-      type: "board",
-      userId: "local-board",
-      companyIds: ["company-1"],
-      source: "local_implicit",
+      type: "agent",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      runId: "44444444-4444-4444-8444-444444444444",
+      companyId: "company-1",
+      source: "agent_jwt",
       isInstanceAdmin: false,
     };
     next();

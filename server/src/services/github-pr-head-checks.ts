@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import type { IssueWorkProduct } from "@paperclipai/shared";
 import type { ToolRunContext } from "@paperclipai/plugin-sdk";
 import type { PluginToolDispatcher } from "./plugin-tool-dispatcher.js";
@@ -249,17 +248,11 @@ export function createGitHubPrHeadCheckService(toolDispatcher?: MinimalToolDispa
   async function enrichOne(
     issue: IssueToolContext,
     workProduct: IssueWorkProduct,
+    runContext: ToolRunContext | null,
   ): Promise<IssueWorkProduct> {
     const prRef = resolvePullRequestRef(workProduct);
     const toolNames = resolveToolNames();
-    if (!prRef || !toolDispatcher || !toolNames?.getPrInfo) return workProduct;
-
-    const runContext: ToolRunContext = {
-      agentId: issue.id,
-      runId: randomUUID(),
-      companyId: issue.companyId,
-      projectId: issue.projectId ?? issue.id,
-    };
+    if (!prRef || !toolDispatcher || !toolNames?.getPrInfo || !runContext) return workProduct;
 
     const prInfo = await executeToolData(
       toolDispatcher,
@@ -362,6 +355,9 @@ export function createGitHubPrHeadCheckService(toolDispatcher?: MinimalToolDispa
     enrichForIssue: async (
       issue: IssueToolContext,
       workProducts: IssueWorkProduct[],
-    ): Promise<IssueWorkProduct[]> => Promise.all(workProducts.map((workProduct) => enrichOne(issue, workProduct))),
+      runContext: ToolRunContext | null = null,
+    ): Promise<IssueWorkProduct[]> => Promise.all(
+      workProducts.map((workProduct) => enrichOne(issue, workProduct, runContext)),
+    ),
   };
 }
