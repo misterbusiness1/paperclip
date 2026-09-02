@@ -147,7 +147,7 @@ export function approvalRoutes(
     const issueIds = Array.isArray(rawIssueIds)
       ? rawIssueIds.filter((value: unknown): value is string => typeof value === "string")
       : [];
-    const uniqueIssueIds = Array.from(new Set(issueIds));
+    const uniqueIssueIds = Array.from(new Set(issueIds)).sort();
     const { issueIds: _issueIds, idempotencyKey: bodyIdempotencyKey, ...approvalInput } = req.body;
     const headerIdempotencyKey = req.header("idempotency-key")?.trim();
     const idempotencyKey = headerIdempotencyKey || bodyIdempotencyKey || null;
@@ -185,11 +185,11 @@ export function approvalRoutes(
     };
 
     const creation = idempotencyKey
-      ? await svc.createWithIdempotency(companyId, approvalData, idempotencyKey)
+      ? await svc.createWithIdempotency(companyId, approvalData, idempotencyKey, uniqueIssueIds)
       : { approval: await svc.create(companyId, approvalData), replayed: false };
     const { approval, replayed } = creation;
 
-    if (!replayed && uniqueIssueIds.length > 0) {
+    if (uniqueIssueIds.length > 0) {
       await issueApprovalsSvc.linkManyForApproval(approval.id, uniqueIssueIds, {
         agentId: actor.agentId,
         userId: actor.actorType === "user" ? actor.actorId : null,

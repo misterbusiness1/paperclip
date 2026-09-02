@@ -8,21 +8,24 @@ import {
 
 const validGateAPayload = {
   gate: "gate_a",
+  orderId: "1001",
+  customerId: "2002",
+  amountUsd: 42.5,
   actionType: "refund_full",
   currency: "USD",
   wooCommerceTransactionRef: "wc-order-1001:txn-2002",
-  reason: {
-    code: "customer_request",
-    description: "Customer requested a full refund before fulfillment.",
-  },
+  reason: "Customer requested a full refund before fulfillment.",
 };
 
 const validGateBPayload = {
   gate: "gate_b",
+  recipient: "customer@example.com",
   channel: "email",
+  subject: "Your order update",
   contentType: "text/plain",
   body: "Send the approved customer response.",
   bodyHash: "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+  threadOrOrderRef: "ticket-1001",
   threadRef: {
     ticketId: "ticket-1001",
     orderRef: "order-2002",
@@ -89,7 +92,10 @@ describe("approval validators", () => {
         actionType: "invalid_action",
         currency: "usd",
         wooCommerceTransactionRef: "",
-        reason: { code: "unknown", description: "" },
+        orderId: "",
+        customerId: "",
+        amountUsd: -1,
+        reason: "",
       },
     });
 
@@ -97,10 +103,12 @@ describe("approval validators", () => {
     expect(result.success ? [] : result.error.issues).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ path: ["payload", "actionType"] }),
+        expect.objectContaining({ path: ["payload", "orderId"] }),
+        expect.objectContaining({ path: ["payload", "customerId"] }),
+        expect.objectContaining({ path: ["payload", "amountUsd"] }),
         expect.objectContaining({ path: ["payload", "currency"] }),
         expect.objectContaining({ path: ["payload", "wooCommerceTransactionRef"] }),
-        expect.objectContaining({ path: ["payload", "reason", "code"] }),
-        expect.objectContaining({ path: ["payload", "reason", "description"] }),
+        expect.objectContaining({ path: ["payload", "reason"] }),
       ]),
     );
   });
@@ -113,6 +121,16 @@ describe("approval validators", () => {
 
     expect(parsed.type).toBe("request_board_approval");
     expect(parsed.payload.gate).toBe("gate_b");
+  });
+
+  it("rejects email Gate B payloads without the exact required subject", () => {
+    const { subject: _subject, ...payload } = validGateBPayload;
+    const result = createApprovalSchema.safeParse({ type: "request_board_approval", payload });
+
+    expect(result.success).toBe(false);
+    expect(result.success ? [] : result.error.issues).toEqual(
+      expect.arrayContaining([expect.objectContaining({ path: ["payload", "subject"] })]),
+    );
   });
 
   it("rejects arbitrary request_board_approval payloads", () => {

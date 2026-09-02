@@ -66,7 +66,11 @@ export function approvalService(db: Db) {
     return JSON.stringify(value);
   }
 
-  function hashApprovalCreateRequest(companyId: string, data: Omit<typeof approvals.$inferInsert, "companyId">): string {
+  function hashApprovalCreateRequest(
+    companyId: string,
+    data: Omit<typeof approvals.$inferInsert, "companyId">,
+    issueIds: string[],
+  ): string {
     const request = {
       companyId,
       type: data.type,
@@ -74,6 +78,7 @@ export function approvalService(db: Db) {
       requestedByUserId: data.requestedByUserId ?? null,
       payload: data.payload,
       status: data.status ?? "pending",
+      issueIds,
     };
     return createHash("sha256").update(stableJson(request)).digest("hex");
   }
@@ -170,8 +175,10 @@ export function approvalService(db: Db) {
       companyId: string,
       data: Omit<typeof approvals.$inferInsert, "companyId" | "idempotencyKey" | "idempotencyRequestHash">,
       idempotencyKey: string,
+      issueIds: string[] = [],
     ): Promise<CreationResult> => {
-      const requestHash = hashApprovalCreateRequest(companyId, data);
+      const canonicalIssueIds = Array.from(new Set(issueIds)).sort();
+      const requestHash = hashApprovalCreateRequest(companyId, data, canonicalIssueIds);
       const existing = await findByIdempotencyKey(companyId, idempotencyKey);
       if (existing) {
         if (existing.idempotencyRequestHash !== requestHash) {

@@ -268,6 +268,40 @@ describe("approvalService creation idempotency", () => {
     expect(replayDbStub.values).not.toHaveBeenCalled();
   });
 
+  it("rejects an idempotency replay when the canonical issue linkage changes", async () => {
+    const existing = {
+      ...createApproval("pending"),
+      type: "request_board_approval",
+      idempotencyKey: "approval:OXFA-2794",
+      idempotencyRequestHash: "placeholder",
+    } as ApprovalRecord & { idempotencyKey: string; idempotencyRequestHash: string };
+    const data = {
+      type: "request_board_approval",
+      requestedByAgentId: "requester-1",
+      requestedByUserId: null,
+      status: "pending",
+      payload: { gate: "gate_a" },
+    } as any;
+    const firstDbStub = createApprovalCreateDbStub([[]], [existing]);
+    await approvalService(firstDbStub.db as any).createWithIdempotency(
+      "company-1",
+      data,
+      "approval:OXFA-2794",
+      ["issue-b", "issue-a", "issue-a"],
+    );
+    const persistedHash = (firstDbStub.values.mock.calls[0]?.[0] as any).idempotencyRequestHash;
+    const replayDbStub = createApprovalCreateDbStub([[{ ...existing, idempotencyRequestHash: persistedHash }]], []);
+
+    await expect(
+      approvalService(replayDbStub.db as any).createWithIdempotency(
+        "company-1",
+        data,
+        "approval:OXFA-2794",
+        ["issue-a", "issue-c"],
+      ),
+    ).rejects.toMatchObject({ status: 409 });
+  });
+
   it("rejects idempotency key reuse with a different request", async () => {
     const existing = {
       ...createApproval("pending"),

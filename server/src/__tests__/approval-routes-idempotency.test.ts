@@ -335,13 +335,13 @@ describe("approval routes idempotent retries", () => {
       status: "pending",
       payload: {
         gate: "gate_a",
+        orderId: "1001",
+        customerId: "2002",
+        amountUsd: 42.5,
         actionType: "refund_full",
         currency: "USD",
         wooCommerceTransactionRef: "wc-order-1001:txn-2002",
-        reason: {
-          code: "customer_request",
-          description: "Customer requested a full refund before fulfillment.",
-        },
+        reason: "Customer requested a full refund before fulfillment.",
         requestedByAgentId: "agent-1",
       },
       decisionNote: null,
@@ -358,13 +358,13 @@ describe("approval routes idempotent retries", () => {
         issueIds: ["00000000-0000-0000-0000-000000000001"],
         payload: {
           gate: "gate_a",
+          orderId: "1001",
+          customerId: "2002",
+          amountUsd: 42.5,
           actionType: "refund_full",
           currency: "USD",
           wooCommerceTransactionRef: "wc-order-1001:txn-2002",
-          reason: {
-            code: "customer_request",
-            description: "Customer requested a full refund before fulfillment.",
-          },
+          reason: "Customer requested a full refund before fulfillment.",
         },
       });
 
@@ -413,7 +413,14 @@ describe("approval routes idempotent retries", () => {
       .post("/api/companies/company-1/approvals")
       .send({
         type: "request_board_approval",
-        payload: { title: "Approve hosting spend" },
+        payload: {
+          gate: "gate_a",
+          orderId: "1001",
+          customerId: "2002",
+          amountUsd: 42.5,
+          actionType: "refund_full",
+          reason: "Customer requested a refund.",
+        },
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(403);
@@ -474,6 +481,8 @@ describe("approval routes idempotent retries", () => {
     expect(res.status, JSON.stringify(res.body)).toBe(403);
     expect(res.body.error).toContain("Cheap status-only recovery runs cannot create or modify approvals");
     expect(mockApprovalService.addComment).not.toHaveBeenCalled();
+  });
+
   it("rejects malformed Gate A creation with field-specific 4xx errors", async () => {
     const res = await request(await createAgentApp())
       .post("/api/companies/company-1/approvals")
@@ -481,10 +490,13 @@ describe("approval routes idempotent retries", () => {
         type: "request_board_approval",
         payload: {
           gate: "gate_a",
+          orderId: "",
+          customerId: "",
+          amountUsd: -1,
           actionType: "invalid_action",
           currency: "usd",
           wooCommerceTransactionRef: "",
-          reason: { code: "unknown", description: "" },
+          reason: "",
         },
       });
 
@@ -494,7 +506,7 @@ describe("approval routes idempotent retries", () => {
         expect.objectContaining({ path: ["payload", "actionType"] }),
         expect.objectContaining({ path: ["payload", "currency"] }),
         expect.objectContaining({ path: ["payload", "wooCommerceTransactionRef"] }),
-        expect.objectContaining({ path: ["payload", "reason", "code"] }),
+        expect.objectContaining({ path: ["payload", "reason"] }),
       ]),
     );
     expect(mockApprovalService.create).not.toHaveBeenCalled();
@@ -512,10 +524,13 @@ describe("approval routes idempotent retries", () => {
       status: "pending",
       payload: {
         gate: "gate_b",
+        recipient: "customer@example.com",
         channel: "email",
+        subject: "Your order update",
         contentType: "text/plain",
         body,
         bodyHash,
+        threadOrOrderRef: "gmail-thread-1",
         threadRef: { ticketId: "gmail-thread-1", orderRef: "order-1001" },
         priority: "high",
         slaDeadline: "2026-08-04T12:00:00.000Z",
@@ -536,10 +551,13 @@ describe("approval routes idempotent retries", () => {
         type: "request_board_approval",
         payload: {
           gate: "gate_b",
+          recipient: "customer@example.com",
           channel: "email",
+          subject: "Your order update",
           contentType: "text/plain",
           body,
           bodyHash,
+          threadOrOrderRef: "gmail-thread-1",
           threadRef: { ticketId: "gmail-thread-1", orderRef: "order-1001" },
           priority: "high",
           slaDeadline: "2026-08-04T12:00:00.000Z",
@@ -562,10 +580,13 @@ describe("approval routes idempotent retries", () => {
         type: "request_board_approval",
         payload: {
           gate: "gate_b",
+          recipient: "customer@example.com",
           channel: "email",
+          subject: "Your order update",
           contentType: "text/plain",
           body: "Send one response.",
           bodyHash: "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+          threadOrOrderRef: "gmail-thread-1",
           threadRef: { ticketId: "gmail-thread-1", orderRef: "order-1001" },
           priority: "high",
           slaDeadline: "2026-08-04T12:00:00.000Z",
@@ -593,13 +614,13 @@ describe("approval routes idempotent retries", () => {
         status: "pending",
         payload: {
           gate: "gate_a",
+          orderId: "1001",
+          customerId: "2002",
+          amountUsd: 42.5,
           actionType: "refund_full",
           currency: "USD",
           wooCommerceTransactionRef: "wc-order-1001:txn-2002",
-          reason: {
-            code: "customer_request",
-            description: "Customer requested a full refund before fulfillment.",
-          },
+          reason: "Customer requested a full refund before fulfillment.",
           requestedByAgentId: "agent-1",
         },
         decisionNote: null,
@@ -618,13 +639,13 @@ describe("approval routes idempotent retries", () => {
         issueIds: ["00000000-0000-0000-0000-000000000001"],
         payload: {
           gate: "gate_a",
+          orderId: "1001",
+          customerId: "2002",
+          amountUsd: 42.5,
           actionType: "refund_full",
           currency: "USD",
           wooCommerceTransactionRef: "wc-order-1001:txn-2002",
-          reason: {
-            code: "customer_request",
-            description: "Customer requested a full refund before fulfillment.",
-          },
+          reason: "Customer requested a full refund before fulfillment.",
         },
       });
 
@@ -634,8 +655,13 @@ describe("approval routes idempotent retries", () => {
       "company-1",
       expect.objectContaining({ type: "request_board_approval" }),
       "approval:OXFA-2794",
+      ["00000000-0000-0000-0000-000000000001"],
     );
-    expect(mockIssueApprovalService.linkManyForApproval).not.toHaveBeenCalled();
+    expect(mockIssueApprovalService.linkManyForApproval).toHaveBeenCalledWith(
+      "approval-replay",
+      ["00000000-0000-0000-0000-000000000001"],
+      { agentId: "agent-1", userId: null },
+    );
     expect(mockLogActivity).not.toHaveBeenCalled();
   });
 });

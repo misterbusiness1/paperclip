@@ -39,40 +39,44 @@ const requestedByAgentPayloadField = z.object({
 
 export const gateABoardApprovalPayloadSchema = requestedByAgentPayloadField.extend({
   gate: z.literal("gate_a"),
+  orderId: z.string().trim().min(1),
+  customerId: z.string().trim().min(1),
+  amountUsd: z.number().finite().nonnegative(),
   actionType: z.enum(gateABoardApprovalActionTypes),
-  currency: z.string().regex(/^[A-Z]{3}$/),
-  wooCommerceTransactionRef: z.string().trim().min(1),
-  reason: z.object({
-    code: z.enum(gateABoardApprovalReasonCodes),
-    description: multilineTextSchema.pipe(z.string().min(1)),
-  }).strict(),
+  reason: multilineTextSchema.pipe(z.string().min(1)),
+  currency: z.string().regex(/^[A-Z]{3}$/).optional(),
+  wooCommerceTransactionRef: z.string().trim().min(1).optional(),
+  reasonCode: z.enum(gateABoardApprovalReasonCodes).optional(),
 });
 
 export const gateBBoardApprovalPayloadSchema = requestedByAgentPayloadField.extend({
   gate: z.literal("gate_b"),
+  recipient: z.string().trim().min(1),
   channel: z.enum(gateBBoardApprovalChannels),
-  contentType: z.enum(["text/plain", "text/html"]),
+  subject: z.string().trim().min(1),
   body: multilineTextSchema.pipe(z.string().min(1)),
-  bodyHash: z.string().regex(/^sha256:[a-f0-9]{64}$/),
+  threadOrOrderRef: z.string().trim().min(1),
+  contentType: z.enum(["text/plain", "text/html"]).optional(),
+  bodyHash: z.string().regex(/^sha256:[a-f0-9]{64}$/).optional(),
   threadRef: z.object({
     ticketId: z.string().trim().min(1),
     orderRef: z.string().trim().min(1),
-  }).strict(),
-  priority: z.enum(gateBBoardApprovalPriorities),
-  slaDeadline: z.string().datetime({ offset: true }),
+  }).strict().optional(),
+  priority: z.enum(gateBBoardApprovalPriorities).optional(),
+  slaDeadline: z.string().datetime({ offset: true }).optional(),
   contextPulled: z.object({
     at: z.string().datetime({ offset: true }),
     sources: z.array(z.string().trim().min(1)).min(1),
-  }).strict(),
+  }).strict().optional(),
   risks: z.array(z.object({
     code: z.string().trim().min(1),
     description: multilineTextSchema.pipe(z.string().min(1)),
-  }).strict()).min(1),
-});
+  }).strict()).min(1).optional(),
+}).strict();
 
 export const requestBoardApprovalPayloadSchema = z.discriminatedUnion("gate", [
   gateABoardApprovalPayloadSchema.strict(),
-  gateBBoardApprovalPayloadSchema.strict(),
+  gateBBoardApprovalPayloadSchema,
 ]);
 
 const requestBoardApprovalSchema = z.object({
