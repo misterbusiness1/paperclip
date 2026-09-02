@@ -6548,6 +6548,35 @@ describeEmbeddedPostgres("issueService mutation guardrails", () => {
     expect(unchanged?.assigneeAgentId).not.toBe(pausedAgentId);
   });
 
+  it("rejects a blocked update with an existing relation when its blocker completes concurrently", async () => {
+    const { issueId, pausedAgentId, blockerId } = await seedMutationGuardFixture();
+    await svc.update(issueId, { blockedByIssueIds: [blockerId] });
+    const blockerLocked = deferred<void>();
+    const completionCanCommit = deferred<void>();
+
+    const concurrentCompletion = db.transaction(async (tx) => {
+      await tx.execute(sql`select ${issues.id} from ${issues} where ${issues.id} = ${blockerId} for update`);
+      blockerLocked.resolve();
+      await completionCanCommit.promise;
+      await tx.update(issues).set({ status: "done", completedAt: new Date() }).where(eq(issues.id, blockerId));
+    });
+
+    await blockerLocked.promise;
+    const updatePromise = svc.update(issueId, {
+      assigneeAgentId: pausedAgentId,
+      status: "blocked",
+    });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    completionCanCommit.resolve();
+    await concurrentCompletion;
+
+    await expect(updatePromise).rejects.toThrow(/remain unresolved/);
+    const unchanged = await db.select({ status: issues.status, assigneeAgentId: issues.assigneeAgentId })
+      .from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]);
+    expect(unchanged).toMatchObject({ status: "todo" });
+    expect(unchanged?.assigneeAgentId).not.toBe(pausedAgentId);
+  });
+
   it.each([
     ["terminated", "terminatedAgentId", /Cannot assign work to terminated agents/],
     ["pending_approval", "pendingApprovalAgentId", /Cannot assign work to pending approval agents/],

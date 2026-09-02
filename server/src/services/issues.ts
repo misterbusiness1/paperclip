@@ -1219,7 +1219,9 @@ async function assertValidUnresolvedBlockerIssueIds(
   const rows = await dbOrTx
     .select({ id: issues.id, status: issues.status })
     .from(issues)
-    .where(and(eq(issues.companyId, companyId), inArray(issues.id, uniqueBlockerIssueIds)));
+    .where(and(eq(issues.companyId, companyId), inArray(issues.id, uniqueBlockerIssueIds)))
+    .orderBy(asc(issues.id))
+    .for("update");
   if (
     rows.length !== uniqueBlockerIssueIds.length
     || rows.some((row) => row.status === "done" || row.status === "cancelled")
@@ -6852,13 +6854,31 @@ export function issueService(db: Db) {
             },
             tx,
           );
-          if (nextAssigneeAgent?.status === "paused" && nextStatus === "blocked") {
-            await assertValidUnresolvedBlockerIssueIds(
-              tx,
-              existing.companyId,
-              blockedByIssueIds,
-            );
-          }
+        }
+        if (nextAssigneeAgent?.status === "paused" && nextStatus === "blocked") {
+          const effectiveBlockerIssueIds = blockedByIssueIds !== undefined
+            ? blockedByIssueIds
+            : await tx
+              .select({ issueId: issueRelations.issueId })
+              .from(issueRelations)
+              .where(
+                and(
+                  eq(issueRelations.companyId, existing.companyId),
+                  eq(issueRelations.relatedIssueId, id),
+                  eq(issueRelations.type, "blocks"),
+                ),
+              )
+              .orderBy(asc(issueRelations.issueId))
+              .then((rows: Array<{ issueId: string }>) => rows.map((row) => row.issueId));
+          // Resolve existing relations only after the issue update has taken its
+          // row lock, then lock blockers in a stable order through commit. This
+          // closes the gap where a blocker could finish and emit its wake before
+          // a paused-agent blocked assignment committed.
+          await assertValidUnresolvedBlockerIssueIds(
+            tx,
+            existing.companyId,
+            effectiveBlockerIssueIds,
+          );
         }
         if (
           issueData.executionWorkspaceSettings !== undefined &&
