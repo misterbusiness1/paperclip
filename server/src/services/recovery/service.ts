@@ -3184,6 +3184,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       status: "blocked",
       blockedByIssueIds: blockerIds,
       assigneeAgentId: recoveryAction.ownerAgentId ?? input.issue.assigneeAgentId,
+      assignmentGuardBlockerComment: "Blocked while Paperclip restores an executable recovery owner.",
     });
     if (!updated) return null;
     if (isProviderQuotaWait) return updated;
