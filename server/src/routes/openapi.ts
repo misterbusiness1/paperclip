@@ -4291,6 +4291,21 @@ registry.registerPath({
 });
 
 registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/execution-workspaces/reconcile-cleanup-failures",
+  tags: ["execution-workspaces"],
+  summary: "Reconcile cleanup-failed execution workspaces in a bounded batch",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    body: jsonBody(z.object({
+      dryRun: z.boolean().optional().default(true),
+      limit: z.number().int().min(1).max(100).optional().default(25),
+    })),
+  },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
+});
+
+registry.registerPath({
   method: "get",
   path: "/api/companies/{companyId}/workspace-overview",
   tags: ["execution-workspaces"],
