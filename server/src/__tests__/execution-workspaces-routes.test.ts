@@ -438,7 +438,11 @@ describe.sequential("execution workspace routes", () => {
       projectId: null,
       projectWorkspaceId: null,
       sourceIssueId: null,
-      metadata: { createdByRuntime: false },
+      metadata: {
+        createdByRuntime: false,
+        blockedByOperator: true,
+        blockedReason: "blocked SSH/local runtime mismatch",
+      },
     };
     mockExecutionWorkspaceService.getById.mockResolvedValue(existing);
     mockExecutionWorkspaceService.getCloseReadiness.mockResolvedValue({
@@ -465,5 +469,70 @@ describe.sequential("execution workspace routes", () => {
       expect.objectContaining({ status: "archived", cleanupReason: null }),
     );
     await expect(stat(sharedDir)).resolves.toBeTruthy();
+  });
+
+  it("dry-runs cleanup_failed reconciliation without mutating record-only workspaces", async () => {
+    const candidate = {
+      id: "workspace-failed-1",
+      companyId: "company-1",
+      status: "cleanup_failed",
+      mode: "shared_workspace",
+      providerType: "local_fs",
+      projectWorkspaceId: null,
+      metadata: { blockedByOperator: true },
+    };
+    mockExecutionWorkspaceService.list.mockResolvedValue([candidate]);
+    mockExecutionWorkspaceService.getCloseReadiness.mockResolvedValue({
+      state: "ready",
+      blockingReasons: [],
+      plannedActions: [{ kind: "archive_record" }],
+    });
+
+    const res = await request(createApp(undefined, mockDb))
+      .post("/api/companies/company-1/execution-workspaces/reconcile-cleanup-failures")
+      .send({ dryRun: true, limit: 10 });
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({
+      dryRun: true,
+      examined: 1,
+      archiveRecordOnly: 1,
+      archived: 0,
+      reasons: { archive_record_only: 1 },
+    });
+    expect(mockExecutionWorkspaceService.update).not.toHaveBeenCalled();
+  });
+
+  it("reconciles a record-only cleanup failure idempotently", async () => {
+    const candidate = {
+      id: "workspace-failed-2",
+      companyId: "company-1",
+      status: "cleanup_failed",
+      mode: "shared_workspace",
+      providerType: "local_fs",
+      projectWorkspaceId: null,
+      metadata: null,
+    };
+    mockExecutionWorkspaceService.list
+      .mockResolvedValueOnce([candidate])
+      .mockResolvedValueOnce([]);
+    mockExecutionWorkspaceService.getCloseReadiness.mockResolvedValue({
+      state: "ready",
+      blockingReasons: [],
+      plannedActions: [{ kind: "archive_record" }],
+    });
+    mockExecutionWorkspaceService.update.mockResolvedValue({ ...candidate, status: "archived" });
+
+    const app = createApp(undefined, mockDb);
+    const first = await request(app)
+      .post("/api/companies/company-1/execution-workspaces/reconcile-cleanup-failures")
+      .send({ dryRun: false });
+    const second = await request(app)
+      .post("/api/companies/company-1/execution-workspaces/reconcile-cleanup-failures")
+      .send({ dryRun: false });
+
+    expect(first.body).toMatchObject({ examined: 1, archived: 1 });
+    expect(second.body).toMatchObject({ examined: 0, archived: 0 });
+    expect(mockExecutionWorkspaceService.update).toHaveBeenCalledTimes(1);
   });
 });
