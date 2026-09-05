@@ -635,7 +635,7 @@ describe("agent issue mutation checkout ownership", () => {
     ]);
     mockIssueService.remove.mockResolvedValue(makeIssue({ status: "cancelled" }));
     mockIssueService.getAttachmentById.mockResolvedValue({
-      id: "attachment-1",
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
       issueId,
       companyId,
       objectKey: "issues/attachment-1/report.txt",
@@ -644,7 +644,7 @@ describe("agent issue mutation checkout ownership", () => {
       originalFilename: "report.txt",
     });
     mockIssueService.removeAttachment.mockResolvedValue({
-      id: "attachment-1",
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
       issueId,
       companyId,
       objectKey: "issues/attachment-1/report.txt",
@@ -778,7 +778,7 @@ describe("agent issue mutation checkout ownership", () => {
           .post(`/api/companies/${companyId}/issues/${issueId}/attachments`)
           .attach("file", Buffer.from("report"), { filename: "report.txt", contentType: "text/plain" }),
     ],
-    ["attachment delete", (app: express.Express) => request(app).delete("/api/attachments/attachment-1")],
+    ["attachment delete", (app: express.Express) => request(app).delete("/api/attachments/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")],
   ])("rejects peer agent %s on another agent's active checkout", async (_name, sendRequest) => {
     const res = await sendRequest(await createApp(peerActor()));
 
@@ -1144,7 +1144,7 @@ describe("agent issue mutation checkout ownership", () => {
     ],
     [
       "attachment delete",
-      (app: express.Express) => request(app).delete("/api/attachments/attachment-1"),
+      (app: express.Express) => request(app).delete("/api/attachments/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
       "Cheap status-only recovery runs cannot update issue documents",
     ],
     [

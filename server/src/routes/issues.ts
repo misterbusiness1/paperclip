@@ -11872,7 +11872,11 @@ export function issueRoutes(
   });
 
   router.get("/attachments/:attachmentId/content", async (req, res, next) => {
-    const attachmentId = req.params.attachmentId as string;
+    const attachmentId = (req.params.attachmentId as string).trim();
+    if (!isUuidLike(attachmentId)) {
+      res.status(400).json({ error: "attachmentId must be a UUID" });
+      return;
+    }
     const attachment = await getAccessibleResource(req, res, svc.getAttachmentById(attachmentId), "Attachment not found");
     if (!attachment) return;
     const issue = await svc.getById(attachment.issueId);
@@ -11933,7 +11937,11 @@ export function issueRoutes(
   });
 
   router.delete("/attachments/:attachmentId", async (req, res) => {
-    const attachmentId = req.params.attachmentId as string;
+    const attachmentId = (req.params.attachmentId as string).trim();
+    if (!isUuidLike(attachmentId)) {
+      res.status(400).json({ error: "attachmentId must be a UUID" });
+      return;
+    }
     const attachment = await getAccessibleResource(req, res, svc.getAttachmentById(attachmentId), "Attachment not found");
     if (!attachment) return;
     const issue = await svc.getById(attachment.issueId);

@@ -10,6 +10,7 @@ const mockIssueService = vi.hoisted(() => ({
   getByIdentifier: vi.fn(),
   createAttachment: vi.fn(),
   getAttachmentById: vi.fn(),
+  removeAttachment: vi.fn(),
 }));
 const mockCompanyService = vi.hoisted(() => ({
   getById: vi.fn(),
@@ -176,10 +177,12 @@ async function createApp(storage: StorageService, options?: { companyIds?: strin
   return app;
 }
 
+const ATTACHMENT_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+
 function makeAttachment(contentType: string, originalFilename: string) {
   const now = new Date("2026-01-01T00:00:00.000Z");
   return {
-    id: "attachment-1",
+    id: ATTACHMENT_ID,
     companyId: "company-1",
     issueId: "11111111-1111-4111-8111-111111111111",
     issueCommentId: null,
@@ -257,6 +260,8 @@ describe("issue attachment routes", () => {
       id: "company-1",
       attachmentMaxBytes: 1024 * 1024 * 1024,
     });
+    mockIssueService.getAttachmentById.mockResolvedValue(null);
+    mockIssueService.removeAttachment.mockResolvedValue(null);
     mockWorkProductService.createForIssue.mockReset();
     mockWorkProductService.getById.mockReset();
     mockWorkProductService.update.mockReset();
@@ -316,9 +321,9 @@ describe("issue attachment routes", () => {
     });
     expect(res.body).toMatchObject({
       contentType: "video/mp4",
-      contentPath: "/api/attachments/attachment-1/content",
-      openPath: "/api/attachments/attachment-1/content",
-      downloadPath: "/api/attachments/attachment-1/content?download=1",
+      contentPath: `/api/attachments/${ATTACHMENT_ID}/content`,
+      openPath: `/api/attachments/${ATTACHMENT_ID}/content`,
+      downloadPath: `/api/attachments/${ATTACHMENT_ID}/content?download=1`,
     });
   });
 
@@ -481,13 +486,87 @@ describe("issue attachment routes", () => {
     expect(mockIssueService.createAttachment).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ["get", "not-a-uuid"],
+    ["get", "bf0ee0de-6d7c-45b5-a6d2-1404172277e=a"],
+    ["delete", "not-a-uuid"],
+    ["delete", "bf0ee0de-6d7c-45b5-a6d2-1404172277e=a"],
+  ] as const)("rejects malformed attachment IDs before lookup: %s %s", async (method, attachmentId) => {
+    const storage = createStorageService();
+    const app = await createApp(storage);
+    const path = `/api/attachments/${encodeURIComponent(attachmentId)}${method === "get" ? "/content" : ""}`;
+    const res = await request(app)[method](path);
+
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({ error: "attachmentId must be a UUID" });
+    expect(mockIssueService.getAttachmentById).not.toHaveBeenCalled();
+    expect(mockIssueService.getById).not.toHaveBeenCalled();
+    expect(mockIssueService.removeAttachment).not.toHaveBeenCalled();
+    expect(storage.getObject).not.toHaveBeenCalled();
+    expect(storage.deleteObject).not.toHaveBeenCalled();
+    expect(mockLogActivity).not.toHaveBeenCalled();
+  });
+
+  it.each(["get", "delete"] as const)("returns 404 for a missing valid attachment UUID: %s", async (method) => {
+    const storage = createStorageService();
+    const app = await createApp(storage);
+    const path = `/api/attachments/${ATTACHMENT_ID}${method === "get" ? "/content" : ""}`;
+    const res = await request(app)[method](path);
+
+    expect(res.status).toBe(404);
+    expect(res.body).toEqual({ error: "Attachment not found" });
+    expect(mockIssueService.getAttachmentById).toHaveBeenCalledWith(ATTACHMENT_ID);
+    expect(mockIssueService.removeAttachment).not.toHaveBeenCalled();
+    expect(storage.getObject).not.toHaveBeenCalled();
+    expect(storage.deleteObject).not.toHaveBeenCalled();
+  });
+
+  it.each([ATTACHMENT_ID.toUpperCase(), ` ${ATTACHMENT_ID} `])(
+    "accepts a valid attachment UUID with existing UUID normalization: %s",
+    async (attachmentId) => {
+      const storage = createStorageService();
+      mockIssueService.getAttachmentById.mockResolvedValue(makeAttachment("image/png", "preview.png"));
+
+      const app = await createApp(storage);
+      const res = await request(app).get(`/api/attachments/${encodeURIComponent(attachmentId)}/content`);
+
+      expect(res.status).toBe(200);
+      expect(mockIssueService.getAttachmentById).toHaveBeenCalledWith(attachmentId.trim());
+      expect(storage.getObject).toHaveBeenCalled();
+    },
+  );
+
+  it("deletes an accessible attachment with a valid UUID and records the activity", async () => {
+    const storage = createStorageService();
+    const attachment = makeAttachment("image/png", "preview.png");
+    mockIssueService.getAttachmentById.mockResolvedValue(attachment);
+    mockIssueService.removeAttachment.mockResolvedValue(attachment);
+
+    const app = await createApp(storage);
+    const res = await request(app).delete(`/api/attachments/${ATTACHMENT_ID}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ ok: true });
+    expect(storage.deleteObject).toHaveBeenCalledWith(attachment.companyId, attachment.objectKey);
+    expect(mockIssueService.removeAttachment).toHaveBeenCalledWith(ATTACHMENT_ID);
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        companyId: attachment.companyId,
+        action: "issue.attachment_removed",
+        entityId: attachment.issueId,
+        details: { attachmentId: ATTACHMENT_ID },
+      }),
+    );
+  });
+
   it("serves html attachments as downloads with nosniff", async () => {
     const storage = createStorageService();
     mockIssueService.getAttachmentById.mockResolvedValue(makeAttachment("text/html", "report.html"));
 
     const app = await createApp(storage);
     const res = await request(app)
-      .get("/api/attachments/attachment-1/content")
+      .get(`/api/attachments/${ATTACHMENT_ID}/content`)
       .buffer(true)
       .parse(parseBinaryResponse);
 
@@ -505,7 +584,7 @@ describe("issue attachment routes", () => {
 
     const app = await createApp(storage);
     const res = await request(app)
-      .get("/api/attachments/attachment-1/content")
+      .get(`/api/attachments/${ATTACHMENT_ID}/content`)
       .buffer(true)
       .parse(parseBinaryResponse);
 
@@ -520,7 +599,7 @@ describe("issue attachment routes", () => {
     mockIssueService.getAttachmentById.mockResolvedValue(makeAttachment("image/png", "preview.png"));
 
     const app = await createApp(storage);
-    const res = await request(app).get("/api/attachments/attachment-1/content");
+    const res = await request(app).get(`/api/attachments/${ATTACHMENT_ID}/content`);
 
     expect(res.status).toBe(200);
     expect([
@@ -538,7 +617,7 @@ describe("issue attachment routes", () => {
 
     const app = await createApp(storage);
     const res = await request(app)
-      .get("/api/attachments/attachment-1/content")
+      .get(`/api/attachments/${ATTACHMENT_ID}/content`)
       .set("Range", "bytes=1-3");
 
     expect(res.status).toBe(206);
@@ -564,7 +643,7 @@ describe("issue attachment routes", () => {
 
     const app = await createApp(storage);
     const res = await request(app)
-      .get("/api/attachments/attachment-1/content")
+      .get(`/api/attachments/${ATTACHMENT_ID}/content`)
       .set("Range", "bytes=1-3");
 
     expect(res.status).toBe(206);
@@ -579,7 +658,7 @@ describe("issue attachment routes", () => {
     mockIssueService.getAttachmentById.mockResolvedValue(makeAttachment("video/webm", "clip.webm"));
 
     const app = await createApp(storage);
-    const res = await request(app).get("/api/attachments/attachment-1/content?download=1");
+    const res = await request(app).get(`/api/attachments/${ATTACHMENT_ID}/content?download=1`);
 
     expect(res.status).toBe(200);
     expect(res.headers["content-disposition"]).toBe('attachment; filename="clip.webm"');
@@ -591,7 +670,7 @@ describe("issue attachment routes", () => {
 
     const app = await createApp(storage);
     const res = await request(app)
-      .get("/api/attachments/attachment-1/content")
+      .get(`/api/attachments/${ATTACHMENT_ID}/content`)
       .set("Range", "bytes=99-100");
 
     expect(res.status).toBe(416);
@@ -599,18 +678,21 @@ describe("issue attachment routes", () => {
     expect(storage.getObject).not.toHaveBeenCalled();
   });
 
-  it("rejects cross-company attachment content reads", async () => {
+  it.each(["get", "delete"] as const)("rejects cross-company attachment access: %s", async (method) => {
     const storage = createStorageService();
     mockIssueService.getAttachmentById.mockResolvedValue(makeAttachment("video/mp4", "clip.mp4"));
 
     const app = await createApp(storage, { companyIds: ["company-2"], source: "session" });
-    const res = await request(app).get("/api/attachments/attachment-1/content");
+    const path = `/api/attachments/${ATTACHMENT_ID}${method === "get" ? "/content" : ""}`;
+    const res = await request(app)[method](path);
 
     // Cross-tenant reads return 404 (not 403) so the status code cannot be
     // used as an existence oracle for other tenants' attachment ids.
     expect(res.status).toBe(404);
     expect(res.body.error).toBe("Attachment not found");
     expect(storage.getObject).not.toHaveBeenCalled();
+    expect(storage.deleteObject).not.toHaveBeenCalled();
+    expect(mockIssueService.removeAttachment).not.toHaveBeenCalled();
   });
 
   it("rejects same-company attachment content reads outside the parent issue boundary", async () => {
@@ -622,7 +704,7 @@ describe("issue attachment routes", () => {
     });
 
     const app = await createApp(storage);
-    const res = await request(app).get("/api/attachments/attachment-1/content");
+    const res = await request(app).get(`/api/attachments/${ATTACHMENT_ID}/content`);
 
     expect(res.status).toBe(403);
     expect(storage.getObject).not.toHaveBeenCalled();
