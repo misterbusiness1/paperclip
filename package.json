@@ -40,6 +40,8 @@
     "check:no-git-push": "node scripts/check-no-git-push.mjs",
     "test:check-no-git-push": "node --test scripts/check-no-git-push.test.mjs",
     "test:hermes-gateway-smoke": "node --test scripts/smoke/hermes-gateway-smoke.test.mjs",
+    "test:actions-billing-refusal": "node cli/node_modules/tsx/dist/cli.mjs --test scripts/operations/actions-billing-refusal/detector.test.ts",
+    "actions:billing-monitor": "node cli/node_modules/tsx/dist/cli.mjs scripts/operations/actions-billing-refusal/index.ts",
     "docs:dev": "cd docs && npx mintlify dev",
     "smoke:hermes-gateway-join": "./scripts/smoke/hermes-gateway-join.sh",
     "smoke:hermes-gateway-e2e": "./scripts/smoke/hermes-gateway-e2e.sh",
