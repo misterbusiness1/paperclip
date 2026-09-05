@@ -3,8 +3,8 @@ import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { promisify } from "node:util";
 import { detectBillingRefusals, isRecoveryExecution } from "./detector.js";
-import { transitionState } from "./state.js";
-import { EMPTY_STATE, type Detection, type IncidentState, type JobObservation } from "./types.js";
+import { incidentBody, migrateState, transitionState } from "./state.js";
+import { EMPTY_STATE, type IncidentState, type JobObservation } from "./types.js";
 
 const execFile = promisify(execFileCallback);
 const LOOKBACK_MINUTES = 20;
@@ -39,6 +39,19 @@ async function gh<T>(path: string): Promise<T> {
   return JSON.parse(stdout) as T;
 }
 
+async function collectLogAvailability(repository: string, jobId: number): Promise<JobObservation["logAvailability"]> {
+  try {
+    await execFile("/usr/local/bin/onecli", [
+      "run", "--", "gh", "api", "--method", "HEAD", "--silent",
+      `/repos/${repository}/actions/jobs/${jobId}/logs`,
+    ]);
+    return "present";
+  } catch (error) {
+    const stderr = String((error as { stderr?: string }).stderr ?? "");
+    return /HTTP 404\b/.test(stderr) ? "absent" : "unavailable";
+  }
+}
+
 async function collectRepository(repository: string, since: Date): Promise<JobObservation[]> {
   const query = `/repos/${repository}/actions/runs?per_page=100`;
   const { workflow_runs: runs } = await gh<{ workflow_runs: GithubRun[] }>(query);
@@ -48,6 +61,7 @@ async function collectRepository(repository: string, since: Date): Promise<JobOb
     const jobsPath = `/repos/${repository}/actions/runs/${run.id}/attempts/${run.run_attempt}/jobs?per_page=100`;
     const { jobs } = await gh<{ jobs: GithubJob[] }>(jobsPath);
     for (const job of jobs) {
+      let logAvailability: JobObservation["logAvailability"] = "unavailable";
       let annotationAvailability: JobObservation["annotationAvailability"] = "available";
       let annotationMessages: string[] = [];
       const duration = Date.parse(job.completed_at) - Date.parse(job.started_at);
@@ -57,6 +71,7 @@ async function collectRepository(repository: string, since: Date): Promise<JobOb
         && (job.steps?.length ?? 0) === 0
         && !job.runner_name?.trim();
       if (structurallyEligible) {
+        logAvailability = await collectLogAvailability(repository, job.id);
         try {
           const annotations = await gh<Array<{ message?: string }>>(`/repos/${repository}/check-runs/${job.id}/annotations?per_page=100`);
           annotationMessages = annotations.flatMap((annotation) => annotation.message ? [annotation.message] : []);
@@ -76,6 +91,7 @@ async function collectRepository(repository: string, since: Date): Promise<JobOb
         completedAt: job.completed_at,
         runnerName: job.runner_name,
         stepCount: job.steps?.length ?? 0,
+        logAvailability,
         annotationAvailability,
         annotationMessages,
       });
@@ -86,7 +102,7 @@ async function collectRepository(repository: string, since: Date): Promise<JobOb
 
 async function readState(path: string): Promise<IncidentState> {
   try {
-    return JSON.parse(await readFile(path, "utf8")) as IncidentState;
+    return migrateState(JSON.parse(await readFile(path, "utf8")) as Partial<IncidentState>);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return { ...EMPTY_STATE };
     throw error;
@@ -98,27 +114,6 @@ async function writeState(path: string, state: IncidentState): Promise<void> {
   const temporary = `${path}.${process.pid}.tmp`;
   await writeFile(temporary, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
   await rename(temporary, path);
-}
-
-function incidentBody(detections: Detection[], state: IncidentState): string {
-  const repositories = [...new Set(detections.map(({ observation }) => observation.repository))].sort();
-  const runAttempts = [...new Set(detections.map(({ observation }) => `${observation.repository} ${observation.runId}/${observation.attempt}`))].sort();
-  const pullRequests = [...new Set(detections.flatMap(({ observation }) => observation.pullRequestNumbers))].sort((a, b) => a - b);
-  const confidence = detections.some((detection) => detection.confidence === "confirmed") ? "confirmed" : "suspected";
-  const reasons = [...new Set(detections.map((detection) => detection.reason))].sort();
-  return [
-    "GitHub Actions billing/spend-limit refusal detected.",
-    "",
-    `- First seen (UTC): ${state.firstSeenAt}`,
-    `- Last seen (UTC): ${state.lastSeenAt}`,
-    `- Affected repositories: ${repositories.join(", ")}`,
-    `- Run/attempt IDs: ${runAttempts.join(", ")}`,
-    `- Unique PRs (${pullRequests.length}): ${pullRequests.length ? pullRequests.join(", ") : "none"}`,
-    `- Confidence: ${confidence}`,
-    `- Sanitized reason category: ${reasons.join(", ")}`,
-    "",
-    "Triage: this signature means GitHub did not assign a runner or execute repository steps; it is not a repository CI failure.",
-  ].join("\n");
 }
 
 async function paperclip(path: string, method: "POST" | "PATCH", body: unknown): Promise<unknown> {
@@ -153,7 +148,7 @@ async function main(): Promise<void> {
   if (!dryRun && transition.action === "open") {
     const issue = await paperclip(`/companies/${required("PAPERCLIP_COMPANY_ID")}/issues`, "POST", {
       title: "P1: GitHub Actions billing/spend-limit job refusals",
-      description: incidentBody(detections, transition.state),
+      description: incidentBody(transition.state),
       priority: "high",
       assigneeAgentId: required("OCC_ACTIONS_MONITOR_CTO_AGENT_ID"),
       status: "todo",
@@ -161,7 +156,7 @@ async function main(): Promise<void> {
     transition.state.incidentIssueId = issue.id;
   } else if (!dryRun && transition.action === "update" && transition.state.incidentIssueId) {
     await paperclip(`/issues/${transition.state.incidentIssueId}`, "PATCH", {
-      description: incidentBody(detections, transition.state),
+      description: incidentBody(transition.state),
       priority: "high",
       comment: "Billing-refusal incident updated within the rolling 60-minute deduplication window.",
     });

@@ -14,7 +14,8 @@ export function hasStructuralRefusalSignature(job: JobObservation): boolean {
     && duration >= 0
     && duration <= MAX_REFUSAL_ELAPSED_MS
     && job.stepCount === 0
-    && !job.runnerName?.trim();
+    && !job.runnerName?.trim()
+    && job.logAvailability === "absent";
 }
 
 export function billingReason(messages: string[]): BillingReason | null {

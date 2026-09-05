@@ -10,6 +10,7 @@
   "completedAt": "2026-08-27T14:02:00Z",
   "runnerName": "GitHub Actions 1000000000",
   "stepCount": 10,
+  "logAvailability": "present",
   "annotationAvailability": "available",
   "annotationMessages": []
 }

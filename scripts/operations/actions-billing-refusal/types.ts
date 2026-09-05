@@ -1,4 +1,5 @@
 export type AnnotationAvailability = "available" | "unavailable";
+export type LogAvailability = "absent" | "present" | "unavailable";
 
 export interface JobObservation {
   repository: string;
@@ -12,6 +13,7 @@ export interface JobObservation {
   completedAt: string;
   runnerName: string | null;
   stepCount: number;
+  logAvailability: LogAvailability;
   annotationAvailability: AnnotationAvailability;
   annotationMessages: string[];
 }
@@ -26,6 +28,7 @@ export interface Detection {
 }
 
 export interface IncidentState {
+  schemaVersion: 2;
   windowStartedAt: string | null;
   incidentIssueId: string | null;
   firstSeenAt: string | null;
@@ -33,9 +36,15 @@ export interface IncidentState {
   clearWindows: number;
   recoveryExecutionSeen: boolean;
   affectedWorkflows: string[];
+  affectedRepositories: string[];
+  runAttempts: string[];
+  pullRequestNumbers: number[];
+  confidences: DetectionConfidence[];
+  reasons: BillingReason[];
 }
 
 export const EMPTY_STATE: IncidentState = {
+  schemaVersion: 2,
   windowStartedAt: null,
   incidentIssueId: null,
   firstSeenAt: null,
@@ -43,4 +52,9 @@ export const EMPTY_STATE: IncidentState = {
   clearWindows: 0,
   recoveryExecutionSeen: false,
   affectedWorkflows: [],
+  affectedRepositories: [],
+  runAttempts: [],
+  pullRequestNumbers: [],
+  confidences: [],
+  reasons: [],
 };

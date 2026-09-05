@@ -23,13 +23,15 @@ GitHub calls are executed only as `/usr/local/bin/onecli run -- gh api ...`. Gra
 
 ## Classification and triage
 
-A confirmed refusal requires every structural condition: conclusion `failure`, elapsed time at most 30 seconds, zero steps, and no runner name. A check-run annotation must also say that the job did not start and identify either failed payments or a spending limit. An annotation-unavailable structural match is only suspected when at least two distinct repositories match within 15 minutes. One heuristic-only job never alerts.
+A confirmed refusal requires every structural condition: conclusion `failure`, elapsed time at most 30 seconds, zero steps, no runner name, and a value-free `404` from the job-log metadata probe confirming that GitHub produced no job log. A check-run annotation must also say that the job did not start and identify either failed payments or a spending limit. An annotation-unavailable structural match is only suspected when at least two distinct repositories match within 15 minutes. One heuristic-only job never alerts. A retained log or an unavailable/ambiguous log probe excludes the job from both confirmed and suspected classification.
 
 Any assigned runner or executed step excludes the job, even when it failed. Those are repository CI failures and should be triaged by the repository owner, not as account billing refusals.
 
 ## Incident state, deduplication, and recovery
 
-The state file stores the active incident issue ID, rolling-window start, UTC first/last seen, clear-window count, and recovery-execution evidence. Its deduplication key is the active account-level category `github-actions-billing-refusal` plus the rolling 60-minute window start. Matches within that window update one incident instead of creating fan-out. A later match starts a new window and incident.
+The version-2 state file stores the active incident issue ID, rolling-window start, UTC first/last seen, clear-window count, recovery-execution evidence, and accumulated value-free repositories, workflows, run/attempt IDs, PR numbers, confidence values, and sanitized reason categories. Its deduplication key is the active account-level category `github-actions-billing-refusal` plus the rolling 60-minute window start. Matches within that window union evidence into one incident instead of creating fan-out or erasing earlier polls. A later match starts a new window and incident with fresh evidence.
+
+Existing version-1 state is migrated lazily on read: missing arrays are initialized empty and repository names are recovered from stored workflow keys, but unavailable historical run/attempt, PR, confidence, or reason data is never invented. To force a clean reset while the routine is disabled, move the state file aside and re-enable the routine; a missing file initializes version-2 empty state. Do not reset an active incident unless the CTO has captured its evidence, because the next detection will open a new deduplication window.
 
 The incident contains only UTC timestamps, repositories, run/attempt IDs, unique PR numbers/count, confidence, and sanitized reason categories. It never contains annotations, logs, request/response headers, tokens, credentials, or environment values. Ownership is the CTO.
 
