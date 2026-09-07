@@ -20,6 +20,20 @@ export function classifyAlertAccess(status) {
   return { state: "unknown", detail: `http_${status}` };
 }
 
+export function classifyDependencyAudit({ lockStatus, auditProbe, alertStatus }) {
+  if (lockStatus === 200 && auditProbe === "executable") {
+    return { state: "pass", detail: "audit_executable" };
+  }
+  if (alertStatus === 204) return { state: "pass", detail: "alerts_enabled" };
+  if (lockStatus === 401 || lockStatus === 403 || alertStatus === 401 || alertStatus === 403) {
+    return { state: "unknown", detail: "denied" };
+  }
+  if (lockStatus === 200 && auditProbe === "unavailable") {
+    return { state: "unknown", detail: "audit_unavailable" };
+  }
+  return classifyAlertAccess(alertStatus);
+}
+
 export function classifyProtection(payload) {
   const checks = [
     ...(payload?.required_status_checks?.contexts ?? []),

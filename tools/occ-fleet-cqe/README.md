@@ -17,11 +17,13 @@ The existing **OCC PR Review Queue and Weekly Quality Sweep** Paperclip routine 
 
 The routine owns overlap prevention and uploads both artifacts to its execution issue with 13-month retention. The JSON is canonical and the Markdown is derived. Generated reports must not be committed.
 
+[`routine-invocation.v1.json`](routine-invocation.v1.json) is the durable control-plane evidence record. It pins the active routine revision, CTO approval record, governed connection, invocation contract, artifact retention, and the reversible removal boundary. The routine owner must set `COLLECTOR_SHA` to the immutable merged collector commit; a feature-branch SHA is not a production schedule target.
+
 ## Coverage semantics
 
 - Branch protection checks the default branch plus `main` and `production` when present. Required `OCC Review Bot` or `CQE` is `pass`; an accessible protection response without it is `fail`; denied access is `unknown`.
 - Up to 100 recently updated closed PRs per repository are inspected by default. Merged PR bot-review states are `approved`, `stale_head`, `non_approve`, `missing`, or `unknown`.
-- Dependency coverage passes only when `composer.lock`, `package-lock.json`, an explicit npm audit script, or an enabled vulnerability-alert feed is verified. Denied or disabled/unavailable alert access is `unknown`, never clean.
+- Dependency coverage passes only when a matching lockfile is present and the scheduled runtime successfully probes the corresponding audit command (`composer audit --help` or `npm audit --help`), or when the repository vulnerability-alert feed is verified enabled. Lockfiles alone never pass. Unavailable tooling and denied or disabled/unavailable alert access are `unknown`, never clean.
 - Owner-assignment records are bounded by the inspected repositories/branches/PRs and keyed as `owner/name:kind:subject`. They are proposals only; v1 does not emit Paperclip or GitHub issues.
 
 Collector/runtime/schema failure, a repository count other than 38, duplicate repositories, or artifact-upload failure is operational failure and must exit non-zero. Coverage findings and explicit unknowns remain report findings and do not by themselves change the collector exit status. The scheduler must treat upload failure as non-zero because upload occurs outside this process.

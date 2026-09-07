@@ -3,7 +3,8 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import process from "node:process";
-import { classifyAlertAccess, classifyBotReview, classifyProtection, gapRecords } from "./classify.mjs";
+import { classifyBotReview, classifyDependencyAudit, classifyProtection, gapRecords } from "./classify.mjs";
+import { githubApi as gh, listInstalledRepositories } from "./github.mjs";
 
 const SCHEMA_VERSION = "1.0.0";
 const args = parseArgs(process.argv.slice(2));
@@ -30,45 +31,32 @@ function parseArgs(argv) {
   return result;
 }
 
-function gh(endpoint, { method = "GET", allow = [] } = {}) {
+function auditExecutable(command) {
   try {
-    const stdout = execFileSync("gh", ["api", "--method", method, "-H", "Accept: application/vnd.github+json", endpoint], { encoding: "utf8", maxBuffer: 16 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"] });
-    return { status: method === "GET" && endpoint.endsWith("/vulnerability-alerts") ? 204 : 200, data: stdout.trim() ? JSON.parse(stdout) : null };
-  } catch (error) {
-    const stderr = String(error.stderr ?? "");
-    const match = stderr.match(/HTTP (\d{3})/);
-    const status = match ? Number(match[1]) : 0;
-    if (allow.includes(status)) return { status, data: null };
-    throw new Error(`GitHub API ${endpoint} failed (${status || "runtime"})`);
+    execFileSync(command, ["audit", "--help"], { encoding: "utf8", stdio: "ignore", timeout: 10_000 });
+    return "executable";
+  } catch {
+    return "unavailable";
   }
 }
 
-function listInstalledRepositories() {
-  const result = execFileSync("gh", ["repo", "list", args.repositoryOwner, "--limit", "100", "--json", "nameWithOwner,defaultBranchRef,url"], { encoding: "utf8" });
-  return JSON.parse(result).map((repo) => ({
-    repository: repo.nameWithOwner,
-    owner: repo.nameWithOwner.split("/", 1)[0],
-    default_branch: repo.defaultBranchRef?.name,
-    html_url: repo.url,
-  })).sort((a, b) => a.repository.localeCompare(b.repository));
-}
-
-function getJsonContent(repo, path) {
-  const response = gh(`/repos/${repo}/contents/${path}`, { allow: [403, 404] });
-  if (response.status !== 200 || !response.data?.content) return null;
-  try { return JSON.parse(Buffer.from(response.data.content, "base64").toString("utf8")); } catch { return null; }
-}
-
 function dependencyCoverage(repo) {
-  const composer = gh(`/repos/${repo}/contents/composer.lock`, { allow: [403, 404] });
-  if (composer.status === 200) return { state: "pass", detail: "composer_audit_executable", evidence: "composer.lock" };
-  const npm = gh(`/repos/${repo}/contents/package-lock.json`, { allow: [403, 404] });
-  if (npm.status === 200) return { state: "pass", detail: "npm_audit_executable", evidence: "package-lock.json" };
-  const packageJson = getJsonContent(repo, "package.json");
-  if (packageJson?.scripts?.audit) return { state: "pass", detail: "npm_audit_script", evidence: "package.json#scripts.audit" };
+  const candidates = [
+    { path: "composer.lock", command: "composer", evidence: "composer audit --help" },
+    { path: "package-lock.json", command: "npm", evidence: "npm audit --help" },
+  ];
+  let denied = false;
+  for (const candidate of candidates) {
+    const lock = gh(`/repos/${repo}/contents/${candidate.path}`, { allow: [401, 403, 404] });
+    denied ||= lock.status === 401 || lock.status === 403;
+    if (lock.status === 200) {
+      const auditProbe = auditExecutable(candidate.command);
+      const alerts = gh(`/repos/${repo}/vulnerability-alerts`, { allow: [401, 403, 404] });
+      return { ...classifyDependencyAudit({ lockStatus: lock.status, auditProbe, alertStatus: alerts.status }), evidence: auditProbe === "executable" ? candidate.evidence : "repository_vulnerability_alerts" };
+    }
+  }
   const alerts = gh(`/repos/${repo}/vulnerability-alerts`, { allow: [401, 403, 404] });
-  const classified = classifyAlertAccess(alerts.status);
-  return { ...classified, evidence: "repository_vulnerability_alerts" };
+  return { ...classifyDependencyAudit({ lockStatus: denied ? 403 : 404, auditProbe: "unavailable", alertStatus: alerts.status }), evidence: "repository_vulnerability_alerts" };
 }
 
 function protection(repo, branch) {
@@ -90,6 +78,7 @@ function mergedReviews(repo) {
 
 try {
   const installed = listInstalledRepositories();
+  if (installed.some((repo) => repo.owner !== args.repositoryOwner)) throw new Error(`installation inventory contains repositories outside ${args.repositoryOwner}`);
   const unique = new Set(installed.map((repo) => repo.repository));
   if (unique.size !== installed.length) throw new Error("duplicate repositories returned by installation inventory");
   if (installed.length !== 38) throw new Error(`incomplete installation inventory: expected 38, received ${installed.length}`);

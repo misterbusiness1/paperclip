@@ -1,0 +1,37 @@
+{
+  "schema_version": "1.0.0",
+  "evidence_captured_at": "2026-09-07T14:20:00Z",
+  "routine": {
+    "id": "d346fd46-927a-47fa-86f4-5bc3ac9aca75",
+    "title": "OCC PR Review Queue and Weekly Quality Sweep",
+    "status": "active",
+    "assignee_agent_id": "1e207779-b845-4e20-a62a-f33c3a09c483",
+    "latest_revision_id": "ea455593-9a1c-4887-a1b5-acc08ce10242",
+    "latest_revision_number": 4,
+    "concurrency_policy": "coalesce_if_active",
+    "monday_leg": "On Monday, also report prior-week main-branch quality trends, dependency/CVE findings, and one tooling improvement."
+  },
+  "architecture_approval": {
+    "issue": "OXFA-30639",
+    "comment_id": "7dba7416-c02c-4a6b-8cbf-02ddfd2151a7",
+    "decision": "APPROVED for report-only v1",
+    "execution_surface": "existing Monday 09:00 ET quality-sweep leg",
+    "connection_id": "d26cdfbb-fa91-458f-b76f-1556918c427e"
+  },
+  "invocation": {
+    "working_directory": "misterbusiness1/paperclip",
+    "command": "/usr/local/bin/onecli run -- node tools/occ-fleet-cqe/src/collect.mjs --collector-sha $COLLECTOR_SHA --run-issue $RUN_ISSUE --repository-owner misterbusiness1 --output fleet-cqe-coverage.v1.json --summary fleet-cqe-coverage.md",
+    "collector_sha_contract": "COLLECTOR_SHA must be the immutable merged commit containing this collector",
+    "artifact_contract": [
+      "fleet-cqe-coverage.v1.json",
+      "fleet-cqe-coverage.md"
+    ],
+    "retention_months": 13
+  },
+  "reversibility": {
+    "routine_change": "Remove only the collector invocation from the existing Monday quality-sweep leg; do not delete or disable the routine.",
+    "source_change": "Revert tools/occ-fleet-cqe/ in a later repository commit.",
+    "target_repository_cleanup": "none",
+    "historical_artifacts": "retain as audit evidence"
+  }
+}
