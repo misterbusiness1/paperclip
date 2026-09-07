@@ -8,6 +8,7 @@ export function classifyBotReview(headSha, reviews, bot = REVIEW_BOT) {
   if (botReviews.some((review) => review.state === "APPROVED" && review.commit_id === headSha)) {
     return "approved";
   }
+  if (botReviews.some((review) => review.commit_id === headSha)) return "non_approve";
   if (botReviews.some((review) => review.state === "APPROVED")) return "stale_head";
   if (botReviews.length > 0) return "non_approve";
   return "missing";

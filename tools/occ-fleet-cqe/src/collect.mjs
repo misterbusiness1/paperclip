@@ -3,8 +3,9 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import process from "node:process";
-import { classifyBotReview, classifyDependencyAudit, classifyProtection, gapRecords } from "./classify.mjs";
+import { classifyDependencyAudit, classifyProtection, gapRecords } from "./classify.mjs";
 import { githubApi as gh, listInstalledRepositories } from "./github.mjs";
+import { mergedReviewRecord } from "./reviews.mjs";
 
 const SCHEMA_VERSION = "1.0.0";
 const args = parseArgs(process.argv.slice(2));
@@ -69,11 +70,9 @@ function protection(repo, branch) {
 
 function mergedReviews(repo) {
   const pulls = gh(`/repos/${repo}/pulls?state=closed&sort=updated&direction=desc&per_page=${args.prLimit}`).data ?? [];
-  return pulls.filter((pr) => pr.merged_at).map((pr) => {
-    const response = gh(`/repos/${repo}/pulls/${pr.number}/reviews`, { allow: [403, 404] });
-    const state = response.status === 200 ? classifyBotReview(pr.head.sha, response.data ?? []) : "unknown";
-    return { number: pr.number, head_sha: pr.head.sha, merged_at: pr.merged_at, review_state: state, evidence: pr.html_url };
-  }).sort((a, b) => a.number - b.number);
+  return pulls.filter((pr) => pr.merged_at)
+    .map((pr) => mergedReviewRecord(repo, pr, gh))
+    .sort((a, b) => a.number - b.number);
 }
 
 try {

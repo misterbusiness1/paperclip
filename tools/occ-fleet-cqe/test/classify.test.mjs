@@ -8,6 +8,9 @@ test("classifies exact-head approval", () => assert.equal(classifyBotReview("hea
 test("classifies stale-head approval", () => assert.equal(classifyBotReview("head", [bot("APPROVED", "old")]), "stale_head"));
 test("classifies missing bot review", () => assert.equal(classifyBotReview("head", []), "missing"));
 test("classifies non-approve bot review", () => assert.equal(classifyBotReview("head", [bot("COMMENTED", "head")]), "non_approve"));
+test("current-head non-approve takes precedence over stale approval", () => {
+  assert.equal(classifyBotReview("head", [bot("APPROVED", "old"), bot("CHANGES_REQUESTED", "head")]), "non_approve");
+});
 test("alert disabled/unavailable is unknown, never clean", () => assert.deepEqual(classifyAlertAccess(404), { state: "unknown", detail: "disabled_or_unavailable" }));
 test("alert denied is unknown, never clean", () => assert.deepEqual(classifyAlertAccess(403), { state: "unknown", detail: "denied" }));
 test("executable audit capability passes only with a lockfile", () => assert.deepEqual(classifyDependencyAudit({ lockStatus: 200, auditProbe: "executable", alertStatus: 404 }), { state: "pass", detail: "audit_executable" }));
