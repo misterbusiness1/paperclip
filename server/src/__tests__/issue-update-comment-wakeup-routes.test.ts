@@ -477,6 +477,43 @@ describe("issue update comment wakeups", () => {
     );
   });
 
+  it.each([
+    { status: "done", explicitNoFollowUp: false },
+    { status: "done", explicitNoFollowUp: true },
+    { status: "cancelled", explicitNoFollowUp: false },
+    { status: "cancelled", explicitNoFollowUp: true },
+  ])("does not wake the assignee when the same update closes the issue: $status, explicit flags=$explicitNoFollowUp", async ({ status, explicitNoFollowUp }) => {
+    const existing = makeIssue({
+      assigneeAgentId: ASSIGNEE_AGENT_ID,
+      assigneeUserId: null,
+      status: "in_progress",
+    });
+    const updated = { ...existing, status };
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.update.mockResolvedValue(updated);
+    mockIssueService.addComment.mockResolvedValue({
+      id: "comment-closeout",
+      issueId: existing.id,
+      companyId: existing.companyId,
+      body: "Verified closeout; no further work requested.",
+    });
+
+    const res = await request(await createApp())
+      .patch(`/api/issues/${existing.id}`)
+      .send({
+        status,
+        comment: "Verified closeout; no further work requested.",
+        ...(explicitNoFollowUp ? { reopen: false, resume: false, interrupt: false } : {}),
+      });
+
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe(status);
+    expect(mockIssueService.addComment).toHaveBeenCalledTimes(1);
+    // Await the asynchronous wake phase, rather than asserting before it runs.
+    await vi.waitFor(() => expect(mockIssueService.findMentionedAgents).toHaveBeenCalled());
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+  });
+
   it("wakes the assignee on top-level board issue comments", async () => {
     const existing = makeIssue({
       assigneeAgentId: ASSIGNEE_AGENT_ID,

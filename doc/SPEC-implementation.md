@@ -498,6 +498,10 @@ Side effects:
 - entering `in_progress` sets `started_at` if null
 - entering `done` sets `completed_at`
 - entering `cancelled` sets `cancelled_at`
+- A comment included in an update that leaves the issue `done` or `cancelled`
+  is a completion report and does not wake its unchanged assignee. Comment-wake
+  eligibility uses the saved status, so a deferred wake cannot undo that same
+  update. A genuine follow-up that reopens the issue to `todo` remains wakeable.
 
 V1 non-terminal liveness rule:
 
