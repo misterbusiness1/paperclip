@@ -1,6 +1,6 @@
 {
   "schema_version": "1.0.0",
-  "evidence_captured_at": "2026-09-07T14:34:42.299Z",
+  "evidence_captured_at": "2026-09-07T16:56:17.000Z",
   "routine": {
     "id": "d346fd46-927a-47fa-86f4-5bc3ac9aca75",
     "title": "OCC PR Review Queue and Weekly Quality Sweep",
@@ -27,6 +27,17 @@
       "fleet-cqe-coverage.md"
     ],
     "retention_months": 13
+  },
+  "live_readback": {
+    "endpoint": "/api/routines/d346fd46-927a-47fa-86f4-5bc3ac9aca75",
+    "observed_at": "2026-09-07T16:56:17.000Z",
+    "latest_revision_id": "2b8da2f8-1d26-4e90-ac41-b9970816529a",
+    "latest_revision_number": 5,
+    "invocation_present_in_description": true,
+    "schedule_trigger_id": "2d5a9b64-5349-4d41-a076-b29779af882a",
+    "schedule": "0 9,15 * * 1-5",
+    "timezone": "America/New_York",
+    "additional_schedule_created": false
   },
   "reversibility": {
     "routine_change": "Remove only the collector invocation from the existing Monday quality-sweep leg; do not delete or disable the routine.",

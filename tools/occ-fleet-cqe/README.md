@@ -19,6 +19,8 @@ The routine owns overlap prevention and uploads both artifacts to its execution 
 
 [`routine-invocation.v1.json`](routine-invocation.v1.json) is the durable control-plane evidence record. It pins the active routine revision, CTO approval record, governed connection, invocation contract, artifact retention, and the reversible removal boundary. The routine owner must set `COLLECTOR_SHA` to the immutable merged collector commit; a feature-branch SHA is not a production schedule target.
 
+The live readback captured on 2026-09-07 pins immutable routine revision `2b8da2f8-1d26-4e90-ac41-b9970816529a` (revision 5). The routine description contains the command above on its Monday leg, and the existing trigger remains `0 9,15 * * 1-5` in `America/New_York`; no second schedule, cron, or webhook was created. Authorized reviewers can inspect the revision history at `/api/routines/d346fd46-927a-47fa-86f4-5bc3ac9aca75/revisions` and compare its snapshot with the readback record.
+
 ## Coverage semantics
 
 - Branch protection checks the default branch plus `main` and `production` when present. Required `OCC Review Bot` or `CQE` is `pass`; an accessible protection response without it is `fail`; denied access is `unknown`.
