@@ -11,7 +11,7 @@ export function githubApiArgs(endpoint, { method = "GET", paginate = false } = {
     "Accept: application/vnd.github+json",
     "-H",
     ONECLI_CONNECTION_HEADER,
-    ...(paginate ? ["--paginate", "--slurp"] : []),
+    ...(paginate ? ["--paginate"] : []),
     endpoint,
   ];
 }
@@ -37,9 +37,8 @@ export function githubApi(endpoint, { method = "GET", paginate = false, allow = 
 }
 
 export function listInstalledRepositories({ exec = execFileSync } = {}) {
-  const response = githubApi("/installation/repositories?per_page=100", { paginate: true, exec });
-  const pages = Array.isArray(response.data) ? response.data : [response.data];
-  return pages.flatMap((page) => page?.repositories ?? []).map((repo) => ({
+  const response = githubApi("/installation/repositories?per_page=100", { exec });
+  return (response.data?.repositories ?? []).map((repo) => ({
     repository: repo.full_name,
     owner: repo.owner.login,
     default_branch: repo.default_branch,

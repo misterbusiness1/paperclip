@@ -11,11 +11,10 @@ test("repository enumeration uses the selected GitHub API connection", () => {
   let invoked;
   const exec = (command, args) => {
     invoked = { command, args };
-    return JSON.stringify([{ repositories: [{ full_name: "misterbusiness1/widget", owner: { login: "misterbusiness1" }, default_branch: "main", html_url: "https://github.com/misterbusiness1/widget" }] }]);
+    return JSON.stringify({ repositories: [{ full_name: "misterbusiness1/widget", owner: { login: "misterbusiness1" }, default_branch: "main", html_url: "https://github.com/misterbusiness1/widget" }] });
   };
   assert.equal(listInstalledRepositories({ exec })[0].repository, "misterbusiness1/widget");
   assert.equal(invoked.command, "gh");
   assert.ok(invoked.args.includes(ONECLI_CONNECTION_HEADER));
-  assert.ok(invoked.args.includes("--paginate"));
-  assert.ok(invoked.args.includes("--slurp"));
+  assert.ok(invoked.args.includes("/installation/repositories?per_page=100"));
 });
