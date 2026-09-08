@@ -1194,6 +1194,55 @@ describe("codex_local ACP lane", () => {
     expect(result.errorFamily).not.toBe("provider_quota");
   });
 
+  it.each(["Sep 8th, 2026 2:00 PM.", "an unavailable reset time."])(
+    "classifies the observed credits quota with bounded reset fallback: %s",
+    async (reset) => {
+      const root = await makeTempRoot("paperclip-codex-acp-credits-quota-");
+      const summary = "You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at " + reset;
+      const execute = createCodexAcpExecutor({
+        createRuntime: (options: FakeRuntimeOptions) => new FakeRuntime(
+          options,
+          [{ type: "text_delta", text: summary, stream: "output", tag: "agent_message_chunk" }],
+          { status: "failed", error: { message: "Prompt failed" } },
+        ) as never,
+      });
+      const result = await execute(buildContext(root));
+      expect(result.exitCode).toBe(1);
+      expect(result.errorMessage).toBe("Prompt failed");
+      expect(result.summary).toBe(summary);
+      expect(result.errorCode).toBe("provider_quota");
+      expect(result.errorFamily).toBe("provider_quota");
+      expect(result.resultJson?.errorFamily).toBe("provider_quota");
+      expect(result.retryNotBefore).toBeNull();
+      expect(result.resultJson).not.toHaveProperty("providerQuotaRetryNotBefore");
+      expect(result.resultJson).not.toHaveProperty("transientRetryNotBefore");
+    },
+  );
+
+  it.each([
+    ["auth precedence", "failed", "", "OAuth failed: refresh_token_invalidated", "refresh_token_invalidated"],
+    ["successful output", "completed", "", "", null],
+    ["cancelled output", "cancelled", "", "", null],
+    ["quoted failed output", "failed", "Provider said: ", "Prompt failed", "acpx_turn_failed"],
+  ] as const)("preserves %s for the credits quota sentence", async (_label, status, prefix, error, expectedCode) => {
+    const root = await makeTempRoot("paperclip-codex-acp-credits-quota-control-");
+    const summary = prefix + "You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Sep 8th, 2026 2:00 PM.";
+    const terminal: FakeRuntimeTurnResult = status === "failed"
+      ? { status, error: { message: error } }
+      : { status, stopReason: "end_turn" };
+    const execute = createCodexAcpExecutor({
+      createRuntime: (options: FakeRuntimeOptions) => new FakeRuntime(
+        options,
+        [{ type: "text_delta", text: summary, stream: "output", tag: "agent_message_chunk" }],
+        terminal,
+      ) as never,
+    });
+    const result = await execute(buildContext(root));
+    expect(result.errorCode).not.toBe("provider_quota");
+    expect(result.errorFamily).not.toBe("provider_quota");
+    if (expectedCode) expect(result.errorCode).toBe(expectedCode);
+  });
+
   it("resumes compatible ACP sessions on later Codex ACP runs", async () => {
     const root = await makeTempRoot("paperclip-codex-acp-resume-");
     const runtimes: FakeRuntime[] = [];
