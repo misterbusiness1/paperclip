@@ -428,7 +428,7 @@ describe("issue update comment wakeups", () => {
       body: "Verified closeout; no further work requested.",
     });
 
-    const res = await request(app)
+    const res = await request(await createApp())
       .patch(`/api/issues/${existing.id}`)
       .send({
         status,

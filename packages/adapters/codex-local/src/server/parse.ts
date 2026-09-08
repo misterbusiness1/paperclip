@@ -10,6 +10,8 @@ const CODEX_TRANSIENT_UPSTREAM_RE =
 const CODEX_REMOTE_COMPACTION_RE = /remote\s+compact\s+task/i;
 const CODEX_USAGE_LIMIT_RE =
   /you(?:'|’)ve hit your usage limit for .+\.\s+switch to another model now,\s+or try again at\s+([^.!\n]+)(?:[.!]|\n|$)/i;
+const CODEX_ACP_PROVIDER_QUOTA_SUMMARY_RE =
+  /^you(?:'|’)ve hit your usage limit for .+\.\s+switch to another model now,\s+or try again at\s+[^.!\n]+(?:[.!])?$/i;
 const CODEX_PROVIDER_QUOTA_RE =
   /(?:you(?:'|’)ve hit your usage limit|usage limit|model (?:is )?at capacity|at capacity for this model|capacity limit)/i;
 const CODEX_REFRESH_TOKEN_REUSED_RE =
@@ -302,6 +304,16 @@ export function extractCodexRetryNotBefore(input: {
   const usageLimitMatch = haystack.match(CODEX_USAGE_LIMIT_RE);
   if (!usageLimitMatch) return null;
   return parseLocalClockTime(usageLimitMatch[1] ?? "", now);
+}
+
+/**
+ * ACP can preserve the provider's quota explanation as its assistant summary
+ * while returning only a generic terminal failure. Keep this deliberately
+ * narrower than the CLI classifier: an exact provider-shaped summary is
+ * evidence, whereas quoted quota text and generic capacity messages are not.
+ */
+export function isCodexAcpProviderQuotaSummary(summary: string): boolean {
+  return CODEX_ACP_PROVIDER_QUOTA_SUMMARY_RE.test(summary.trim());
 }
 
 export function isCodexTransientUpstreamError(input: {
