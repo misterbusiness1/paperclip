@@ -25,7 +25,7 @@ const IGNORED_INSTRUCTIONS_DIRECTORY_NAMES = new Set([
   "venv",
 ]);
 
-type BundleMode = "managed" | "external";
+export type BundleMode = "managed" | "external";
 
 type AgentLike = {
   id: string;
@@ -74,6 +74,13 @@ type BundleState = {
   warnings: string[];
   legacyPromptTemplateActive: boolean;
   legacyBootstrapPromptTemplateActive: boolean;
+};
+
+export type InstructionsBundleBinding = {
+  instructionsBundleMode: BundleMode;
+  instructionsRootPath: string;
+  instructionsEntryFile: string;
+  instructionsFilePath: string;
 };
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -452,6 +459,36 @@ export function syncInstructionsBundleConfigFromFilePath(
 }
 
 export function agentInstructionsService() {
+  async function resolvePersistedBundleBinding(
+    agent: AgentLike,
+  ): Promise<InstructionsBundleBinding | null> {
+    const derived = deriveBundleState(agent);
+    const recovered = await recoverManagedBundleState(agent, derived);
+    const managedRootPath = resolveManagedInstructionsRoot(agent);
+    if (
+      !recovered.mode
+      || !recovered.rootPath
+      || (recovered.mode === "managed" && path.resolve(recovered.rootPath) !== managedRootPath)
+    ) {
+      return null;
+    }
+
+    const persisted = buildPersistedBundleConfig(derived, recovered);
+    const rootPath = asString(persisted[ROOT_KEY]);
+    const entryFile = asString(persisted[ENTRY_KEY]);
+    const filePath = asString(persisted[FILE_KEY]);
+    if (!isBundleMode(persisted[MODE_KEY]) || !rootPath || !entryFile || !filePath) {
+      return null;
+    }
+
+    return {
+      instructionsBundleMode: persisted[MODE_KEY],
+      instructionsRootPath: rootPath,
+      instructionsEntryFile: entryFile,
+      instructionsFilePath: filePath,
+    };
+  }
+
   async function getBundle(agent: AgentLike): Promise<AgentInstructionsBundle> {
     const state = await recoverManagedBundleState(agent, deriveBundleState(agent));
     if (!state.rootPath) return toBundle(agent, state, []);
@@ -730,6 +767,7 @@ export function agentInstructionsService() {
     deleteFile,
     exportFiles,
     ensureManagedBundle: ensureWritableBundle,
+    resolvePersistedBundleBinding,
     materializeManagedBundle,
   };
 }
