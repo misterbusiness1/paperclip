@@ -1,6 +1,6 @@
 import express from "express";
 import request from "supertest";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 const ASSIGNEE_AGENT_ID = "11111111-1111-4111-8111-111111111111";
 const PREVIOUS_AGENT_ID = "22222222-2222-4222-8222-222222222222";
@@ -103,79 +103,6 @@ vi.mock("../services/index.js", () => ({
   workProductService: () => ({}),
 }));
 
-function registerModuleMocks() {
-  vi.doMock("../services/index.js", () => ({
-    companyService: () => ({
-      getById: vi.fn(async () => ({ id: "company-1", attachmentMaxBytes: 10 * 1024 * 1024 })),
-    }),
-    accessService: () => ({
-      canUser: vi.fn(async () => true),
-      decide: vi.fn(async (input: { action?: string }) => ({
-        allowed: true,
-        action: input.action,
-        reason: "allow_explicit_grant",
-        explanation: "Allowed by test grant.",
-      })),
-      hasPermission: vi.fn(async () => true),
-    }),
-    agentService: () => ({
-      getById: vi.fn(async () => null),
-      resolveByReference: vi.fn(async (_companyId: string, raw: string) => ({
-        ambiguous: false,
-        agent: { id: raw },
-      })),
-    }),
-    companySkillService: () => ({
-      completeTestRunForIssue: vi.fn(async () => null),
-    }),
-    documentAnnotationService: () => ({ remapOpenThreadsForDocument: async () => [] }),
-    documentService: () => ({}),
-    executionWorkspaceService: () => ({}),
-    feedbackService: () => ({
-      listIssueVotesForUser: vi.fn(async () => []),
-      saveIssueVote: vi.fn(async () => ({ vote: null, consentEnabledNow: false, sharingEnabled: false })),
-    }),
-    goalService: () => ({}),
-    heartbeatService: () => mockHeartbeatService,
-    instanceSettingsService: () => ({
-      get: vi.fn(async () => ({
-        id: "instance-settings-1",
-        general: {
-          censorUsernameInLogs: false,
-          feedbackDataSharingPreference: "prompt",
-        },
-      })),
-      listCompanyIds: vi.fn(async () => ["company-1"]),
-    }),
-    issueApprovalService: () => ({}),
-    issueReferenceService: () => ({
-      deleteDocumentSource: async () => undefined,
-      diffIssueReferenceSummary: () => ({
-        addedReferencedIssues: [],
-        removedReferencedIssues: [],
-        currentReferencedIssues: [],
-      }),
-      emptySummary: () => ({ outbound: [], inbound: [] }),
-      listIssueReferenceSummary: async () => ({ outbound: [], inbound: [] }),
-      syncComment: async () => undefined,
-      syncDocument: async () => undefined,
-      syncIssue: async () => undefined,
-    }),
-    issueRecoveryActionService: () => ({
-      getActiveForIssue: vi.fn(async () => null),
-      listActiveForIssues: vi.fn(async () => new Map()),
-    }),
-    issueService: () => mockIssueService,
-    issueThreadInteractionService: () => mockIssueThreadInteractionService,
-    logActivity: vi.fn(async () => undefined),
-    projectService: () => ({}),
-    routineService: () => ({
-      syncRunStatusForIssue: vi.fn(async () => undefined),
-    }),
-    workProductService: () => ({}),
-  }));
-}
-
 async function createApp() {
   const [{ errorHandler }, { issueRoutes }] = await Promise.all([
     vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
@@ -220,12 +147,13 @@ function makeIssue(overrides: Record<string, unknown> = {}) {
 }
 
 describe("issue update comment wakeups", () => {
+  let app: express.Express;
+
+  beforeAll(async () => {
+    app = await createApp();
+  });
+
   beforeEach(() => {
-    vi.resetModules();
-    vi.doUnmock("../routes/issues.js");
-    vi.doUnmock("../routes/authz.js");
-    vi.doUnmock("../middleware/index.js");
-    registerModuleMocks();
     vi.clearAllMocks();
     mockIssueService.findMentionedAgents.mockResolvedValue([]);
     mockIssueService.getRelationSummaries.mockResolvedValue({ blockedBy: [], blocks: [] });
@@ -251,7 +179,7 @@ describe("issue update comment wakeups", () => {
       body: "write the whole thing",
     });
 
-    const res = await request(await createApp())
+    const res = await request(app)
       .patch(`/api/issues/${existing.id}`)
       .send({
         assigneeAgentId: ASSIGNEE_AGENT_ID,
@@ -317,7 +245,7 @@ describe("issue update comment wakeups", () => {
       status: "cancelled",
     });
 
-    const res = await request(await createApp())
+    const res = await request(app)
       .patch(`/api/issues/${existing.id}`)
       .send({
         assigneeAgentId: ASSIGNEE_AGENT_ID,
@@ -403,7 +331,7 @@ describe("issue update comment wakeups", () => {
       status: "cancelled",
     });
 
-    const res = await request(await createApp())
+    const res = await request(app)
       .patch(`/api/issues/${existing.id}`)
       .send({
         assigneeAgentId: null,
@@ -449,7 +377,7 @@ describe("issue update comment wakeups", () => {
       body: "please revise this",
     });
 
-    const res = await request(await createApp())
+    const res = await request(app)
       .patch(`/api/issues/${existing.id}`)
       .send({
         comment: "please revise this",
@@ -500,7 +428,7 @@ describe("issue update comment wakeups", () => {
       body: "Verified closeout; no further work requested.",
     });
 
-    const res = await request(await createApp())
+    const res = await request(app)
       .patch(`/api/issues/${existing.id}`)
       .send({
         status,
@@ -530,7 +458,7 @@ describe("issue update comment wakeups", () => {
       body: "please handle this top-level thread comment",
     });
 
-    const res = await request(await createApp())
+    const res = await request(app)
       .post(`/api/issues/${existing.id}/comments`)
       .send({
         body: "please handle this top-level thread comment",
@@ -583,7 +511,7 @@ describe("issue update comment wakeups", () => {
       { state: "stalled", paths: [], reason: "review path consumed" },
     ]]));
 
-    const res = await request(await createApp())
+    const res = await request(app)
       .post(`/api/issues/${existing.id}/comments`)
       .send({ body: "one more review note" });
 
@@ -620,7 +548,7 @@ describe("issue update comment wakeups", () => {
     });
     mockIssueService.findMentionedAgents.mockResolvedValue([]);
 
-    const res = await request(await createApp())
+    const res = await request(app)
       .post(`/api/issues/${existing.id}/comments`)
       .send({
         body: "QA please take the screenshot",
@@ -642,7 +570,7 @@ describe("issue update comment wakeups", () => {
     mockIssueService.update.mockResolvedValue(updated);
     mockIssueService.shouldSuppressReviewChildCompletionWake.mockResolvedValue(true);
 
-    const res = await request(await createApp())
+    const res = await request(app)
       .patch(`/api/issues/${existing.id}`)
       .send({ status: "done", comment: "review complete" });
 
@@ -668,7 +596,7 @@ describe("issue update comment wakeups", () => {
     });
     mockIssueService.findMentionedAgents.mockResolvedValue([MENTIONED_AGENT_ID]);
 
-    const res = await request(await createApp())
+    const res = await request(app)
       .post(`/api/issues/${existing.id}/comments`)
       .send({
         body: "[@QA](/agents/33333333-3333-4333-8333-333333333333) please inspect this",

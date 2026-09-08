@@ -87,7 +87,11 @@ import {
   type ParsedExecutionWorkspaceMode,
 } from "./execution-workspace-policy.js";
 import { mergeExecutionWorkspaceConfig } from "./execution-workspaces.js";
-import { buildInitialIssueMonitorFields, normalizeIssueExecutionPolicy } from "./issue-execution-policy.js";
+import {
+  buildInitialIssueMonitorFields,
+  normalizeIssueExecutionPolicy,
+  parseIssueExecutionState,
+} from "./issue-execution-policy.js";
 import { instanceSettingsService } from "./instance-settings.js";
 import { redactCurrentUserText } from "../log-redaction.js";
 import { redactSensitiveText } from "../redaction.js";
@@ -6529,8 +6533,10 @@ export function issueService(db: Db) {
           parentAssigneeAgentId: issues.assigneeAgentId,
           parentAssigneeUserId: issues.assigneeUserId,
           parentExecutionPolicy: issues.executionPolicy,
+          parentExecutionState: issues.executionState,
           parentMonitorNextCheckAt: issues.monitorNextCheckAt,
           parentMonitorWakeRequestedAt: issues.monitorWakeRequestedAt,
+          parentMonitorScheduledBy: issues.monitorScheduledBy,
           databaseNow: sql<Date>`current_timestamp`,
           childParentId: completedChild.parentId,
           childOriginKind: completedChild.originKind,
@@ -6560,8 +6566,13 @@ export function issueService(db: Db) {
 
       try {
         const monitor = normalizeIssueExecutionPolicy(rows.parentExecutionPolicy)?.monitor;
-        if (!monitor) return false;
-        return new Date(monitor.nextCheckAt).getTime() === rows.parentMonitorNextCheckAt.getTime();
+        const monitorState = parseIssueExecutionState(rows.parentExecutionState)?.monitor;
+        if (!monitor || !monitorState || monitorState.status !== "scheduled") return false;
+        const persistedNextCheckAt = rows.parentMonitorNextCheckAt.toISOString();
+        return monitor.nextCheckAt === persistedNextCheckAt
+          && monitorState.nextCheckAt === persistedNextCheckAt
+          && monitor.scheduledBy === rows.parentMonitorScheduledBy
+          && monitorState.scheduledBy === rows.parentMonitorScheduledBy;
       } catch {
         // Ambiguous or invalid persisted policy state must fail open.
         return false;

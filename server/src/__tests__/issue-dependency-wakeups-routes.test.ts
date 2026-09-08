@@ -1,6 +1,6 @@
 import express from "express";
 import request from "supertest";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 const mockWakeup = vi.hoisted(() => vi.fn(async () => undefined));
 const mockFindExistingIssueBlockersResolvedWake = vi.hoisted(() => vi.fn(async () => null));
@@ -138,11 +138,13 @@ async function createApp() {
 }
 
 describe("issue dependency wakeups in issue routes", () => {
+  let app: express.Express;
+
+  beforeAll(async () => {
+    app = await createApp();
+  });
+
   beforeEach(() => {
-    vi.resetModules();
-    vi.doUnmock("../routes/issues.js");
-    vi.doUnmock("../routes/authz.js");
-    vi.doUnmock("../middleware/index.js");
     vi.clearAllMocks();
     mockFindExistingIssueBlockersResolvedWake.mockResolvedValue(null);
     mockIssueService.getAncestors.mockResolvedValue([]);
@@ -209,7 +211,7 @@ describe("issue dependency wakeups in issue routes", () => {
       },
     ]);
 
-    const res = await request(await createApp()).patch("/api/issues/issue-1").send({ status: "done" });
+    const res = await request(app).patch("/api/issues/issue-1").send({ status: "done" });
     expect(res.status).toBe(200);
     await vi.waitFor(() => {
       expect(mockWakeup).toHaveBeenCalledWith(
@@ -272,7 +274,7 @@ describe("issue dependency wakeups in issue routes", () => {
       isDependencyReady: true,
     });
 
-    const res = await request(await createApp())
+    const res = await request(app)
       .patch(`/api/issues/${parentIssueId}`)
       .send({
         status: "blocked",
@@ -365,7 +367,7 @@ describe("issue dependency wakeups in issue routes", () => {
       childIssueSummaryTruncated: false,
     });
 
-    const res = await request(await createApp()).patch("/api/issues/child-1").send({ status: "done" });
+    const res = await request(app).patch("/api/issues/child-1").send({ status: "done" });
     expect(res.status).toBe(200);
     await vi.waitFor(() => {
       expect(mockWakeup).toHaveBeenCalledWith(
