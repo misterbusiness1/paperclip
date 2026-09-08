@@ -30,6 +30,7 @@ import type {
   AcpxRemoteManagedHomeContext,
   AcpxRemoteManagedHomeResult,
 } from "@paperclipai/adapter-utils/acpx-engine/execute";
+import { hasTrustedTerminalProviderDiagnostic } from "@paperclipai/adapter-utils/acpx-engine/execute";
 import {
   asBoolean,
   asNumber,
@@ -291,6 +292,9 @@ function withCodexAcpDefaults(options: CodexAcpExecutorOptions): AcpxEngineExecu
     resolveBillingIdentity: resolveCodexAcpBillingIdentity,
     prepareRemoteManagedHome: prepareCodexRemoteManagedHome,
     ...options,
+    // This trust boundary is adapter-owned. Callers may replace runtime test
+    // seams, but cannot broaden which content receives internal provenance.
+    terminalProviderDiagnosticMatcher: isCodexAcpProviderQuotaSummary,
     adapterType: "codex_local",
     moduleDir,
     packageRootDir,
@@ -319,7 +323,12 @@ function withCodexFailureClassification(result: AdapterExecutionResult): Adapter
     };
   }
 
-  if (result.errorCode !== "acpx_turn_failed" || !isCodexAcpProviderQuotaSummary(result.summary ?? "")) {
+  const summary = result.summary ?? "";
+  if (
+    result.errorCode !== "acpx_turn_failed" ||
+    !isCodexAcpProviderQuotaSummary(summary) ||
+    !hasTrustedTerminalProviderDiagnostic(result, summary)
+  ) {
     return result;
   }
 

@@ -314,6 +314,13 @@ export interface AcpxRemoteManagedHomeResult {
 
 export interface AcpxEngineExecutorOptions {
   createRuntime?: AcpxRuntimeFactory;
+  /**
+   * Fail-closed recognizer for a provider-owned terminal diagnostic. ACPX
+   * 0.12 does not expose diagnostic provenance, so the engine invokes this
+   * only for an exact whole-output failed turn. Mixed assistant output can
+   * never acquire trusted provenance through this compatibility seam.
+   */
+  terminalProviderDiagnosticMatcher?: (content: string) => boolean;
   now?: () => number;
   warmHandles?: Map<string, RuntimeCacheEntry>;
   /**
@@ -428,6 +435,14 @@ interface AcpxPreparedRuntime {
 
 const defaultWarmHandles = new Map<string, RuntimeCacheEntry>();
 const defaultStagedRuntimes = new Map<string, StagedRuntimeCacheEntry>();
+const trustedTerminalProviderDiagnostics = new WeakMap<object, string>();
+
+export function hasTrustedTerminalProviderDiagnostic(
+  result: AdapterExecutionResult,
+  content: string,
+): boolean {
+  return content.length > 0 && trustedTerminalProviderDiagnostics.get(result) === content;
+}
 const defaultStagingLocks = new Map<string, Promise<unknown>>();
 
 function resolveEngineSettings(options: AcpxEngineExecutorOptions): AcpxEngineSettings {
@@ -3600,6 +3615,8 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
       let timeout: NodeJS.Timeout | null = null;
       let timedOut = false;
       const textParts: string[] = [];
+      const outputTextParts: string[] = [];
+      let hasNonOutputText = false;
       let eventBreakdown: AcpRuntimeUsageBreakdown | null = null;
       let eventCostUsd: number | null = null;
       // Open the agent turn span as a child of the run root span. It wraps the
@@ -3637,7 +3654,11 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         };
         const toolTitles = new Map<string, string>();
         for await (const event of turn.events) {
-          if (event.type === "text_delta") textParts.push(event.text);
+          if (event.type === "text_delta") {
+            textParts.push(event.text);
+            if (event.stream === "thought") hasNonOutputText = true;
+            else outputTextParts.push(event.text);
+          }
           if (event.type === "status" && event.tag === "usage_update") {
             eventBreakdown = event.breakdown ?? eventBreakdown;
             eventCostUsd = usdCostAmount(event.cost) ?? eventCostUsd;
@@ -3742,7 +3763,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         // The one clean-completion path clears the run failure flag; every other
         // path keeps it set, so the run root span closes with error status.
         runFailed = terminal.status === "completed" && !timedOut ? false : true;
-        return {
+        const result: AdapterExecutionResult = {
           exitCode: terminal.status === "completed" ? 0 : 1,
           signal: timedOut ? "SIGTERM" : null,
           timedOut,
@@ -3772,6 +3793,19 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           summary: textParts.join("").trim() || terminalStopReason || terminal.status,
           clearSession,
         };
+        const terminalDiagnostic = outputTextParts.join("").trim();
+        if (
+          terminal.status === "failed" &&
+          !timedOut &&
+          !hasNonOutputText &&
+          terminalDiagnostic.length > 0 &&
+          terminalDiagnostic.length <= 512 &&
+          terminalDiagnostic === result.summary &&
+          deps.terminalProviderDiagnosticMatcher?.(terminalDiagnostic) === true
+        ) {
+          trustedTerminalProviderDiagnostics.set(result, terminalDiagnostic);
+        }
+        return result;
       } catch (err) {
         if (timeout) clearTimeout(timeout);
         const messageOverride = timedOut
