@@ -10,6 +10,36 @@ import {
   parseCodexJsonl,
 } from "./parse.js";
 
+describe("Codex ACP credits quota summary", () => {
+  const prefix = "You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at ";
+
+  it.each([
+    "Sep 8th, 2026 2:00 PM.",
+    "an unavailable reset time.",
+  ])("recognizes the credits quota sentence without inventing a reset for %s", (reset) => {
+    const summary = prefix + reset;
+    expect(isCodexAcpProviderQuotaSummary(summary)).toBe(true);
+    // This dated provider format has no proven timezone contract. Preserve the
+    // scheduler's bounded fallback instead of guessing an absolute reset.
+    expect(extractCodexRetryNotBefore({ errorMessage: summary }, new Date("2026-09-08T01:00:00Z"))).toBeNull();
+  });
+
+  it.each([
+    `Provider said: "${prefix}Sep 8th, 2026 2:00 PM."`,
+    `"${prefix}Sep 8th, 2026 2:00 PM."`,
+    prefix.replace("chatgpt.com", "chatgpt.com.example.invalid") + "Sep 8th, 2026 2:00 PM.",
+    prefix.replace("https://", "http://") + "Sep 8th, 2026 2:00 PM.",
+    prefix.replace("/usage", "/usage?token=synthetic") + "Sep 8th, 2026 2:00 PM.",
+    prefix + "Sep 8th, 2026 2:00 PM.\nUnrelated failure.",
+    prefix + "Sep 8th,\n2026 2:00 PM.",
+    prefix + "x".repeat(161),
+    prefix,
+    "You've hit your usage limit. To get more access now, send a request to your admin or try again at Sep 8th, 2026 2:00 PM.",
+  ])("rejects a nonmatching credits quota summary: %s", (summary) => {
+    expect(isCodexAcpProviderQuotaSummary(summary)).toBe(false);
+  });
+});
+
 describe("parseCodexJsonl", () => {
   it("captures session id, assistant summary, usage, and error message", () => {
     const stdout = [

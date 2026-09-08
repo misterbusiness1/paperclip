@@ -12,6 +12,8 @@ const CODEX_USAGE_LIMIT_RE =
   /you(?:'|’)ve hit your usage limit for .+\.\s+switch to another model now,\s+or try again at\s+([^.!\n]+)(?:[.!]|\n|$)/i;
 const CODEX_ACP_PROVIDER_QUOTA_SUMMARY_RE =
   /^you(?:'|’)ve hit your usage limit for .+\.\s+switch to another model now,\s+or try again at\s+[^.!\n]+(?:[.!])?$/i;
+const CODEX_ACP_CREDITS_QUOTA_SUMMARY_RE =
+  /^you(?:'|’)ve hit your usage limit\. Visit https:\/\/chatgpt\.com\/codex\/settings\/usage to purchase more credits or try again at [^.!?\r\n]{1,160}[.!]?$/i;
 const CODEX_PROVIDER_QUOTA_RE =
   /(?:you(?:'|’)ve hit your usage limit|usage limit|model (?:is )?at capacity|at capacity for this model|capacity limit)/i;
 const CODEX_REFRESH_TOKEN_REUSED_RE =
@@ -313,7 +315,12 @@ export function extractCodexRetryNotBefore(input: {
  * evidence, whereas quoted quota text and generic capacity messages are not.
  */
 export function isCodexAcpProviderQuotaSummary(summary: string): boolean {
-  return CODEX_ACP_PROVIDER_QUOTA_SUMMARY_RE.test(summary.trim());
+  const normalized = summary.trim();
+  // The credits notice is also a provider-owned sentence, but its dated reset
+  // has no verified timezone contract. The existing extractor deliberately
+  // leaves that format unparsed so native retry scheduling uses its fallback.
+  return CODEX_ACP_PROVIDER_QUOTA_SUMMARY_RE.test(normalized)
+    || CODEX_ACP_CREDITS_QUOTA_SUMMARY_RE.test(normalized);
 }
 
 export function isCodexTransientUpstreamError(input: {
