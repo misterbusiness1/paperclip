@@ -3,6 +3,7 @@ import {
   classifyCodexAuthRefreshFailure,
   extractCodexRetryNotBefore,
   isCodexHarnessCrash,
+  isCodexAcpProviderQuotaSummary,
   isCodexProviderQuotaError,
   isCodexTransientUpstreamError,
   isCodexUnknownSessionError,
@@ -188,6 +189,22 @@ describe("isCodexUnknownSessionError", () => {
 });
 
 describe("isCodexTransientUpstreamError", () => {
+  it("recognizes only an unquoted ACP provider-quota summary", () => {
+    const summary = "You've hit your usage limit for GPT-5.3-Codex-Spark. Switch to another model now, or try again at 11:31 PM.";
+
+    expect(isCodexAcpProviderQuotaSummary(summary)).toBe(true);
+    expect(isCodexAcpProviderQuotaSummary(`Provider said: \"${summary}\"`)).toBe(false);
+    expect(isCodexAcpProviderQuotaSummary("The requested model is at capacity. Please try again later.")).toBe(false);
+    expect(isCodexAcpProviderQuotaSummary("An ordinary adapter failure occurred.")).toBe(false);
+  });
+
+  it("parses the supported ACP provider reset clock independently", () => {
+    const now = new Date("2026-04-23T03:29:02.000Z");
+    expect(extractCodexRetryNotBefore({
+      errorMessage: "You've hit your usage limit for GPT-5.3-Codex-Spark. Switch to another model now, or try again at 11:31 PM (America/Chicago).",
+    }, now)?.toISOString()).toBe("2026-04-23T04:31:00.000Z");
+  });
+
   it("classifies the remote-compaction high-demand failure as transient upstream", () => {
     expect(
       isCodexTransientUpstreamError({

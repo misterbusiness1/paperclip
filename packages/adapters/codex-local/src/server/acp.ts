@@ -37,7 +37,11 @@ import {
   parseObject,
 } from "@paperclipai/adapter-utils/server-utils";
 import { normalizeCodexModel } from "../index.js";
-import { classifyCodexAuthRefreshFailure } from "./parse.js";
+import {
+  classifyCodexAuthRefreshFailure,
+  extractCodexRetryNotBefore,
+  isCodexAcpProviderQuotaSummary,
+} from "./parse.js";
 import { copyBackCodexAuth } from "./codex-auth-copyback.js";
 import { buildCodexAuthInboundProvision } from "./codex-auth-merge-scripts.js";
 import {
@@ -293,7 +297,7 @@ function withCodexAcpDefaults(options: CodexAcpExecutorOptions): AcpxEngineExecu
   };
 }
 
-function withCodexAuthRefreshFailureClassification(result: AdapterExecutionResult): AdapterExecutionResult {
+function withCodexFailureClassification(result: AdapterExecutionResult): AdapterExecutionResult {
   if ((result.exitCode ?? 0) === 0) return result;
   const resultJson = parseObject(result.resultJson);
   const stopReason = asString(resultJson.stopReason, "");
@@ -303,15 +307,39 @@ function withCodexAuthRefreshFailureClassification(result: AdapterExecutionResul
       .filter(Boolean)
       .join("\n"),
   });
-  if (!authFailure) return result;
+  if (authFailure) {
+    return {
+      ...result,
+      errorCode: authFailure,
+      errorFamily: authFailure,
+      resultJson: {
+        ...(result.resultJson ?? {}),
+        errorFamily: authFailure,
+      },
+    };
+  }
+
+  if (result.errorCode !== "acpx_turn_failed" || !isCodexAcpProviderQuotaSummary(result.summary ?? "")) {
+    return result;
+  }
+
+  const retryNotBefore = extractCodexRetryNotBefore({ errorMessage: result.summary ?? "" });
 
   return {
     ...result,
-    errorCode: authFailure,
-    errorFamily: authFailure,
+    errorCode: "provider_quota",
+    errorFamily: "provider_quota",
+    retryNotBefore: retryNotBefore?.toISOString() ?? null,
     resultJson: {
       ...(result.resultJson ?? {}),
-      errorFamily: authFailure,
+      errorFamily: "provider_quota",
+      ...(retryNotBefore
+        ? {
+            retryNotBefore: retryNotBefore.toISOString(),
+            transientRetryNotBefore: retryNotBefore.toISOString(),
+            providerQuotaRetryNotBefore: retryNotBefore.toISOString(),
+          }
+        : {}),
     },
   };
 }
@@ -363,7 +391,7 @@ export function createCodexAcpExecutor(options: CodexAcpExecutorOptions = {}): C
       ...ctx,
       config: buildCodexAcpConfig(ctx.config),
     });
-    return withCodexAuthRefreshFailureClassification(result);
+    return withCodexFailureClassification(result);
   };
 }
 

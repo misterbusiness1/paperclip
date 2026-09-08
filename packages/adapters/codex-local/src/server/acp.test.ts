@@ -54,7 +54,9 @@ type FakeRuntimeHandle = {
   backendSessionId: string;
   agentSessionId: string;
 };
-type FakeRuntimeTurnResult = { status: "completed" | "failed" | "cancelled"; stopReason?: string };
+type FakeRuntimeTurnResult =
+  | { status: "completed" | "cancelled"; stopReason?: string }
+  | { status: "failed"; error?: { message: string }; stopReason?: string };
 type FakeRuntimeTurn = {
   requestId: string;
   events: AsyncIterable<FakeRuntimeEvent>;
@@ -1144,6 +1146,52 @@ describe("codex_local ACP lane", () => {
     expect(result.errorFamily).toBe("refresh_token_invalidated");
     expect(result.resultJson?.errorFamily).toBe("refresh_token_invalidated");
     expect(result.resultJson).not.toHaveProperty("codexCredentialTelemetry");
+  });
+
+  it("classifies a failed ACP turn from its provider-quota summary", async () => {
+    const root = await makeTempRoot("paperclip-codex-acp-provider-quota-");
+    const summary = "You've hit your usage limit for GPT-5.3-Codex-Spark. Switch to another model now, or try again at 11:31 PM (UTC).";
+    const execute = createCodexAcpExecutor({
+      createRuntime: (options: FakeRuntimeOptions) => new FakeRuntime(
+        options,
+        [{ type: "text_delta", text: summary, stream: "output", tag: "agent_message_chunk" }],
+        { status: "failed", error: { message: "ACP turn failed" } },
+      ) as never,
+    });
+
+    const result = await execute(buildContext(root));
+
+    expect(result.exitCode).toBe(1);
+    expect(result.errorMessage).toBe("ACP turn failed");
+    expect(result.summary).toBe(summary);
+    expect(result.errorCode).toBe("provider_quota");
+    expect(result.errorFamily).toBe("provider_quota");
+    expect(result.resultJson?.errorFamily).toBe("provider_quota");
+    expect(result.retryNotBefore).toMatch(/T23:31:00\.000Z$/);
+    expect(result.resultJson?.providerQuotaRetryNotBefore).toBe(result.retryNotBefore);
+  });
+
+  it.each([
+    ["successful turn", "completed", "You've hit your usage limit for GPT-5.3-Codex-Spark. Switch to another model now, or try again at 11:31 PM."],
+    ["quoted quota text", "failed", "The provider said: \"You've hit your usage limit for GPT-5.3-Codex-Spark. Switch to another model now, or try again at 11:31 PM.\""],
+    ["capacity error", "failed", "The requested model is at capacity. Please try again later."],
+    ["ordinary failure", "failed", "The adapter stopped unexpectedly."],
+  ] as const)("does not classify %s as ACP provider quota", async (_label, status, summary) => {
+    const root = await makeTempRoot("paperclip-codex-acp-provider-quota-negative-");
+    const terminal: FakeRuntimeTurnResult = status === "completed"
+      ? { status: "completed", stopReason: "end_turn" }
+      : { status: "failed", error: { message: "ACP turn failed" } };
+    const execute = createCodexAcpExecutor({
+      createRuntime: (options: FakeRuntimeOptions) => new FakeRuntime(
+        options,
+        [{ type: "text_delta", text: summary, stream: "output", tag: "agent_message_chunk" }],
+        terminal,
+      ) as never,
+    });
+
+    const result = await execute(buildContext(root));
+    expect(result.errorCode).not.toBe("provider_quota");
+    expect(result.errorFamily).not.toBe("provider_quota");
   });
 
   it("resumes compatible ACP sessions on later Codex ACP runs", async () => {
