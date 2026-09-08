@@ -9831,7 +9831,10 @@ export function issueRoutes(
         await destroyReusableSandboxLeasesForTerminalIssue(issue);
       }
       if (becameTerminal && issue.parentId) {
-        const parent = await svc.getWakeableParentAfterChildCompletion(issue.parentId);
+        const suppressReviewChildWake = await svc.shouldSuppressReviewChildCompletionWake(issue.parentId, issue.id);
+        const parent = suppressReviewChildWake
+          ? null
+          : await svc.getWakeableParentAfterChildCompletion(issue.parentId);
         if (parent) {
           addWakeup(parent.assigneeAgentId, {
             source: "automation",
@@ -11606,7 +11609,13 @@ export function issueRoutes(
         await destroyReusableSandboxLeasesForTerminalIssue(currentIssue);
       }
       if (becameTerminal && currentIssue.parentId) {
-        const parent = await svc.getWakeableParentAfterChildCompletion(currentIssue.parentId);
+        const suppressReviewChildWake = await svc.shouldSuppressReviewChildCompletionWake(
+          currentIssue.parentId,
+          currentIssue.id,
+        );
+        const parent = suppressReviewChildWake
+          ? null
+          : await svc.getWakeableParentAfterChildCompletion(currentIssue.parentId);
         if (parent) {
           addWakeup(parent.assigneeAgentId, {
             source: "automation",

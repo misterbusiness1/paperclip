@@ -42,6 +42,7 @@ import {
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_MESSAGE,
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_REMEDIATION,
 } from "../services/execution-workspace-policy.ts";
+import { parseIssueExecutionState } from "../services/issue-execution-policy.ts";
 import { buildAgentMentionHref, buildProjectMentionHref, MAX_ISSUE_REQUEST_DEPTH, type IssueWorkMode } from "@paperclipai/shared";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -6611,6 +6612,148 @@ describeEmbeddedPostgres("issueService.assertCheckoutOwner stale checkout adopti
     });
   });
 
+});
+
+describeEmbeddedPostgres("review-child completion monitor wake guard", () => {
+  let db!: ReturnType<typeof createDb>;
+  let svc!: ReturnType<typeof issueService>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+  let companyId!: string;
+  let agentId!: string;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-review-child-monitor-");
+    db = createDb(tempDb.connectionString);
+    svc = issueService(db);
+    companyId = randomUUID();
+    agentId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Monitor owner",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+  }, 20_000);
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  async function seedGuardState(overrides: {
+    parentStatus?: string;
+    parentAssigneeUserId?: string | null;
+    monitorAt?: Date | null;
+    policyMonitorAt?: Date | null;
+    monitorWakeRequestedAt?: Date | null;
+    monitorScheduledBy?: "assignee" | "board";
+    monitorStateStatus?: "scheduled" | "triggered" | "cleared";
+    monitorStateAt?: Date | null;
+    childOriginKind?: string;
+    childOriginId?: string | null;
+    childParentId?: string | null;
+    childStatus?: "done" | "cancelled";
+  } = {}) {
+    const monitorAt = overrides.monitorAt === undefined
+      ? new Date(Date.now() + 60 * 60_000)
+      : overrides.monitorAt;
+    const policyMonitorAt = overrides.policyMonitorAt === undefined ? monitorAt : overrides.policyMonitorAt;
+    const scheduledBy = overrides.monitorScheduledBy ?? "assignee";
+    const parent = await svc.create(companyId, {
+      title: "Parent",
+      status: overrides.parentStatus === "blocked" ? "in_progress" : overrides.parentStatus ?? "in_progress",
+      assigneeAgentId: agentId,
+      assigneeUserId: overrides.parentAssigneeUserId ?? null,
+      executionPolicy: policyMonitorAt
+        ? {
+            mode: "normal",
+            commentRequired: true,
+            stages: [],
+            monitor: {
+              nextCheckAt: policyMonitorAt.toISOString(),
+              scheduledBy,
+            },
+          }
+        : null,
+    });
+    const parentId = parent.id;
+    if (
+      monitorAt?.getTime() !== policyMonitorAt?.getTime()
+      || overrides.monitorWakeRequestedAt !== undefined
+      || overrides.monitorStateStatus
+      || overrides.monitorStateAt !== undefined
+      || overrides.parentStatus === "blocked"
+    ) {
+      const state = parseIssueExecutionState(parent.executionState);
+      await db.update(issues).set({
+        monitorNextCheckAt: monitorAt,
+        monitorWakeRequestedAt: overrides.monitorWakeRequestedAt ?? null,
+        ...(overrides.parentStatus === "blocked" ? { status: "blocked" } : {}),
+        executionState: state?.monitor
+          ? {
+              ...state,
+              monitor: {
+                ...state.monitor,
+                status: overrides.monitorStateStatus ?? state.monitor.status,
+                nextCheckAt: overrides.monitorStateAt === undefined
+                  ? state.monitor.nextCheckAt
+                  : overrides.monitorStateAt?.toISOString() ?? state.monitor.nextCheckAt,
+              },
+            }
+          : state,
+      }).where(eq(issues.id, parentId));
+    }
+    const child = await svc.create(companyId, {
+      title: "Review child",
+      status: overrides.childStatus ?? "done",
+      parentId: overrides.childParentId === undefined ? parentId : overrides.childParentId,
+      originKind: overrides.childOriginKind ?? "issue_productivity_review",
+      originId: overrides.childOriginId === undefined ? parentId : overrides.childOriginId,
+    });
+    return { parentId, childId: child.id };
+  }
+
+  it.each([
+    ["future monitor on in_progress", {}, true],
+    ["future monitor on in_review", { parentStatus: "in_review" }, true],
+    ["cancelled review child", { childStatus: "cancelled" }, true],
+    ["board-scheduled monitor", { monitorScheduledBy: "board" }, true],
+    ["due monitor", { monitorAt: new Date(Date.now() - 1_000) }, false],
+    ["past monitor", { monitorAt: new Date(Date.now() - 60_000) }, false],
+    ["null monitor", { monitorAt: null }, false],
+    ["replaced monitor", { policyMonitorAt: new Date(Date.now() + 2 * 60 * 60_000) }, false],
+    ["stale monitor state", { monitorStateAt: new Date(Date.now() + 2 * 60 * 60_000) }, false],
+    ["triggered monitor state", { monitorStateStatus: "triggered" }, false],
+    ["cleared monitor state", { monitorStateStatus: "cleared" }, false],
+    ["claimed monitor", { monitorWakeRequestedAt: new Date() }, false],
+    ["ordinary child", { childOriginKind: "manual" }, false],
+    ["untrusted origin id", { childOriginId: randomUUID() }, false],
+    ["different parent", { childParentId: null }, false],
+    ["blocked parent", { parentStatus: "blocked" }, false],
+  ])("fails open for %s", async (_name, overrides, expected) => {
+    const { parentId, childId } = await seedGuardState(overrides);
+    await expect(svc.shouldSuppressReviewChildCompletionWake(parentId, childId)).resolves.toBe(expected);
+  });
+
+  it("does not mutate parent or child state while deciding suppression", async () => {
+    const { parentId, childId } = await seedGuardState();
+    const before = await db.select().from(issues).where(eq(issues.id, parentId)).then((rows) => rows[0]);
+
+    await expect(svc.shouldSuppressReviewChildCompletionWake(parentId, childId)).resolves.toBe(true);
+
+    const after = await db.select().from(issues).where(eq(issues.id, parentId)).then((rows) => rows[0]);
+    expect(after).toEqual(before);
+  });
 });
 
 describeEmbeddedPostgres("issueService.addComment createdByRunId", () => {

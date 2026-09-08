@@ -1,6 +1,7 @@
 import { Buffer } from "node:buffer";
 import { createHash, randomUUID } from "node:crypto";
 import { and, asc, desc, eq, gt, gte, inArray, isNull, like, lt, ne, notInArray, or, sql, type SQL } from "drizzle-orm";
+import { alias } from "drizzle-orm/pg-core";
 import type { Db } from "@paperclipai/db";
 import {
   activityLog,
@@ -86,7 +87,11 @@ import {
   type ParsedExecutionWorkspaceMode,
 } from "./execution-workspace-policy.js";
 import { mergeExecutionWorkspaceConfig } from "./execution-workspaces.js";
-import { buildInitialIssueMonitorFields, normalizeIssueExecutionPolicy } from "./issue-execution-policy.js";
+import {
+  buildInitialIssueMonitorFields,
+  normalizeIssueExecutionPolicy,
+  parseIssueExecutionState,
+} from "./issue-execution-policy.js";
 import { instanceSettingsService } from "./instance-settings.js";
 import { redactCurrentUserText } from "../log-redaction.js";
 import { redactSensitiveText } from "../redaction.js";
@@ -6517,6 +6522,61 @@ export function issueService(db: Db) {
         childIssueSummaries,
         childIssueSummaryTruncated: children.length > childIssueSummaries.length,
       };
+    },
+
+    shouldSuppressReviewChildCompletionWake: async (parentIssueId: string, completedChildIssueId: string) => {
+      const completedChild = alias(issues, "completed_review_child");
+      const rows = await db
+        .select({
+          parentId: issues.id,
+          parentStatus: issues.status,
+          parentAssigneeAgentId: issues.assigneeAgentId,
+          parentAssigneeUserId: issues.assigneeUserId,
+          parentExecutionPolicy: issues.executionPolicy,
+          parentExecutionState: issues.executionState,
+          parentMonitorNextCheckAt: issues.monitorNextCheckAt,
+          parentMonitorWakeRequestedAt: issues.monitorWakeRequestedAt,
+          parentMonitorScheduledBy: issues.monitorScheduledBy,
+          databaseNow: sql<Date>`current_timestamp`,
+          childParentId: completedChild.parentId,
+          childOriginKind: completedChild.originKind,
+          childOriginId: completedChild.originId,
+        })
+        .from(issues)
+        .innerJoin(completedChild, eq(completedChild.id, completedChildIssueId))
+        .where(eq(issues.id, parentIssueId))
+        .then((result) => result[0] ?? null);
+
+      if (
+        !rows ||
+        !rows.parentAssigneeAgentId ||
+        rows.parentAssigneeUserId ||
+        (rows.parentStatus !== "in_progress" && rows.parentStatus !== "in_review") ||
+        rows.childParentId !== rows.parentId ||
+        rows.childOriginKind !== PRODUCTIVITY_REVIEW_ORIGIN_KIND ||
+        rows.childOriginId !== rows.parentId ||
+        !rows.parentMonitorNextCheckAt ||
+        rows.parentMonitorWakeRequestedAt !== null ||
+        rows.parentMonitorNextCheckAt.getTime() <= (
+          rows.databaseNow instanceof Date ? rows.databaseNow.getTime() : Date.parse(String(rows.databaseNow))
+        )
+      ) {
+        return false;
+      }
+
+      try {
+        const monitor = normalizeIssueExecutionPolicy(rows.parentExecutionPolicy)?.monitor;
+        const monitorState = parseIssueExecutionState(rows.parentExecutionState)?.monitor;
+        if (!monitor || !monitorState || monitorState.status !== "scheduled") return false;
+        const persistedNextCheckAt = rows.parentMonitorNextCheckAt.toISOString();
+        return monitor.nextCheckAt === persistedNextCheckAt
+          && monitorState.nextCheckAt === persistedNextCheckAt
+          && monitor.scheduledBy === rows.parentMonitorScheduledBy
+          && monitorState.scheduledBy === rows.parentMonitorScheduledBy;
+      } catch {
+        // Ambiguous or invalid persisted policy state must fail open.
+        return false;
+      }
     },
 
     createChild: async (

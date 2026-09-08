@@ -242,8 +242,10 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     const tickAt = new Date("2026-04-11T12:31:00.000Z");
 
     const result = await heartbeat.tickTimers(tickAt);
+    const duplicateResult = await heartbeat.tickTimers(new Date(tickAt.getTime() + 1_000));
 
     expect(result.enqueued).toBe(1);
+    expect(duplicateResult.enqueued).toBe(0);
 
     const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
     expect(issue.monitorNextCheckAt).toBeNull();
@@ -260,15 +262,16 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       .select()
       .from(agentWakeupRequests)
       .where(eq(agentWakeupRequests.agentId, agentId))
-      .then((rows) => rows[0] ?? null);
-    expect(wakeup?.reason).toBe("issue_monitor_due");
+      .then((rows) => rows);
+    expect(wakeup).toHaveLength(1);
+    expect(wakeup[0]?.reason).toBe("issue_monitor_due");
 
     const activity = await db
       .select()
       .from(activityLog)
       .where(eq(activityLog.entityId, issueId))
       .then((rows) => rows.map((row) => row.action));
-    expect(activity).toContain("issue.monitor_triggered");
+    expect(activity.filter((action) => action === "issue.monitor_triggered")).toHaveLength(1);
   });
 
   it("wakes a cross-agent review participant for provider quota monitors", async () => {
