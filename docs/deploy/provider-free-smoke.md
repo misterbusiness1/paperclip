@@ -11,10 +11,12 @@ env -u DATABASE_URL -u DATABASE_MIGRATION_URL \
 ```
 
 The launcher fails before process startup when it inherits `DATABASE_URL` or
-`DATABASE_MIGRATION_URL`, when the run root is not absolute, or when the root
-contains prior Paperclip state. It binds to loopback, supplies fresh run-owned
-home/config/context paths, disables database backups, and selects the embedded
-PostgreSQL path.
+`DATABASE_MIGRATION_URL`, when the launch directory's `.env` declares either
+binding, when the run root is not absolute, or when the root is non-empty. It
+also disables launch-cwd dotenv loading to prevent a post-preflight file change
+from rehydrating an external database binding. It binds to loopback, supplies
+fresh run-owned home/config/context paths, disables database backups, and
+selects the embedded PostgreSQL path.
 
 Before accepting smoke evidence, verify the server banner says
 `embedded-postgres`, its database and config paths are under the supplied run
