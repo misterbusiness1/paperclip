@@ -983,6 +983,22 @@ export function builtInAgentService(db: Db) {
           },
         });
       }
+      const latestAgent = await agentSvc.getById(agent.id) as Agent | null;
+      if (!latestAgent) throw notFound("Built-in agent not found");
+      const recoveredBinding = await instructionsSvc.resolvePersistedBundleBinding(latestAgent);
+      if (recoveredBinding?.instructionsBundleMode === "managed") {
+        const currentConfig = isPlainRecord(latestAgent.adapterConfig) ? latestAgent.adapterConfig : {};
+        const nextConfig = { ...currentConfig, ...recoveredBinding };
+        if (stableJson(currentConfig) !== stableJson(nextConfig)) {
+          const updated = await agentSvc.update(agent.id, {
+            adapterConfig: nextConfig,
+          }, {
+            allowBuiltInAgentMetadata: true,
+            recordRevision: { source: "built-in-bundle:reconcile:instructions-binding" },
+          });
+          if (!updated) throw notFound("Built-in agent not found");
+        }
+      }
       return currentState;
     }
 
@@ -1620,7 +1636,19 @@ export function builtInAgentService(db: Db) {
         const adapterType = resolvedInput.adapterType ?? existing.adapterType;
         assertAdapterAllowed(definition, adapterType);
         patch.adapterType = adapterType;
-        patch.adapterConfig = resolvedInput.adapterConfig ?? existing.adapterConfig;
+        const resolvedAdapterConfig = resolvedInput.adapterConfig ?? existing.adapterConfig;
+        const recoveredBinding = adapterType === existing.adapterType
+          ? await instructionsSvc.resolvePersistedBundleBinding(existing as Agent)
+          : null;
+        if (recoveredBinding && isPlainRecord(resolvedAdapterConfig)) {
+          const currentConfig = isPlainRecord(existing.adapterConfig) ? existing.adapterConfig : {};
+          const managedSkillSync = currentConfig.paperclipSkillSync === undefined
+            ? {}
+            : { paperclipSkillSync: currentConfig.paperclipSkillSync };
+          patch.adapterConfig = { ...resolvedAdapterConfig, ...managedSkillSync, ...recoveredBinding };
+        } else {
+          patch.adapterConfig = resolvedAdapterConfig;
+        }
       }
       if (!existingPendingApproval && resolvedInput.budgetMonthlyCents !== undefined) {
         patch.budgetMonthlyCents = resolvedInput.budgetMonthlyCents;

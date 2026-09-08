@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
@@ -40,6 +40,7 @@ import {
 } from "../services/built-in-agents.ts";
 import { readBuiltInAgentMarker, withBuiltInAgentMarker } from "../services/built-in-agent-metadata.ts";
 import { issueThreadInteractionService } from "../services/issue-thread-interactions.ts";
+import { execute as executeClaude } from "@paperclipai/adapter-claude-local/server";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -819,6 +820,157 @@ describeEmbeddedPostgres("built-in agents", () => {
     expect(resetFile.content).toContain("Reflection Coach");
     expect(resetFile.content).not.toContain("Operator edit.");
   });
+
+  it("persists only recovered managed instruction bindings and prepares the Claude prompt", async () => {
+    const companyId = await seedCompany();
+    const paperclipHome = mkdtempSync(path.join(tmpdir(), "paperclip-reflection-bindings-"));
+    const commandPath = path.join(paperclipHome, "claude-fake");
+    const capturePath = path.join(paperclipHome, "capture.json");
+    const externalRoot = path.join(paperclipHome, "external");
+    const previousPaperclipHome = process.env.PAPERCLIP_HOME;
+    const previousInstanceId = process.env.PAPERCLIP_INSTANCE_ID;
+    process.env.PAPERCLIP_HOME = paperclipHome;
+    process.env.PAPERCLIP_INSTANCE_ID = "binding-regression";
+
+    try {
+      await agentService(db).create(companyId, {
+        name: "Configured peer",
+        role: "engineer",
+        status: "idle",
+        adapterType: "claude_local",
+        adapterConfig: { model: "claude-sonnet-4-6" },
+        runtimeConfig: {},
+        permissions: {},
+      });
+
+      const builtIns = builtInAgentService(db);
+      const first = await builtIns.ensure(companyId, "reflection-coach");
+      const initialConfig = first.agent!.adapterConfig as Record<string, unknown>;
+      const binding = {
+        instructionsBundleMode: "managed",
+        instructionsRootPath: initialConfig.instructionsRootPath,
+        instructionsEntryFile: "AGENTS.md",
+        instructionsFilePath: initialConfig.instructionsFilePath,
+      };
+      expect(initialConfig).toMatchObject(binding);
+      const instructionPath = binding.instructionsFilePath as string;
+      const initialContent = readFileSync(instructionPath, "utf8");
+      const initialMtime = statSync(instructionPath).mtimeMs;
+      const initialStatus = first.agent!.status;
+      const initialPermissions = first.agent!.permissions;
+      const initialRuntimeConfig = first.agent!.runtimeConfig;
+      const initialGrants = await permissionKeysForAgent(first.agentId!);
+      const [initialRoutine] = await db.select().from(routines).where(eq(routines.assigneeAgentId, first.agentId!));
+      const [initialTrigger] = await db.select().from(routineTriggers).where(eq(routineTriggers.routineId, initialRoutine!.id));
+
+      await db.update(agents).set({
+        adapterConfig: { paperclipSkillSync: initialConfig.paperclipSkillSync },
+      }).where(eq(agents.id, first.agentId!));
+      const healed = await builtIns.ensure(companyId, "reflection-coach");
+      expect(healed.agent!.adapterConfig).toEqual(initialConfig);
+      expect(readFileSync(instructionPath, "utf8")).toBe(initialContent);
+      expect(statSync(instructionPath).mtimeMs).toBe(initialMtime);
+
+      await db.update(agents).set({
+        adapterConfig: {
+          paperclipSkillSync: initialConfig.paperclipSkillSync,
+          instructionsBundleMode: "managed",
+          instructionsRootPath: path.join(paperclipHome, "stale"),
+          instructionsEntryFile: "missing.md",
+          instructionsFilePath: path.join(paperclipHome, "stale", "missing.md"),
+        },
+      }).where(eq(agents.id, first.agentId!));
+      const staleHealed = await builtIns.ensure(companyId, "reflection-coach");
+      expect(staleHealed.agent!.adapterConfig).toEqual(initialConfig);
+
+      mkdirSync(externalRoot, { recursive: true });
+      const externalPath = path.join(externalRoot, "AGENTS.md");
+      writeFileSync(externalPath, initialContent, "utf8");
+      const externalBinding = {
+        instructionsBundleMode: "external",
+        instructionsRootPath: externalRoot,
+        instructionsEntryFile: "AGENTS.md",
+        instructionsFilePath: externalPath,
+      };
+      await db.update(agents).set({
+        adapterConfig: { paperclipSkillSync: initialConfig.paperclipSkillSync, ...externalBinding },
+      }).where(eq(agents.id, first.agentId!));
+      const external = await builtIns.ensure(companyId, "reflection-coach");
+      expect(external.agent!.adapterConfig).toMatchObject(externalBinding);
+
+      await db.update(agents).set({ adapterConfig: initialConfig }).where(eq(agents.id, first.agentId!));
+      const revisionCountBefore = await db.select().from(agentConfigRevisions)
+        .where(eq(agentConfigRevisions.agentId, first.agentId!));
+      const repeated = await builtIns.ensure(companyId, "reflection-coach");
+      const repeatedAgain = await builtIns.ensure(companyId, "reflection-coach");
+      const revisionCountAfter = await db.select().from(agentConfigRevisions)
+        .where(eq(agentConfigRevisions.agentId, first.agentId!));
+      expect(repeated.agent!.adapterConfig).toEqual(initialConfig);
+      expect(repeatedAgain.agent!.adapterConfig).toEqual(initialConfig);
+      expect(revisionCountAfter).toHaveLength(revisionCountBefore.length);
+      expect(repeatedAgain.agent).toMatchObject({
+        status: initialStatus,
+        permissions: initialPermissions,
+        runtimeConfig: initialRuntimeConfig,
+      });
+      expect(await permissionKeysForAgent(first.agentId!)).toEqual(initialGrants);
+      const [routine] = await db.select().from(routines).where(eq(routines.id, initialRoutine!.id));
+      const [trigger] = await db.select().from(routineTriggers).where(eq(routineTriggers.id, initialTrigger!.id));
+      expect(routine).toMatchObject({ status: "paused" });
+      expect(trigger).toMatchObject({ enabled: false });
+
+      writeFileSync(commandPath, `#!/usr/bin/env node
+const fs = require("node:fs");
+const argv = process.argv.slice(2);
+const index = argv.indexOf("--append-system-prompt-file");
+const instructionsFilePath = index >= 0 ? argv[index + 1] : null;
+fs.writeFileSync(process.env.PAPERCLIP_TEST_CAPTURE_PATH, JSON.stringify({
+  instructionsFilePath,
+  instructionsContents: instructionsFilePath ? fs.readFileSync(instructionsFilePath, "utf8") : null
+}));
+console.log(JSON.stringify({type:"system",subtype:"init",session_id:"11111111-1111-4111-8111-111111111111",model:"synthetic"}));
+console.log(JSON.stringify({type:"result",session_id:"11111111-1111-4111-8111-111111111111",result:"ok",usage:{input_tokens:1,output_tokens:1}}));
+`, "utf8");
+      chmodSync(commandPath, 0o755);
+      const result = await executeClaude({
+        runId: "binding-regression-run",
+        agent: repeatedAgain.agent!,
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+        config: {
+          ...(repeatedAgain.agent!.adapterConfig as Record<string, unknown>),
+          engine: "cli",
+          command: commandPath,
+          env: { PAPERCLIP_TEST_CAPTURE_PATH: capturePath },
+        },
+        context: {},
+        onLog: async () => {},
+      });
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(readFileSync(capturePath, "utf8"))).toMatchObject({
+        instructionsFilePath: expect.any(String),
+        instructionsContents: expect.stringContaining("Reflection Coach"),
+      });
+
+      const configured = await agentService(db).update(first.agentId!, {
+        adapterConfig: {
+          ...initialConfig,
+          model: "claude-sonnet-4-6",
+          env: { SAFE: "value" },
+          credentials: { profile: "managed" },
+          arbitrary: { keep: true },
+        },
+      });
+      const configuredConfig = configured!.adapterConfig;
+      const configuredAgain = await builtIns.ensure(companyId, "reflection-coach");
+      expect(configuredAgain.agent!.adapterConfig).toEqual(configuredConfig);
+    } finally {
+      if (previousPaperclipHome === undefined) delete process.env.PAPERCLIP_HOME;
+      else process.env.PAPERCLIP_HOME = previousPaperclipHome;
+      if (previousInstanceId === undefined) delete process.env.PAPERCLIP_INSTANCE_ID;
+      else process.env.PAPERCLIP_INSTANCE_ID = previousInstanceId;
+      rmSync(paperclipHome, { recursive: true, force: true });
+    }
+  }, 30_000);
 
   it("blocks deleting a built-in agent", async () => {
     const companyId = await seedCompany();
