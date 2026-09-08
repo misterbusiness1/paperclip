@@ -44,7 +44,13 @@ function createLocalSandboxRunner() {
 }
 
 type FakeRuntimeOptions = Record<string, unknown>;
-type FakeRuntimeEvent = { type: string; text?: string; stream?: string; tag?: string };
+type FakeRuntimeEvent = {
+  type: string;
+  text?: string;
+  stream?: string;
+  tag?: string;
+  [key: string]: unknown;
+};
 type FakeRuntimeHandle = {
   sessionKey: string;
   backend: string;
@@ -1218,6 +1224,113 @@ describe("codex_local ACP lane", () => {
       expect(result.resultJson).not.toHaveProperty("transientRetryNotBefore");
     },
   );
+
+  it("classifies an exact failed whole-summary notice split across ACP chunks", async () => {
+    const root = await makeTempRoot("paperclip-codex-acp-credits-quota-split-");
+    const chunks = [
+      "You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage ",
+      "to purchase more credits or try again at Sep 8th, 2026 2:00 PM.",
+    ];
+    const execute = createCodexAcpExecutor({
+      createRuntime: (options: FakeRuntimeOptions) => new FakeRuntime(
+        options,
+        chunks.map((text) => ({
+          type: "text_delta",
+          text,
+          stream: "output",
+          tag: "agent_message_chunk",
+        })),
+        { status: "failed", error: { message: "Prompt failed" } },
+      ) as never,
+    });
+
+    const result = await execute(buildContext(root));
+    expect(result.errorCode).toBe("provider_quota");
+    expect(result.errorFamily).toBe("provider_quota");
+    expect(result.resultJson?.errorFamily).toBe("provider_quota");
+  });
+
+  it.each([
+    [
+      "long mixed output",
+      [
+        ...Array.from({ length: 92 }, (_, index) => ({
+          type: "text_delta",
+          text: `assistant text ${index}\n`,
+          stream: "output",
+          tag: "agent_message_chunk",
+        })),
+        {
+          type: "text_delta",
+          text: "You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Sep 8th, 2026 2:00 PM.",
+          stream: "output",
+          tag: "agent_message_chunk",
+        },
+      ],
+    ],
+    [
+      "quoted earlier and final assistant notices",
+      [
+        {
+          type: "text_delta",
+          text: "Earlier notice: You've hit your usage limit.\n",
+          stream: "output",
+          tag: "agent_message_chunk",
+        },
+        {
+          type: "text_delta",
+          text: "You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Sep 8th, 2026 2:00 PM.",
+          stream: "output",
+          tag: "agent_message_chunk",
+        },
+      ],
+    ],
+    [
+      "caller-injected provenance",
+      [
+        {
+          type: "text_delta",
+          text: "assistant preface\nYou've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Sep 8th, 2026 2:00 PM.",
+          stream: "output",
+          tag: "agent_message_chunk",
+          trustedOrigin: "adapter-utils",
+          terminalProviderDiagnostic: true,
+          resultJson: { errorFamily: "provider_quota" },
+        },
+      ],
+    ],
+    [
+      "thought plus exact output",
+      [
+        {
+          type: "text_delta",
+          text: "internal assistant thought",
+          stream: "thought",
+          tag: "agent_thought_chunk",
+        },
+        {
+          type: "text_delta",
+          text: "You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Sep 8th, 2026 2:00 PM.",
+          stream: "output",
+          tag: "agent_message_chunk",
+        },
+      ],
+    ],
+  ] as const)("keeps %s generic without upstream diagnostic provenance", async (_label, events) => {
+    const root = await makeTempRoot("paperclip-codex-acp-credits-quota-untrusted-");
+    const execute = createCodexAcpExecutor({
+      createRuntime: (options: FakeRuntimeOptions) => new FakeRuntime(
+        options,
+        [...events],
+        { status: "failed", error: { message: "Prompt failed" } },
+      ) as never,
+    });
+
+    const result = await execute(buildContext(root));
+    expect(result.errorCode).toBe("acpx_turn_failed");
+    expect(result.errorFamily).not.toBe("provider_quota");
+    expect(result.resultJson).not.toHaveProperty("errorFamily", "provider_quota");
+  });
 
   it.each([
     ["auth precedence", "failed", "", "OAuth failed: refresh_token_invalidated", "refresh_token_invalidated"],
