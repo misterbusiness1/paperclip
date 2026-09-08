@@ -14,6 +14,7 @@ const mockIssueService = vi.hoisted(() => ({
   getRelationSummaries: vi.fn(),
   listWakeableBlockedDependents: vi.fn(),
   getWakeableParentAfterChildCompletion: vi.fn(),
+  shouldSuppressReviewChildCompletionWake: vi.fn(),
   getCurrentScheduledRetry: vi.fn(),
   listReviewAttention: vi.fn(),
 }));
@@ -230,6 +231,7 @@ describe("issue update comment wakeups", () => {
     mockIssueService.getRelationSummaries.mockResolvedValue({ blockedBy: [], blocks: [] });
     mockIssueService.listWakeableBlockedDependents.mockResolvedValue([]);
     mockIssueService.getWakeableParentAfterChildCompletion.mockResolvedValue(null);
+    mockIssueService.shouldSuppressReviewChildCompletionWake.mockResolvedValue(false);
     mockIssueService.getCurrentScheduledRetry.mockResolvedValue(null);
     mockIssueService.listReviewAttention.mockResolvedValue(new Map());
   });
@@ -631,6 +633,25 @@ describe("issue update comment wakeups", () => {
     ));
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });
+
+  it("suppresses the update-route child completion wake when the persisted guard matches", async () => {
+    const parentId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    const existing = makeIssue({ parentId, status: "in_progress" });
+    const updated = makeIssue({ parentId, status: "done" });
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.update.mockResolvedValue(updated);
+    mockIssueService.shouldSuppressReviewChildCompletionWake.mockResolvedValue(true);
+
+    const res = await request(await createApp())
+      .patch(`/api/issues/${existing.id}`)
+      .send({ status: "done", comment: "review complete" });
+
+    expect(res.status).toBe(200);
+    await vi.waitFor(() => expect(mockIssueService.shouldSuppressReviewChildCompletionWake)
+      .toHaveBeenCalledWith(parentId, updated.id));
+    expect(mockIssueService.getWakeableParentAfterChildCompletion).not.toHaveBeenCalled();
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+  }, 10_000);
 
   it("routes a structured mentioned agent without making that agent the issue owner", async () => {
     const existing = makeIssue({

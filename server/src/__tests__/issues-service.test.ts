@@ -6613,6 +6613,109 @@ describeEmbeddedPostgres("issueService.assertCheckoutOwner stale checkout adopti
 
 });
 
+describeEmbeddedPostgres("review-child completion monitor wake guard", () => {
+  let db!: ReturnType<typeof createDb>;
+  let svc!: ReturnType<typeof issueService>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+  let companyId!: string;
+  let agentId!: string;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-review-child-monitor-");
+    db = createDb(tempDb.connectionString);
+    svc = issueService(db);
+    companyId = randomUUID();
+    agentId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Monitor owner",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+  }, 20_000);
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  async function seedGuardState(overrides: {
+    parentStatus?: string;
+    parentAssigneeUserId?: string | null;
+    monitorAt?: Date | null;
+    policyMonitorAt?: Date | null;
+    monitorWakeRequestedAt?: Date | null;
+    childOriginKind?: string;
+    childOriginId?: string | null;
+    childParentId?: string | null;
+  } = {}) {
+    const parentId = randomUUID();
+    const childId = randomUUID();
+    const monitorAt = overrides.monitorAt === undefined
+      ? new Date(Date.now() + 60 * 60_000)
+      : overrides.monitorAt;
+    const policyMonitorAt = overrides.policyMonitorAt === undefined ? monitorAt : overrides.policyMonitorAt;
+    await db.insert(issues).values({
+      id: parentId,
+      companyId,
+      title: "Parent",
+      status: overrides.parentStatus ?? "in_progress",
+      assigneeAgentId: agentId,
+      assigneeUserId: overrides.parentAssigneeUserId ?? null,
+      monitorNextCheckAt: monitorAt,
+      monitorWakeRequestedAt: overrides.monitorWakeRequestedAt ?? null,
+      monitorScheduledBy: "assignee",
+      executionPolicy: policyMonitorAt
+        ? {
+            mode: "normal",
+            commentRequired: true,
+            stages: [],
+            monitor: {
+              nextCheckAt: policyMonitorAt.toISOString(),
+              scheduledBy: "assignee",
+            },
+          }
+        : null,
+    });
+    await db.insert(issues).values({
+      id: childId,
+      companyId,
+      title: "Review child",
+      status: "done",
+      parentId: overrides.childParentId === undefined ? parentId : overrides.childParentId,
+      originKind: overrides.childOriginKind ?? "issue_productivity_review",
+      originId: overrides.childOriginId === undefined ? parentId : overrides.childOriginId,
+    });
+    return { parentId, childId };
+  }
+
+  it.each([
+    ["future monitor on in_progress", {}, true],
+    ["future monitor on in_review", { parentStatus: "in_review" }, true],
+    ["due monitor", { monitorAt: new Date(Date.now() - 1_000) }, false],
+    ["null monitor", { monitorAt: null }, false],
+    ["replaced monitor", { policyMonitorAt: new Date(Date.now() + 2 * 60 * 60_000) }, false],
+    ["claimed monitor", { monitorWakeRequestedAt: new Date() }, false],
+    ["ordinary child", { childOriginKind: "manual" }, false],
+    ["untrusted origin id", { childOriginId: randomUUID() }, false],
+    ["different parent", { childParentId: null }, false],
+    ["blocked parent", { parentStatus: "blocked" }, false],
+  ])("fails open for %s", async (_name, overrides, expected) => {
+    const { parentId, childId } = await seedGuardState(overrides);
+    await expect(svc.shouldSuppressReviewChildCompletionWake(parentId, childId)).resolves.toBe(expected);
+  });
+});
+
 describeEmbeddedPostgres("issueService.addComment createdByRunId", () => {
   let db!: ReturnType<typeof createDb>;
   let svc!: ReturnType<typeof issueService>;
