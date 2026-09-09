@@ -1901,6 +1901,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         && resolvedWorkspacePath != null
         && resolvedPrimaryWorkspacePath != null
         && resolvedWorkspacePath === resolvedPrimaryWorkspacePath;
+      const preserveWorkspaceContents = isSharedWorkspace || isProjectPrimaryWorkspace;
 
       const linkedIssueSummaries = linkedIssues.map((issue) => ({
         ...issue,
@@ -1987,7 +1988,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         });
       }
 
-      const configuredCleanupCommands = [
+      const configuredCleanupCommands = preserveWorkspaceContents ? [] : [
         {
           kind: "cleanup_command" as const,
           label: "Run workspace cleanup command",
@@ -2006,7 +2007,9 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         plannedActions.push(action);
       }
 
-      const teardownCommand = config?.teardownCommand ?? projectPolicy?.workspaceStrategy?.teardownCommand ?? null;
+      const teardownCommand = preserveWorkspaceContents
+        ? null
+        : config?.teardownCommand ?? projectPolicy?.workspaceStrategy?.teardownCommand ?? null;
       if (teardownCommand) {
         plannedActions.push({
           kind: "teardown_command",
@@ -2016,7 +2019,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         });
       }
 
-      if (executionWorkspace.providerType === "git_worktree" && workspacePath) {
+      if (!preserveWorkspaceContents && executionWorkspace.providerType === "git_worktree" && workspacePath) {
         plannedActions.push({
           kind: "git_worktree_remove",
           label: "Remove git worktree",
@@ -2025,7 +2028,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         });
       }
 
-      if (git?.createdByRuntime && executionWorkspace.branchName) {
+      if (!preserveWorkspaceContents && git?.createdByRuntime && executionWorkspace.branchName) {
         plannedActions.push({
           kind: "git_branch_delete",
           label: "Delete runtime-created branch",
@@ -2034,7 +2037,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         });
       }
 
-      if (executionWorkspace.providerType === "local_fs" && git?.createdByRuntime && workspacePath) {
+      if (!preserveWorkspaceContents && executionWorkspace.providerType === "local_fs" && git?.createdByRuntime && workspacePath) {
         const resolvedWorkspacePath = path.resolve(workspacePath);
         const resolvedProjectWorkspacePath = projectWorkspace?.cwd ? path.resolve(projectWorkspace.cwd) : null;
         const containsProjectWorkspace = resolvedProjectWorkspacePath

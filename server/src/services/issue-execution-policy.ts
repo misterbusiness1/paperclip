@@ -325,12 +325,14 @@ function nextAssigneeIds(input: {
 export function stripMonitorFromExecutionPolicy(policy: IssueExecutionPolicy | null): IssueExecutionPolicy | null {
   if (!policy) return null;
   if (!policy.monitor) return policy;
-  if (policy.stages.length === 0) return null;
-  return {
-    mode: policy.mode,
-    commentRequired: policy.commentRequired,
-    stages: policy.stages,
-  };
+  const { monitor: _monitor, ...remainingPolicy } = policy;
+  if (
+    remainingPolicy.stages.length === 0
+    && !remainingPolicy.reviewPreset
+    && !remainingPolicy.authorizationPolicy
+    && remainingPolicy.maxReviewRounds == null
+  ) return null;
+  return remainingPolicy;
 }
 
 export function setIssueExecutionPolicyMonitorScheduledBy(
@@ -400,8 +402,9 @@ export function normalizeIssueExecutionPolicy(input: unknown): IssueExecutionPol
 
   const reviewPreset = parsed.data.reviewPreset;
   const authorizationPolicy = parsed.data.authorizationPolicy;
+  const maxReviewRounds = parsed.data.maxReviewRounds;
 
-  if (stages.length === 0 && !monitor && !reviewPreset && !authorizationPolicy) return null;
+  if (stages.length === 0 && !monitor && !reviewPreset && !authorizationPolicy && maxReviewRounds == null) return null;
 
   return {
     mode: parsed.data.mode ?? "normal",
@@ -410,7 +413,7 @@ export function normalizeIssueExecutionPolicy(input: unknown): IssueExecutionPol
     ...(monitor ? { monitor } : {}),
     ...(reviewPreset ? { reviewPreset } : {}),
     ...(authorizationPolicy ? { authorizationPolicy } : {}),
-    ...(parsed.data.maxReviewRounds != null ? { maxReviewRounds: parsed.data.maxReviewRounds } : {}),
+    ...(maxReviewRounds != null ? { maxReviewRounds } : {}),
   };
 }
 
