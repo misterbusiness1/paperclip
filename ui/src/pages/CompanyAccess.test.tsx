@@ -228,9 +228,9 @@ describe("CompanyAccess", () => {
         element.textContent?.includes("Codex Codercodexcoder@paperclip.localOwneractiveEditRemove"),
     );
 
-    expect(memberHeader?.className).toContain("grid-cols-[minmax(0,1fr)_auto]");
+    expect(memberHeader?.className).toContain("grid-cols-(--gtc-company-access-mobile)");
     expect(memberHeader?.className).toContain("sm:grid-cols-(--gtc-24)");
-    expect(memberRow?.className).toContain("grid-cols-[minmax(0,1fr)_auto]");
+    expect(memberRow?.className).toContain("grid-cols-(--gtc-company-access-mobile)");
     expect(memberRow?.className).toContain("sm:grid-cols-(--gtc-24)");
     expect(container.textContent).not.toContain("Open join request queue");
     expect(container.textContent).not.toContain("Manage invites");
