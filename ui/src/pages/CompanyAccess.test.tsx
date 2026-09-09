@@ -218,6 +218,20 @@ describe("CompanyAccess", () => {
     expect(container.textContent).not.toContain("Assign scoped tasks");
     expect(container.textContent).not.toContain("Agents");
     expect(container.textContent).not.toContain("Pending agent joins");
+
+    const memberHeader = Array.from(container.querySelectorAll("div")).find(
+      (element) => element.textContent === "User accountRoleStatusAction",
+    );
+    const memberRow = Array.from(container.querySelectorAll("div")).find(
+      (element) =>
+        element.classList.contains("grid") &&
+        element.textContent?.includes("Codex Codercodexcoder@paperclip.localOwneractiveEditRemove"),
+    );
+
+    expect(memberHeader?.className).toContain("grid-cols-[minmax(0,1fr)_auto]");
+    expect(memberHeader?.className).toContain("sm:grid-cols-(--gtc-24)");
+    expect(memberRow?.className).toContain("grid-cols-[minmax(0,1fr)_auto]");
+    expect(memberRow?.className).toContain("sm:grid-cols-(--gtc-24)");
     expect(container.textContent).not.toContain("Open join request queue");
     expect(container.textContent).not.toContain("Manage invites");
     expect(container.textContent).not.toContain("Active user accounts");
