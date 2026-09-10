@@ -338,12 +338,15 @@ function isTerminalIssueRun(latestRun: LatestIssueRun) {
   return TERMINAL_HEARTBEAT_RUN_STATUSES.has(latestRun.status);
 }
 
+// provider_quota is deliberately excluded: it is not a transient infra blip,
+// it is a provider-reported reset time. classifyContinuationFailure defers
+// to that reset time (see the "provider_quota" branch below) instead of
+// retrying it 3x on the same short backoff as a dropped connection.
 const TRANSIENT_INFRA_CONTINUATION_ERROR_CODES = new Set<string>([
   "adapter_failed",
   "codex_transient_upstream",
   "codex_harness_crash",
   "claude_transient_upstream",
-  "provider_quota",
   "timeout",
 ]);
 
@@ -367,6 +370,11 @@ const CONTINUATION_RECOVERY_TRANSIENT_MAX_ATTEMPTS = 3;
 const CONTINUATION_RECOVERY_DEFAULT_MAX_ATTEMPTS = 1;
 const CONTINUATION_RECOVERY_TRANSIENT_BASE_BACKOFF_MS = 60_000;
 export const PROVIDER_QUOTA_RECOVERY_DEFAULT_BACKOFF_MS = 60 * 60 * 1000;
+// Hard ceiling shared by every provider_quota recovery/monitor path (issue
+// continuation retries, the issue-level executionPolicy monitor, and the
+// stranded-recovery wait_recovery action). A quota that never clears must
+// still stop retrying instead of rescheduling forever (OXFA-31266).
+export const PROVIDER_QUOTA_RECOVERY_MAX_ATTEMPTS = 6;
 
 const PROVIDER_QUOTA_ERROR_RE =
   /(?:you(?:'|’)ve hit your usage limit|usage limit(?: reached| exceeded)?|provider quota|quota (?:limit )?exceeded|model (?:is )?at capacity)/i;
@@ -378,10 +386,96 @@ export type AdapterFailureRecoveryClassification =
   | { kind: "configuration_incomplete" }
   | null;
 
+const PROVIDER_QUOTA_MONTH_INDEX: Record<string, number> = {
+  jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5,
+  jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11,
+};
+
+// Resolves a wall-clock date/time to a UTC instant in an arbitrary IANA time
+// zone by iteratively correcting for the zone's UTC offset (handles DST).
+function resolveWallClockInTimeZone(
+  year: number,
+  monthIndex: number,
+  day: number,
+  hour: number,
+  minute: number,
+  timeZone: string,
+): Date | null {
+  try {
+    const wallClock = (date: Date) => Object.fromEntries(
+      new Intl.DateTimeFormat("en-US", {
+        timeZone,
+        hourCycle: "h23",
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+      }).formatToParts(date).map((part) => [part.type, part.value]),
+    );
+    const targetMs = Date.UTC(year, monthIndex, day, hour, minute);
+    let candidate = new Date(targetMs);
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      const actual = wallClock(candidate);
+      const actualMs = Date.UTC(
+        Number(actual.year),
+        Number(actual.month) - 1,
+        Number(actual.day),
+        Number(actual.hour),
+        Number(actual.minute),
+      );
+      const adjustment = targetMs - actualMs;
+      if (adjustment === 0) break;
+      candidate = new Date(candidate.getTime() + adjustment);
+    }
+    return candidate;
+  } catch {
+    return null;
+  }
+}
+
+// Matches an absolute reset date+time, e.g. Codex's
+// "try again at Sep 15th, 2026 1:24 AM". Tried before the bare-clock pattern
+// below since it is the more specific match.
+const PROVIDER_QUOTA_ABSOLUTE_RESET_RE =
+  /try again at\s+([A-Za-z]{3,9})\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4}),?\s+(\d{1,2})(?::(\d{2}))?\s*(?:([ap])\.?\s*m\.?)?(?:\s*\(([^)]+)\)|\s+([A-Z]{2,5}))?/i;
+
+// Matches a bare clock time with no date, e.g. Claude's
+// "resets at 4:30 PM (America/Chicago)".
+const PROVIDER_QUOTA_CLOCK_RESET_RE =
+  /try again at\s+(\d{1,2})(?::(\d{2}))?\s*(?:([ap])\.?\s*m\.?)?(?:\s*\(([^)]+)\)|\s+([A-Z]{2,5}))?/i;
+
+function parseProviderQuotaAbsoluteReset(error: string): Date | null {
+  const match = error.match(PROVIDER_QUOTA_ABSOLUTE_RESET_RE);
+  if (!match) return null;
+
+  const monthIndex = PROVIDER_QUOTA_MONTH_INDEX[(match[1] ?? "").slice(0, 3).toLowerCase()];
+  const day = Number.parseInt(match[2] ?? "", 10);
+  const year = Number.parseInt(match[3] ?? "", 10);
+  const hourValue = Number.parseInt(match[4] ?? "", 10);
+  const minute = Number.parseInt(match[5] ?? "0", 10);
+  const meridiem = (match[6] ?? "").toLowerCase();
+  const timeZone = (match[7] ?? match[8])?.trim();
+
+  if (monthIndex === undefined) return null;
+  if (!Number.isInteger(day) || day < 1 || day > 31) return null;
+  if (!Number.isInteger(year)) return null;
+  if (!Number.isInteger(hourValue)) return null;
+  if (meridiem ? hourValue < 1 || hourValue > 12 : hourValue < 0 || hourValue > 23) return null;
+  if (!Number.isInteger(minute) || minute < 0 || minute > 59) return null;
+
+  let hour = meridiem ? hourValue % 12 : hourValue;
+  if (meridiem === "p") hour += 12;
+
+  if (!timeZone) return new Date(Date.UTC(year, monthIndex, day, hour, minute));
+  return resolveWallClockInTimeZone(year, monthIndex, day, hour, minute, timeZone);
+}
+
 function parseProviderQuotaClockReset(error: string, now: Date) {
-  const match = error.match(
-    /try again at\s+(\d{1,2})(?::(\d{2}))?\s*(?:([ap])\.?\s*m\.?)?(?:\s*\(([^)]+)\)|\s+([A-Z]{2,5}))?/i,
-  );
+  const absoluteReset = parseProviderQuotaAbsoluteReset(error);
+  if (absoluteReset) return absoluteReset;
+
+  const match = error.match(PROVIDER_QUOTA_CLOCK_RESET_RE);
   if (!match) return null;
 
   const hourValue = Number.parseInt(match[1] ?? "", 10);
@@ -401,49 +495,62 @@ function parseProviderQuotaClockReset(error: string, now: Date) {
     return retryAt;
   }
 
+  const wallClock = (date: Date) => Object.fromEntries(
+    new Intl.DateTimeFormat("en-US", {
+      timeZone,
+      hourCycle: "h23",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+    }).formatToParts(date).map((part) => [part.type, part.value]),
+  );
+  let nowParts: Record<string, string>;
   try {
-    const wallClock = (date: Date) => Object.fromEntries(
-      new Intl.DateTimeFormat("en-US", {
-        timeZone,
-        hourCycle: "h23",
-        year: "numeric",
-        month: "2-digit",
-        day: "2-digit",
-        hour: "2-digit",
-        minute: "2-digit",
-      }).formatToParts(date).map((part) => [part.type, part.value]),
-    );
-    const nowParts = wallClock(now);
-    const buildRetryAt = (dayOffset: number) => {
-      const targetDay = new Date(Date.UTC(
-        Number(nowParts.year),
-        Number(nowParts.month) - 1,
-        Number(nowParts.day) + dayOffset,
-        hour,
-        minute,
-      ));
-      let candidate = targetDay;
-      const targetMs = targetDay.getTime();
-      for (let attempt = 0; attempt < 4; attempt += 1) {
-        const actual = wallClock(candidate);
-        const actualMs = Date.UTC(
-          Number(actual.year),
-          Number(actual.month) - 1,
-          Number(actual.day),
-          Number(actual.hour),
-          Number(actual.minute),
-        );
-        const adjustment = targetMs - actualMs;
-        if (adjustment === 0) break;
-        candidate = new Date(candidate.getTime() + adjustment);
-      }
-      return candidate;
-    };
-    const sameDay = buildRetryAt(0);
-    return sameDay.getTime() > now.getTime() ? sameDay : buildRetryAt(1);
+    nowParts = wallClock(now);
   } catch {
     return null;
   }
+  const buildRetryAt = (dayOffset: number) => resolveWallClockInTimeZone(
+    Number(nowParts.year),
+    Number(nowParts.month) - 1,
+    Number(nowParts.day) + dayOffset,
+    hour,
+    minute,
+    timeZone,
+  );
+  const sameDay = buildRetryAt(0);
+  if (!sameDay) return null;
+  return sameDay.getTime() > now.getTime() ? sameDay : buildRetryAt(1);
+}
+
+// Shared by classifyAdapterFailureForRecovery and the continuation-retry and
+// stranded-recovery monitor paths so every provider_quota consumer defers to
+// the same parsed provider reset time instead of independently falling back
+// to the flat default backoff.
+function resolveProviderQuotaRetryAt(
+  latestRun: Pick<NonNullable<LatestIssueRun>, "error" | "errorCode" | "resultJson"> | null | undefined,
+  now: Date,
+): { retryAt: Date; parsedResetTime: boolean } {
+  const resultJson = parseObject(latestRun?.resultJson);
+  const persistedRetryAt = readNonEmptyString(resultJson.retryNotBefore) ??
+    readNonEmptyString(resultJson.transientRetryNotBefore) ??
+    readNonEmptyString(resultJson.providerQuotaRetryNotBefore);
+  const parsedPersistedRetryAt = persistedRetryAt ? new Date(persistedRetryAt) : null;
+  if (parsedPersistedRetryAt && !Number.isNaN(parsedPersistedRetryAt.getTime()) && parsedPersistedRetryAt > now) {
+    return { retryAt: parsedPersistedRetryAt, parsedResetTime: true };
+  }
+
+  const error = [latestRun?.errorCode ?? "", latestRun?.error ?? "", JSON.stringify(resultJson)].join("\n");
+  const parsedClockReset = parseProviderQuotaClockReset(error, now);
+  if (parsedClockReset) {
+    return { retryAt: parsedClockReset, parsedResetTime: true };
+  }
+  return {
+    retryAt: new Date(now.getTime() + PROVIDER_QUOTA_RECOVERY_DEFAULT_BACKOFF_MS),
+    parsedResetTime: false,
+  };
 }
 
 export function classifyAdapterFailureForRecovery(
@@ -464,36 +571,40 @@ export function classifyAdapterFailureForRecovery(
   }
   if (latestRun.errorCode !== "provider_quota" && !PROVIDER_QUOTA_ERROR_RE.test(error)) return null;
 
-  const persistedRetryAt = readNonEmptyString(resultJson.retryNotBefore) ??
-    readNonEmptyString(resultJson.transientRetryNotBefore) ??
-    readNonEmptyString(resultJson.providerQuotaRetryNotBefore);
-  const parsedPersistedRetryAt = persistedRetryAt ? new Date(persistedRetryAt) : null;
-  if (parsedPersistedRetryAt && !Number.isNaN(parsedPersistedRetryAt.getTime()) && parsedPersistedRetryAt > now) {
-    return { kind: "provider_quota", retryAt: parsedPersistedRetryAt, parsedResetTime: true };
-  }
-
-  const parsedClockReset = parseProviderQuotaClockReset(error, now);
-  if (parsedClockReset) {
-    return { kind: "provider_quota", retryAt: parsedClockReset, parsedResetTime: true };
-  }
-  return {
-    kind: "provider_quota",
-    retryAt: new Date(now.getTime() + PROVIDER_QUOTA_RECOVERY_DEFAULT_BACKOFF_MS),
-    parsedResetTime: false,
-  };
+  const { retryAt, parsedResetTime } = resolveProviderQuotaRetryAt(latestRun, now);
+  return { kind: "provider_quota", retryAt, parsedResetTime };
 }
 
 type ContinuationRetryClassification = {
-  kind: "transient_infra" | "non_retryable" | "default";
+  kind: "transient_infra" | "non_retryable" | "default" | "provider_quota";
   maxAttempts: number;
   baseBackoffMs: number;
   errorCode: string | null;
+  retryAt?: Date;
+  parsedResetTime?: boolean;
 };
 
-export function classifyContinuationFailure(latestRun: LatestIssueRun): ContinuationRetryClassification {
+export function classifyContinuationFailure(
+  latestRun: LatestIssueRun,
+  now = new Date(),
+): ContinuationRetryClassification {
   const errorCode = readNonEmptyString(latestRun?.errorCode);
   if (errorCode && NON_RETRYABLE_CONTINUATION_ERROR_CODES.has(errorCode)) {
     return { kind: "non_retryable", maxAttempts: 0, baseBackoffMs: 0, errorCode };
+  }
+  // Deferred, not transient: a quota failure carries (or implies) a provider
+  // reset time, so it gets exactly one retry scheduled at that time instead
+  // of the short flat/exponential backoff used for dropped connections.
+  if (isProviderQuotaRecovery(latestRun)) {
+    const { retryAt, parsedResetTime } = resolveProviderQuotaRetryAt(latestRun, now);
+    return {
+      kind: "provider_quota",
+      maxAttempts: PROVIDER_QUOTA_RECOVERY_MAX_ATTEMPTS,
+      baseBackoffMs: 0,
+      errorCode: errorCode ?? "provider_quota",
+      retryAt,
+      parsedResetTime,
+    };
   }
   if (errorCode && TRANSIENT_INFRA_CONTINUATION_ERROR_CODES.has(errorCode)) {
     return {
@@ -2949,7 +3060,10 @@ export function recoveryService(
       monitorPolicy: recoveryCause === "provider_quota" && !ownerAgentId
         ? { type: "wait_recovery", retryAgentId: routing.returnOwnerAgentId }
         : null,
-      maxAttempts: null,
+      // wait_recovery monitors (provider_quota with no invokable owner) must
+      // never be unbounded: a quota that never clears has to stop
+      // rescheduling instead of retrying forever (OXFA-31266).
+      maxAttempts: recoveryCause === "provider_quota" ? PROVIDER_QUOTA_RECOVERY_MAX_ATTEMPTS : null,
       lastAttemptAt: now,
     });
 
@@ -2994,18 +3108,17 @@ export function recoveryService(
   }
 
   function readProviderQuotaRetryAt(latestRun: LatestIssueRun, now: Date) {
-    const result = parseObject(latestRun?.resultJson);
     const context = parseObject(latestRun?.contextSnapshot);
-    const raw = result.providerQuotaRetryNotBefore ??
-      result.retryNotBefore ??
-      result.transientRetryNotBefore ??
-      context.providerQuotaRetryNotBefore ??
-      context.transientRetryNotBefore;
+    const raw = context.providerQuotaRetryNotBefore ?? context.transientRetryNotBefore;
     if (typeof raw === "string" || typeof raw === "number" || raw instanceof Date) {
       const parsed = new Date(raw);
       if (!Number.isNaN(parsed.getTime()) && parsed.getTime() > now.getTime()) return parsed;
     }
-    return new Date(now.getTime() + PROVIDER_QUOTA_RECOVERY_DEFAULT_BACKOFF_MS);
+    // Falls back to parsing the run's own resultJson/error text (e.g. the
+    // provider's "try again at <date>" message) instead of jumping straight
+    // to the flat default backoff, so a stranded-recovery wait still targets
+    // the real provider reset time (OXFA-31266).
+    return resolveProviderQuotaRetryAt(latestRun, now).retryAt;
   }
 
   async function ensureProviderQuotaWaitRecoveryMonitor(input: {
@@ -3308,6 +3421,13 @@ export function recoveryService(
     recoveryCause?: StrandedRecoveryCause;
     recoveryOwnerAgentId?: string | null;
     successfulRunHandoffEvidence?: SuccessfulRunHandoffRecoveryEvidence | null;
+    // Set by callers that already tracked a provider_quota retry chain
+    // themselves (e.g. classifyContinuationFailure's consecutive-attempts
+    // count) and determined it is exhausted. A freshly created recovery
+    // action always starts at attemptCount 1, so without this the first
+    // arrival here would silently re-enter the wait_recovery path instead
+    // of honoring the caller's own bound (OXFA-31266).
+    suppressProviderQuotaWait?: boolean;
   }) {
     if (isStrandedIssueRecoveryIssue(input.issue)) {
       return escalateStrandedRecoveryIssueInPlace({
@@ -3326,9 +3446,16 @@ export function recoveryService(
       recoveryOwnerAgentId: input.recoveryOwnerAgentId,
       successfulRunHandoffEvidence: input.successfulRunHandoffEvidence,
     });
+    // Once the wait_recovery chain has used up its bounded attempts, stop
+    // scheduling further retries and fall through to a normal, visible
+    // blocked escalation instead of looping forever (OXFA-31266).
+    const providerQuotaAttemptsExhausted = recoveryCause === "provider_quota" &&
+      (input.suppressProviderQuotaWait === true ||
+        (typeof recoveryAction.maxAttempts === "number" && recoveryAction.attemptCount >= recoveryAction.maxAttempts));
     const isProviderQuotaWait = recoveryCause === "provider_quota" &&
       !recoveryAction.ownerAgentId &&
-      Boolean(recoveryAction.returnOwnerAgentId);
+      Boolean(recoveryAction.returnOwnerAgentId) &&
+      !providerQuotaAttemptsExhausted;
     if (isProviderQuotaWait && recoveryAction.returnOwnerAgentId) {
       await ensureProviderQuotaWaitRecoveryMonitor({
         issue: input.issue,
@@ -3401,7 +3528,8 @@ export function recoveryService(
     const shouldPostEscalationComment =
       recoveryAction.attemptCount === 1 ||
       input.recoveryCause === "workspace_validation_failed" ||
-      input.recoveryCause === "configuration_incomplete";
+      input.recoveryCause === "configuration_incomplete" ||
+      providerQuotaAttemptsExhausted;
     if (shouldPostEscalationComment) {
       const escalationCommentMarker = `Recovery action: \`${recoveryAction.id}\``;
 
@@ -3577,7 +3705,10 @@ export function recoveryService(
         serviceName: PROVIDER_QUOTA_MONITOR_SERVICE_NAME,
         externalRef: input.latestRun.id,
         timeoutAt: null,
-        maxAttempts: null,
+        // Never unbounded: once attemptCount reaches this ceiling,
+        // exhaustedMonitorClearReason() clears the monitor instead of
+        // rescheduling another wait forever (OXFA-31266).
+        maxAttempts: PROVIDER_QUOTA_RECOVERY_MAX_ATTEMPTS,
         recoveryPolicy: "wake_owner" as const,
       },
     };
@@ -4205,7 +4336,7 @@ export function recoveryService(
         continue;
       }
       if (isUnsuccessfulTerminalIssueRun(latestRun)) {
-        const classification = classifyContinuationFailure(latestRun);
+        const classification = classifyContinuationFailure(latestRun, recoveryNow);
 
         if (classification.errorCode === CONTINUATION_WAITING_ON_REVIEW_ERROR_CODE) {
           const resolved = await resolveContinuationWaitingOnReview(issue);
@@ -4237,6 +4368,41 @@ export function recoveryService(
             result.skipped += 1;
           }
           continue;
+        }
+
+        if (classification.kind === "provider_quota") {
+          const { consecutive } = await summarizeRecentContinuationRetries(
+            issue.companyId,
+            issue.id,
+            agentId,
+            classification.errorCode,
+          );
+          if (consecutive >= classification.maxAttempts) {
+            const failureSummary = summarizeRunFailureForIssueComment(latestRun);
+            const updated = await escalateStrandedAssignedIssue({
+              issue,
+              previousStatus: "in_progress",
+              latestRun,
+              recoveryCause: "provider_quota",
+              suppressProviderQuotaWait: true,
+              comment:
+                "Paperclip stopped automatic continuation retries after " +
+                `${consecutive}× consecutive provider-quota failures on this assigned \`in_progress\` issue.${failureSummary ?? ""} ` +
+                "Moving it to `blocked` so it is visible for intervention.",
+            });
+            if (updated) {
+              result.escalated += 1;
+              result.issueIds.push(issue.id);
+            } else {
+              result.skipped += 1;
+            }
+            continue;
+          }
+
+          if (classification.retryAt && classification.retryAt.getTime() > Date.now()) {
+            result.skipped += 1;
+            continue;
+          }
         }
 
         if (didAutomaticRecoveryFail(latestRun, "issue_continuation_needed")) {
