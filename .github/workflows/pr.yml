@@ -4,6 +4,7 @@ on:
   pull_request:
     branches:
       - master
+      - 'release/**'
 
 concurrency:
   group: pr-${{ github.event.pull_request.number }}
@@ -150,10 +151,14 @@ jobs:
           # The server suite is pinned to maxWorkers=1 (server/vitest.config.ts),
           # so it can only be parallelized across runners. Shard it to keep this
           # lane off the PR critical path. Five shards because the suite has
-          # grown to ~946s of serial vitest wall time (run 30930345729,
-          # 2026-08-04): at four shards the worst shard ran 311s and was the
-          # slowest check in the whole PR run; five brings each shard to ~196s
-          # of suite time (~240s job), level with the other ~250-300s lanes.
+          # grown to ~996s of serial vitest wall time (run 34533751794,
+          # 2026-09-10, general-server-shard-durations.json refreshed from the
+          # same run): five shards land the real LPT-balanced partition at
+          # ~198s/shard (~240s job), level with the other ~250-300s lanes. This
+          # count was already correct before 2026-09-10 -- shards were timing
+          # out because a stray "--" in the invocation below (see that step's
+          # comment) silently disabled sharding entirely, not because five
+          # shards was the wrong number.
           - group: general-server
             group_label: server (1/5)
             shard_index: 0
@@ -218,11 +223,21 @@ jobs:
 
       - name: Run grouped general test suites
         run: |
+          # No "--" before these flags: pnpm forwards `run <script> -- <args>` by
+          # literally inserting the "--" token into argv when the target script
+          # already has its own baked-in arguments (test:run:general ends in
+          # `--mode general`), and run-vitest-stable.mjs's own parser treats the
+          # first "--" it sees as "stop parsing flags, everything after is opaque
+          # vitest passthrough" -- so a leading "--" here silently drops --group/
+          # --shard-index/--shard-count and every job falls back to running the
+          # entire general suite unsharded. Confirmed 2026-09-10 (OXFA-31270,
+          # diagnostic run 34533751794): this, not suite growth, was the real
+          # cause of every general_tests shard blowing its budget.
           if [ -n "${{ matrix.shard_count }}" ]; then
-            pnpm test:run:general -- --group '${{ matrix.group }}' \
+            pnpm test:run:general --group '${{ matrix.group }}' \
               --shard-index ${{ matrix.shard_index }} --shard-count ${{ matrix.shard_count }}
           else
-            pnpm test:run:general -- --group '${{ matrix.group }}'
+            pnpm test:run:general --group '${{ matrix.group }}'
           fi
 
   verify:
@@ -287,10 +302,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # A successful PR run on 2026-08-04 (30876682788) spent 256s in
-          # serialized shard 2/4, making its 305s job the run's slowest check.
-          # Five shards reduce the measured 739s suite total to about 148s per
-          # runner before setup overhead.
+          # Round-robin over 128 route/authz suites (server/src/__tests__), not
+          # duration-weighted. Real suite total is ~922s as of 2026-09-10 (run
+          # 34533751794, up from 739s on 2026-08-04) -- five shards still split
+          # that to a ~230s worst shard, inside the ~150-250s/shard headroom
+          # this lane targets. This count was already correct; shards were
+          # blowing past timeout because a stray "--" in the invocation below
+          # silently dropped --shard-index/--shard-count and every "shard" ran
+          # all 128 suites. See that step's comment and OXFA-31270.
           - shard_index: 0
             shard_count: 5
             shard_label: 1/5
@@ -333,7 +352,10 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Run serialized server test shard
-        run: pnpm test:run:serialized -- --shard-index ${{ matrix.shard_index }} --shard-count ${{ matrix.shard_count }}
+        # No "--" here either -- see the general_tests "Run grouped general
+        # test suites" step comment; the same pnpm/argv-parsing interaction
+        # silently dropped --shard-index/--shard-count for this lane too.
+        run: pnpm test:run:serialized --shard-index ${{ matrix.shard_index }} --shard-count ${{ matrix.shard_count }}
 
   canary_dry_run:
     name: Canary Dry Run
