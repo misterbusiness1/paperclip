@@ -880,10 +880,38 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       isDestructiveCloseAllowed: true,
     });
     expect(readiness?.blockingReasons).toEqual([]);
+    expect(readiness?.plannedActions.map((action) => action.kind)).toEqual(["archive_record"]);
     expect(readiness?.warnings).toEqual(expect.arrayContaining([
       "This workspace is still linked to an open issue. Archiving it will detach this shared workspace session from those issues, but keep the underlying project workspace available.",
       "This shared workspace session points at project workspace infrastructure. Archiving it only removes the session record.",
     ]));
+  });
+
+  it("keeps primary workspace contents out of the cleanup plan despite legacy cleanup commands", async () => {
+    const repoRoot = await createTempRepo();
+    tempDirs.add(repoRoot);
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const projectWorkspaceId = randomUUID();
+    const executionWorkspaceId = randomUUID();
+    await db.insert(companies).values({ id: companyId, name: "Primary preservation", issuePrefix: "PAP" });
+    await db.insert(projects).values({ id: projectId, companyId, name: "Protected project", status: "in_progress",
+      executionWorkspacePolicy: { enabled: true, workspaceStrategy: { type: "project_primary", teardownCommand: "echo project-teardown" } } });
+    await db.insert(projectWorkspaces).values({ id: projectWorkspaceId, companyId, projectId,
+      name: "Primary", sourceType: "local_path", isPrimary: true, cwd: repoRoot, cleanupCommand: "echo primary-cleanup" });
+    await db.insert(executionWorkspaces).values({ id: executionWorkspaceId, companyId, projectId,
+      projectWorkspaceId, mode: "isolated_workspace", strategyType: "project_primary", name: "Legacy primary",
+      status: "idle", providerType: "local_fs", cwd: repoRoot, branchName: "retained-branch",
+      metadata: { createdByRuntime: true, config: { cleanupCommand: "echo local-cleanup", teardownCommand: "echo local-teardown" } } });
+    await fs.writeFile(path.join(repoRoot, "retained.txt"), "valuable primary contents\n");
+
+    const readiness = await svc.getCloseReadiness(executionWorkspaceId);
+
+    expect(readiness?.isSharedWorkspace).toBe(false);
+    expect(readiness?.isProjectPrimaryWorkspace).toBe(true);
+    expect(readiness?.plannedActions.map((action) => action.kind)).toEqual(["archive_record"]);
+    expect(readiness?.git?.hasUntrackedFiles).toBe(true);
+    expect(await fs.readFile(path.join(repoRoot, "retained.txt"), "utf8")).toBe("valuable primary contents\n");
   });
 
   it("clears matching environment selections transactionally without touching other workspaces", async () => {
