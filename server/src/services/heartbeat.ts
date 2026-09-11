@@ -660,6 +660,8 @@ function mergeAdapterRecoveryMetadata(input: {
 }
 const RUNNING_ISSUE_WAKE_REASONS_REQUIRING_FOLLOWUP = new Set([
   "approval_approved",
+  "approval_rejected",
+  "approval_revision_requested",
   ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
   "issue_recovery_action_restored",
 ]);
@@ -678,6 +680,8 @@ const ISSUE_RESPONSIBLE_USER_WAKE_REASONS = new Set([
   "execution_approval_requested",
   "execution_changes_requested",
   "approval_approved",
+  "approval_rejected",
+  "approval_revision_requested",
 ]);
 const SESSIONED_LOCAL_ADAPTERS = new Set([
   "claude_local",
@@ -4064,6 +4068,25 @@ function shouldRequireIssueCommentForWake(
     wakeReason === "execution_approval_requested" ||
     wakeReason === "execution_changes_requested"
   );
+}
+
+// Board decisions on an approval (approve / reject / request revision) are
+// addressed to the agent that requested it. Agents park the linked issue
+// with a human owner while the approval is pending, so the queued-run
+// assignee guard must not treat the decision wake as a stale reassignment
+// and cancel it (OXFA-31274).
+const APPROVAL_DECISION_WAKE_REASONS: ReadonlySet<string> = new Set([
+  "approval_approved",
+  "approval_rejected",
+  "approval_revision_requested",
+]);
+
+function isApprovalDecisionWakeForRequester(
+  contextSnapshot: Record<string, unknown> | null | undefined,
+) {
+  const wakeReason = readNonEmptyString(contextSnapshot?.wakeReason);
+  if (!wakeReason || !APPROVAL_DECISION_WAKE_REASONS.has(wakeReason)) return false;
+  return readNonEmptyString(contextSnapshot?.approvalId) !== null;
 }
 
 function allowsIssueInteractionWake(
@@ -12677,6 +12700,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     const wakeCommentId = deriveCommentId(context, null);
     const isInteractionWake = allowsIssueInteractionWake(context);
+    const isApprovalDecisionWake = isApprovalDecisionWakeForRequester(context);
     const resumeIntent = context.resumeIntent === true || context.followUpRequested === true;
     const wakeReason = readNonEmptyString(context.wakeReason);
     const retryReason = readNonEmptyString(context.retryReason) ?? run.scheduledRetryReason ?? null;
@@ -12723,14 +12747,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (
       issue.assigneeAgentId !== run.agentId &&
       !isInteractionWake &&
+      !isApprovalDecisionWake &&
       !isCurrentReviewParticipant &&
       !isNonAssigneeWorkspaceBusyRetry(retryReason, context)
     ) {
       return {
         stale: true,
         errorCode: "issue_assignee_changed",
-        reason:
-          "Cancelled because issue assignee changed before the queued run could start; the new owner will be woken instead",
+        reason: issue.assigneeAgentId
+          ? "Cancelled because issue assignee changed before the queued run could start; the new owner will be woken instead"
+          : "Cancelled because issue assignee changed to a human owner before the queued run could start; no agent owns the issue, so no replacement run is woken",
         details: {
           issueId,
           previousAssigneeAgentId: run.agentId,
