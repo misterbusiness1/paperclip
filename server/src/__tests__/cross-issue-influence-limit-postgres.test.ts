@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import express from "express";
+import request from "supertest";
 import { and, eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
@@ -7,6 +9,8 @@ import {
   companies,
   createDb,
   heartbeatRuns,
+  issueComments,
+  issues,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -16,6 +20,10 @@ import {
   CROSS_ISSUE_INFLUENCE_ENFORCE_AT,
   observeCrossIssueInfluence,
 } from "../services/cross-issue-influence-limit.js";
+import { createLocalAgentJwt } from "../agent-auth-jwt.js";
+import { actorMiddleware } from "../middleware/auth.js";
+import { errorHandler } from "../middleware/index.js";
+import { issueRoutes } from "../routes/issues.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -31,9 +39,92 @@ describeEmbeddedPostgres("cross-issue influence limit PostgreSQL serialization",
 
   afterEach(async () => {
     await db.delete(activityLog);
+    await db.delete(issueComments);
+    await db.delete(issues);
     await db.delete(heartbeatRuns);
     await db.delete(agents);
     await db.delete(companies);
+  });
+
+  function createApp() {
+    const app = express();
+    app.use(express.json());
+    app.use(actorMiddleware(db, {
+      deploymentMode: "authenticated",
+      resolveSession: async () => null,
+    }));
+    app.use("/api", issueRoutes(db, {} as never));
+    app.use(errorHandler);
+    return app;
+  }
+
+  it("lets a correctly attributed timer run PATCH and comment after checkout", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Timer Attribution Company",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Timer Agent",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "timer",
+      triggerDetail: "system",
+      status: "running",
+      contextSnapshot: {
+        wakeReason: "heartbeat_timer",
+        source: "scheduler",
+      },
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Timer-selected work",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: agentId,
+    });
+    const token = createLocalAgentJwt(agentId, companyId, "codex_local", runId);
+    const app = createApp();
+    const authenticated = (call: request.Test) => call
+      .set("Authorization", `Bearer ${token}`)
+      .set("X-Paperclip-Run-Id", runId);
+
+    const unattributed = await authenticated(request(app).post(`/api/issues/${issueId}/comments`))
+      .send({ body: "Must not bind without checkout." });
+    expect(unattributed.status).toBe(403);
+    expect(unattributed.body.details?.code).toBe("cross_issue_influence_run_context_required");
+
+    await authenticated(request(app).post(`/api/issues/${issueId}/checkout`))
+      .send({ agentId, expectedStatuses: ["todo"] })
+      .expect(200);
+    await authenticated(request(app).patch(`/api/issues/${issueId}`))
+      .send({ title: "Timer-selected work updated" })
+      .expect(200);
+    await authenticated(request(app).post(`/api/issues/${issueId}/comments`))
+      .send({ body: "Timer run can report progress." })
+      .expect(201);
+
+    const persistedRun = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).then((rows) => rows[0]);
+    expect(persistedRun?.contextSnapshot).toMatchObject({ issueId, taskId: issueId, wakeReason: "heartbeat_timer" });
+    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, issueId))).toEqual([
+      expect.objectContaining({ body: "Timer run can report progress.", createdByRunId: runId }),
+    ]);
   });
 
   afterAll(async () => {

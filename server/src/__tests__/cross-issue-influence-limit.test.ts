@@ -23,6 +23,7 @@ function counterDb(
             };
           }
           return {
+            then: (resolve: (rows: unknown[]) => unknown) => resolve([]),
             for: () => ({
               then: (resolve: (rows: unknown[]) => unknown) => resolve(runOverrides === null ? [] : [{
                 id: "11111111-1111-4111-8111-111111111111",
