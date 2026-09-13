@@ -1,6 +1,6 @@
 import { and, count, eq } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { activityLog, heartbeatRuns } from "@paperclipai/db";
+import { activityLog, heartbeatRuns, issues } from "@paperclipai/db";
 import { isUuidLike, issueWriteDenialResponse } from "@paperclipai/shared";
 import { forbidden } from "../errors.js";
 import { logger } from "../middleware/logger.js";
@@ -85,6 +85,7 @@ export async function observeCrossIssueInfluence(
         companyId: heartbeatRuns.companyId,
         agentId: heartbeatRuns.agentId,
         responsibleUserId: heartbeatRuns.responsibleUserId,
+        invocationSource: heartbeatRuns.invocationSource,
         contextSnapshot: heartbeatRuns.contextSnapshot,
       })
       .from(heartbeatRuns)
@@ -103,8 +104,51 @@ export async function observeCrossIssueInfluence(
       throw crossIssueInfluenceRunContextError();
     }
 
-    const sourceIssueId = readRunSourceIssueId(run.contextSnapshot);
-    if (!sourceIssueId) throw crossIssueInfluenceRunContextError();
+    let sourceIssueId = readRunSourceIssueId(run.contextSnapshot);
+    if (!sourceIssueId) {
+      // Generic timer runs are intentionally created without an issue. A
+      // successful checkout is the first server-mediated proof of which issue
+      // the run owns, so use that durable lock to establish the immutable run
+      // source on the first subsequent write. No lock (or a lock on another
+      // issue) still fails closed.
+      const contextSnapshot =
+        run.contextSnapshot &&
+        typeof run.contextSnapshot === "object" &&
+        !Array.isArray(run.contextSnapshot)
+          ? (run.contextSnapshot as Record<string, unknown>)
+          : null;
+      if (
+        run.invocationSource !== "timer" ||
+        contextSnapshot?.wakeReason !== "heartbeat_timer"
+      ) {
+        throw crossIssueInfluenceRunContextError();
+      }
+
+      const checkedOutIssue = await tx
+        .select({ id: issues.id })
+        .from(issues)
+        .where(and(
+          eq(issues.id, input.targetIssueId),
+          eq(issues.companyId, input.companyId),
+          eq(issues.assigneeAgentId, input.agentId),
+          eq(issues.checkoutRunId, input.runId),
+        ))
+        .then((rows) => rows[0] ?? null);
+      if (!checkedOutIssue) throw crossIssueInfluenceRunContextError();
+
+      sourceIssueId = checkedOutIssue.id;
+      const boundContextSnapshot = { ...contextSnapshot };
+      boundContextSnapshot.issueId = sourceIssueId;
+      boundContextSnapshot.taskId = sourceIssueId;
+      await tx
+        .update(heartbeatRuns)
+        .set({ contextSnapshot: boundContextSnapshot, updatedAt: new Date() })
+        .where(and(
+          eq(heartbeatRuns.id, input.runId),
+          eq(heartbeatRuns.companyId, input.companyId),
+          eq(heartbeatRuns.agentId, input.agentId),
+        ));
+    }
     if (
       sourceIssueId === input.targetIssueId ||
       (input.targetIssueIdentifier && sourceIssueId.toUpperCase() === input.targetIssueIdentifier.toUpperCase())
