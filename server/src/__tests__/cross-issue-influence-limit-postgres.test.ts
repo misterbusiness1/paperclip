@@ -105,11 +105,6 @@ describeEmbeddedPostgres("cross-issue influence limit PostgreSQL serialization",
       .set("Authorization", `Bearer ${token}`)
       .set("X-Paperclip-Run-Id", runId);
 
-    const unattributed = await authenticated(request(app).post(`/api/issues/${issueId}/comments`))
-      .send({ body: "Must not bind without checkout." });
-    expect(unattributed.status).toBe(403);
-    expect(unattributed.body.details?.code).toBe("cross_issue_influence_run_context_required");
-
     await authenticated(request(app).post(`/api/issues/${issueId}/checkout`))
       .send({ agentId, expectedStatuses: ["todo"] })
       .expect(200);
@@ -125,6 +120,130 @@ describeEmbeddedPostgres("cross-issue influence limit PostgreSQL serialization",
     expect(await db.select().from(issueComments).where(eq(issueComments.issueId, issueId))).toEqual([
       expect.objectContaining({ body: "Timer run can report progress.", createdByRunId: runId }),
     ]);
+  });
+
+  it.each([
+    ["non-timer invocation", "on_demand", { wakeReason: "heartbeat_timer" }],
+    ["missing wake reason", "timer", {}],
+    ["malformed wake reason", "timer", { wakeReason: 42 }],
+    ["mismatched wake reason", "timer", { wakeReason: "issue_assigned" }],
+  ] as const)("denies PATCH and comment for %s", async (_name, invocationSource, contextSnapshot) => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Timer Attribution Negative Company",
+      issuePrefix: `N${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Timer Negative Agent",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource,
+      triggerDetail: "system",
+      status: "running",
+      contextSnapshot,
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Invalid timer origin",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: runId,
+    });
+
+    const token = createLocalAgentJwt(agentId, companyId, "codex_local", runId);
+    const authenticated = (call: request.Test) => call
+      .set("Authorization", `Bearer ${token}`)
+      .set("X-Paperclip-Run-Id", runId);
+    const app = createApp();
+    for (const response of [
+      await authenticated(request(app).patch(`/api/issues/${issueId}`)).send({ title: "Denied update" }),
+      await authenticated(request(app).post(`/api/issues/${issueId}/comments`)).send({ body: "Denied comment" }),
+    ]) {
+      expect(response.status).toBe(403);
+      expect(response.body.details?.code).toBe("cross_issue_influence_run_context_required");
+    }
+
+    const persistedRun = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).then((rows) => rows[0]);
+    expect(persistedRun?.contextSnapshot).toEqual(contextSnapshot);
+  });
+
+  it.each([
+    ["company", { company: false, agent: true, issue: true, run: true }],
+    ["agent", { company: true, agent: false, issue: true, run: true }],
+    ["issue", { company: true, agent: true, issue: false, run: true }],
+    ["run", { company: true, agent: true, issue: true, run: false }],
+  ] as const)("fails closed for a %s checkout-lock mismatch", async (_name, match) => {
+    const companyId = randomUUID();
+    const otherCompanyId = randomUUID();
+    const agentId = randomUUID();
+    const otherAgentId = randomUUID();
+    const runId = randomUUID();
+    const otherRunId = randomUUID();
+    const issueId = randomUUID();
+    const otherIssueId = randomUUID();
+    await db.insert(companies).values([
+      { id: companyId, name: "Lock Company", issuePrefix: `L${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}` },
+      { id: otherCompanyId, name: "Other Lock Company", issuePrefix: `O${otherCompanyId.replace(/-/g, "").slice(0, 6).toUpperCase()}` },
+    ]);
+    await db.insert(agents).values([
+      { id: agentId, companyId, name: "Lock Agent", role: "engineer", status: "active", adapterType: "codex_local", adapterConfig: {}, runtimeConfig: {}, permissions: {} },
+      { id: otherAgentId, companyId, name: "Other Lock Agent", role: "engineer", status: "active", adapterType: "codex_local", adapterConfig: {}, runtimeConfig: {}, permissions: {} },
+    ]);
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "timer",
+      status: "running",
+      contextSnapshot: { wakeReason: "heartbeat_timer" },
+    });
+    await db.insert(heartbeatRuns).values({
+      id: otherRunId,
+      companyId,
+      agentId,
+      invocationSource: "on_demand",
+      status: "running",
+      contextSnapshot: { issueId: otherIssueId },
+    });
+    await db.insert(issues).values({
+      id: match.issue ? issueId : otherIssueId,
+      companyId: match.company ? companyId : otherCompanyId,
+      title: "Mismatched lock",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: match.agent ? agentId : otherAgentId,
+      checkoutRunId: match.run ? runId : otherRunId,
+    });
+
+    await expect(observeCrossIssueInfluence(db, {
+      companyId,
+      runId,
+      agentId,
+      targetIssueId: issueId,
+      kind: "update",
+    })).rejects.toMatchObject({
+      status: 403,
+      details: { code: "cross_issue_influence_run_context_required" },
+    });
+    const persistedRun = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).then((rows) => rows[0]);
+    expect(persistedRun?.contextSnapshot).toEqual({ wakeReason: "heartbeat_timer" });
   });
 
   afterAll(async () => {

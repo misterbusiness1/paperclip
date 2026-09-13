@@ -85,6 +85,7 @@ export async function observeCrossIssueInfluence(
         companyId: heartbeatRuns.companyId,
         agentId: heartbeatRuns.agentId,
         responsibleUserId: heartbeatRuns.responsibleUserId,
+        invocationSource: heartbeatRuns.invocationSource,
         contextSnapshot: heartbeatRuns.contextSnapshot,
       })
       .from(heartbeatRuns)
@@ -110,6 +111,19 @@ export async function observeCrossIssueInfluence(
       // the run owns, so use that durable lock to establish the immutable run
       // source on the first subsequent write. No lock (or a lock on another
       // issue) still fails closed.
+      const contextSnapshot =
+        run.contextSnapshot &&
+        typeof run.contextSnapshot === "object" &&
+        !Array.isArray(run.contextSnapshot)
+          ? (run.contextSnapshot as Record<string, unknown>)
+          : null;
+      if (
+        run.invocationSource !== "timer" ||
+        contextSnapshot?.wakeReason !== "heartbeat_timer"
+      ) {
+        throw crossIssueInfluenceRunContextError();
+      }
+
       const checkedOutIssue = await tx
         .select({ id: issues.id })
         .from(issues)
@@ -123,15 +137,12 @@ export async function observeCrossIssueInfluence(
       if (!checkedOutIssue) throw crossIssueInfluenceRunContextError();
 
       sourceIssueId = checkedOutIssue.id;
-      const contextSnapshot =
-        run.contextSnapshot && typeof run.contextSnapshot === "object" && !Array.isArray(run.contextSnapshot)
-          ? { ...(run.contextSnapshot as Record<string, unknown>) }
-          : {};
-      contextSnapshot.issueId = sourceIssueId;
-      contextSnapshot.taskId = sourceIssueId;
+      const boundContextSnapshot = { ...contextSnapshot };
+      boundContextSnapshot.issueId = sourceIssueId;
+      boundContextSnapshot.taskId = sourceIssueId;
       await tx
         .update(heartbeatRuns)
-        .set({ contextSnapshot, updatedAt: new Date() })
+        .set({ contextSnapshot: boundContextSnapshot, updatedAt: new Date() })
         .where(and(
           eq(heartbeatRuns.id, input.runId),
           eq(heartbeatRuns.companyId, input.companyId),
