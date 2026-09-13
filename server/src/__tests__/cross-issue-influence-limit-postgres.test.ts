@@ -20,8 +20,6 @@ import {
   CROSS_ISSUE_INFLUENCE_ENFORCE_AT,
   observeCrossIssueInfluence,
 } from "../services/cross-issue-influence-limit.js";
-import { createLocalAgentJwt } from "../agent-auth-jwt.js";
-import { actorMiddleware } from "../middleware/auth.js";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 
@@ -46,13 +44,19 @@ describeEmbeddedPostgres("cross-issue influence limit PostgreSQL serialization",
     await db.delete(companies);
   });
 
-  function createApp() {
+  function createApp(input: { companyId: string; agentId: string; runId: string }) {
     const app = express();
     app.use(express.json());
-    app.use(actorMiddleware(db, {
-      deploymentMode: "authenticated",
-      resolveSession: async () => null,
-    }));
+    app.use((req, _res, next) => {
+      req.actor = {
+        type: "agent",
+        agentId: input.agentId,
+        companyId: input.companyId,
+        runId: input.runId,
+        source: "local_jwt",
+      };
+      next();
+    });
     app.use("/api", issueRoutes(db, {} as never));
     app.use(errorHandler);
     return app;
@@ -99,10 +103,8 @@ describeEmbeddedPostgres("cross-issue influence limit PostgreSQL serialization",
       priority: "high",
       assigneeAgentId: agentId,
     });
-    const token = createLocalAgentJwt(agentId, companyId, "codex_local", runId);
-    const app = createApp();
+    const app = createApp({ companyId, agentId, runId });
     const authenticated = (call: request.Test) => call
-      .set("Authorization", `Bearer ${token}`)
       .set("X-Paperclip-Run-Id", runId);
 
     await authenticated(request(app).post(`/api/issues/${issueId}/checkout`))
@@ -167,11 +169,9 @@ describeEmbeddedPostgres("cross-issue influence limit PostgreSQL serialization",
       checkoutRunId: runId,
     });
 
-    const token = createLocalAgentJwt(agentId, companyId, "codex_local", runId);
     const authenticated = (call: request.Test) => call
-      .set("Authorization", `Bearer ${token}`)
       .set("X-Paperclip-Run-Id", runId);
-    const app = createApp();
+    const app = createApp({ companyId, agentId, runId });
     for (const response of [
       await authenticated(request(app).patch(`/api/issues/${issueId}`)).send({ title: "Denied update" }),
       await authenticated(request(app).post(`/api/issues/${issueId}/comments`)).send({ body: "Denied comment" }),
@@ -185,11 +185,13 @@ describeEmbeddedPostgres("cross-issue influence limit PostgreSQL serialization",
   });
 
   it.each([
-    ["company", { company: false, agent: true, issue: true, run: true }],
-    ["agent", { company: true, agent: false, issue: true, run: true }],
-    ["issue", { company: true, agent: true, issue: false, run: true }],
-    ["run", { company: true, agent: true, issue: true, run: false }],
-  ] as const)("fails closed for a %s checkout-lock mismatch", async (_name, match) => {
+    ["company", { company: false, agent: true, issue: true, run: true }, [404, 404]],
+    ["agent", { company: true, agent: false, issue: true, run: true }, [409, 403]],
+    ["issue", { company: true, agent: true, issue: false, run: true }, [404, 404]],
+    ["run", { company: true, agent: true, issue: true, run: false }, [409, 403]],
+  ] as const)(
+    "fails closed at HTTP level for a %s checkout-lock mismatch",
+    async (_name, match, expectedStatuses) => {
     const companyId = randomUUID();
     const otherCompanyId = randomUUID();
     const agentId = randomUUID();
@@ -232,18 +234,84 @@ describeEmbeddedPostgres("cross-issue influence limit PostgreSQL serialization",
       checkoutRunId: match.run ? runId : otherRunId,
     });
 
-    await expect(observeCrossIssueInfluence(db, {
+    const app = createApp({ companyId, agentId, runId });
+    const authenticated = (call: request.Test) => call.set("X-Paperclip-Run-Id", runId);
+    const responses = [
+      await authenticated(request(app).patch(`/api/issues/${issueId}`)).send({ title: "Denied mismatch update" }),
+      await authenticated(request(app).post(`/api/issues/${issueId}/comments`)).send({ body: "Denied mismatch comment" }),
+    ];
+    expect(responses.map((response) => response.status)).toEqual(expectedStatuses);
+    for (const response of responses.filter((candidate) => candidate.status === 403)) {
+      expect(response.body.details?.code).toBe("cross_issue_influence_run_context_required");
+    }
+    expect(await db.select().from(issueComments)).toEqual([]);
+    const persistedIssue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, match.issue ? issueId : otherIssueId))
+      .then((rows) => rows[0]);
+    expect(persistedIssue?.title).toBe("Mismatched lock");
+    const persistedRun = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).then((rows) => rows[0]);
+    expect(persistedRun?.contextSnapshot).toEqual({ wakeReason: "heartbeat_timer" });
+    },
+  );
+
+  it("keeps an already-bound origin immutable despite a matching checkout lock", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const boundIssueId = randomUUID();
+    const targetIssueId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Immutable Origin Company",
+      issuePrefix: `I${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Immutable Origin Agent",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    const contextSnapshot = {
+      issueId: boundIssueId,
+      taskId: boundIssueId,
+      wakeReason: "heartbeat_timer",
+    };
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "timer",
+      status: "running",
+      contextSnapshot,
+    });
+    await db.insert(issues).values({
+      id: targetIssueId,
+      companyId,
+      title: "Matching checkout must not replace origin",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: runId,
+    });
+
+    const decision = await observeCrossIssueInfluence(db, {
       companyId,
       runId,
       agentId,
-      targetIssueId: issueId,
+      targetIssueId,
       kind: "update",
-    })).rejects.toMatchObject({
-      status: 403,
-      details: { code: "cross_issue_influence_run_context_required" },
     });
+
+    expect(decision).toMatchObject({ allowed: true, count: 1 });
     const persistedRun = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).then((rows) => rows[0]);
-    expect(persistedRun?.contextSnapshot).toEqual({ wakeReason: "heartbeat_timer" });
+    expect(persistedRun?.contextSnapshot).toEqual(contextSnapshot);
   });
 
   afterAll(async () => {
