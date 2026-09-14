@@ -38,15 +38,16 @@ export function reviewLatency(repo, pr, reviewsResult, checksResult) {
     evidence_status: "missing",
     evidence_kind: null,
   };
-  const review = reviewsResult.status === 200 ? qualifyingReview(reviewsResult.data ?? [], pr.head.sha) : null;
-  const check = checksResult.status === 200 ? qualifyingCheck(checksResult.data?.check_runs ?? []) : null;
+  const incomplete = [reviewsResult, checksResult].find((result) => result.status !== 200 || result.state !== "complete");
+  if (incomplete) return { ...base, evidence_status: evidenceState(incomplete.status) };
+  const review = qualifyingReview(reviewsResult.data, pr.head.sha);
+  const check = qualifyingCheck(checksResult.data.check_runs);
   const candidates = [
     review && { at: review.submitted_at, kind: "review", url: review.html_url ?? pr.html_url },
     check && { at: check.completed_at, kind: "check", url: check.html_url ?? pr.html_url },
   ].filter(Boolean).sort((a, b) => Date.parse(a.at) - Date.parse(b.at));
   if (candidates.length === 0) {
-    const unavailable = [reviewsResult.status, checksResult.status].find((status) => status !== 200);
-    return unavailable === undefined ? base : { ...base, evidence_status: evidenceState(unavailable) };
+    return base;
   }
   const first = candidates[0];
   const latency = durationSeconds(pr.created_at, first.at);

@@ -4,9 +4,10 @@ import test from "node:test";
 import { dependencyAdvisories, reviewLatency, staticAnalysisEvidence } from "../src/trends.mjs";
 
 const fixture = JSON.parse(readFileSync(new URL("./fixtures/complete.json", import.meta.url)));
+const incomplete = JSON.parse(readFileSync(new URL("./fixtures/incomplete.json", import.meta.url)));
 
 test("complete fixtures produce exact-head latency and measured static-analysis/advisory values", () => {
-  const latency = reviewLatency("acme/widget", fixture.pr, { status: 200, data: fixture.reviews }, { status: 200, data: fixture.checks });
+  const latency = reviewLatency("acme/widget", fixture.pr, { state: "complete", status: 200, data: fixture.reviews }, { state: "complete", status: 200, data: fixture.checks });
   assert.deepEqual(latency, {
     repository: "acme/widget", number: 42, created_at: fixture.pr.created_at, head_sha: "abc",
     first_cqe_at: "2026-09-01T10:20:00Z", latency_seconds: 1200, evidence_status: "measured",
@@ -26,7 +27,7 @@ test("complete fixtures produce exact-head latency and measured static-analysis/
 });
 
 test("denied evidence is explicit for every new lane", () => {
-  assert.equal(reviewLatency("acme/widget", fixture.pr, { status: 403 }, { status: 403 }).evidence_status, "denied");
+  assert.equal(reviewLatency("acme/widget", fixture.pr, { state: "unknown", status: 403 }, { state: "unknown", status: 403 }).evidence_status, "denied");
   const staticEvidence = staticAnalysisEvidence({ status: 403 }, new Map(), { status: 200, data: fixture.files });
   assert.equal(staticEvidence.phpstan.evidence_status, "denied");
   assert.equal(staticEvidence.phpcs.evidence_status, "denied");
@@ -34,7 +35,7 @@ test("denied evidence is explicit for every new lane", () => {
 });
 
 test("missing evidence is never treated as a measured zero by Monday trend reducers", () => {
-  const latency = reviewLatency("acme/widget", fixture.pr, { status: 200, data: [] }, { status: 200, data: { check_runs: [] } });
+  const latency = reviewLatency("acme/widget", fixture.pr, { state: "complete", status: 200, data: [] }, { state: "complete", status: 200, data: { check_runs: [] } });
   const staticEvidence = staticAnalysisEvidence({ status: 200, data: { check_runs: [] } }, new Map(), { status: 200, data: fixture.files });
   assert.equal(latency.evidence_status, "missing");
   assert.equal(latency.latency_seconds, null);
@@ -49,6 +50,25 @@ test("missing evidence is never treated as a measured zero by Monday trend reduc
     { evidence_status: "denied", changed_file_errors: null },
   ].filter((item) => item.evidence_status === "measured").map((item) => item.changed_file_errors);
   assert.deepEqual(values, [0]);
+});
+
+test("latency is non-measured unless both candidate feeds are complete", () => {
+  const validReview = { state: "complete", status: 200, data: fixture.reviews };
+  const validCheck = { state: "complete", status: 200, data: fixture.checks };
+  const cases = [
+    [incomplete.bounded_reviews, validCheck],
+    [validReview, incomplete.bounded_checks],
+    [{ state: "unknown", status: 403, data: [] }, validCheck],
+    [validReview, { state: "unknown", status: 403, data: null }],
+    [{ state: "unknown", status: 0, data: [] }, validCheck],
+    [validReview, { state: "unknown", status: 0, data: null }],
+  ];
+  for (const [reviews, checks] of cases) {
+    const latency = reviewLatency("acme/widget", fixture.pr, reviews, checks);
+    assert.notEqual(latency.evidence_status, "measured");
+    assert.equal(latency.first_cqe_at, null);
+    assert.equal(latency.latency_seconds, null);
+  }
 });
 
 test("multiple checks for one tool aggregate deterministically", () => {

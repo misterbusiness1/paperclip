@@ -32,7 +32,7 @@ export function collectDependabotAlerts(repo, gh, options) {
 export function collectCheckRuns(repo, sha, gh, options) {
   const result = collectPagedEvidence(`/repos/${repo}/commits/${sha}/check-runs`, gh, {
     ...options,
-    select: (data) => data?.check_runs ?? [],
+    select: (data) => data?.check_runs,
   });
   return { ...result, data: result.status === 200 ? { check_runs: result.data } : null };
 }
@@ -57,7 +57,7 @@ export function mergedReviewRecord(repo, pr, gh, options) {
       }
     }
   }
-  const reviewsEvidence = { status: result.status, data: result.state === "complete" ? result.reviews : [] };
+  const reviewsEvidence = { state: result.state, status: result.status, data: result.state === "complete" ? result.reviews : [] };
   return {
     number: pr.number,
     head_sha: pr.head.sha,

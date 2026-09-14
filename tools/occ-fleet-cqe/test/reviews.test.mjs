@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 import {
   collectChangedFiles,
@@ -11,6 +12,7 @@ import {
 } from "../src/reviews.mjs";
 
 const review = (id) => ({ id, state: "COMMENTED", commit_id: "head", user: { login: "someone" } });
+const incomplete = JSON.parse(readFileSync(new URL("./fixtures/incomplete.json", import.meta.url)));
 
 test("review retrieval continues beyond GitHub's default 30 records", () => {
   const endpoints = [];
@@ -43,6 +45,15 @@ test("every trend evidence lane retrieves more than 100 records completely", () 
   assert.equal(collectChangedFiles("acme/widget", 7, pagedGh((id) => ({ filename: `file-${id}.php` }))).data.length, 107);
   assert.equal(collectCheckRuns("acme/widget", "head", pagedGh((id) => ({ id }), (items) => ({ check_runs: items }))).data.check_runs.length, 107);
   assert.equal(collectCheckAnnotations("acme/widget", 11, pagedGh((id) => ({ id }))).data.length, 107);
+});
+
+test("check-run retrieval rejects malformed HTTP-200 payloads", () => {
+  for (const data of incomplete.malformed_check_payloads) {
+    const result = collectCheckRuns("acme/widget", "head", () => ({ status: 200, data }));
+    assert.deepEqual({ state: result.state, status: result.status, data: result.data }, {
+      state: "unknown", status: 0, data: null,
+    });
+  }
 });
 
 test("every trend evidence lane preserves denied and bounded semantics", () => {
