@@ -6,8 +6,9 @@ import process from "node:process";
 import { classifyDependencyAudit, classifyProtection, gapRecords } from "./classify.mjs";
 import { githubApi as gh, listInstalledRepositories } from "./github.mjs";
 import { mergedReviewRecord } from "./reviews.mjs";
+import { dependencyAdvisories } from "./trends.mjs";
 
-const SCHEMA_VERSION = "1.0.0";
+const SCHEMA_VERSION = "2.0.0";
 const args = parseArgs(process.argv.slice(2));
 const observedAt = args.observedAt ?? new Date().toISOString();
 const startedAt = new Date().toISOString();
@@ -60,6 +61,11 @@ function dependencyCoverage(repo) {
   return { ...classifyDependencyAudit({ lockStatus: denied ? 403 : 404, auditProbe: "unavailable", alertStatus: alerts.status }), evidence: "repository_vulnerability_alerts" };
 }
 
+function advisoryEvidence(repo) {
+  const response = gh(`/repos/${repo}/dependabot/alerts?state=open&per_page=100`, { allow: [401, 403, 404] });
+  return dependencyAdvisories(response);
+}
+
 function protection(repo, branch) {
   const response = gh(`/repos/${repo}/branches/${branch}/protection`, { allow: [403, 404] });
   if (response.status === 200) return classifyProtection(response.data);
@@ -90,7 +96,7 @@ try {
       if (exists.status === 403) return { name, protection: { state: "unknown", detail: "denied", contexts: [] } };
       return { name, protection: protection(repo.repository, name) };
     }).filter(Boolean);
-    const record = { ...repo, observed_at: observedAt, branches, merged_pr_reviews: mergedReviews(repo.repository), dependency_coverage: dependencyCoverage(repo.repository), collection_errors: [] };
+    const record = { ...repo, observed_at: observedAt, branches, merged_pr_reviews: mergedReviews(repo.repository), dependency_coverage: dependencyCoverage(repo.repository), dependency_advisories: advisoryEvidence(repo.repository), collection_errors: [] };
     return { ...record, proposed_owner_assignments: gapRecords(record) };
   });
 
@@ -100,7 +106,7 @@ try {
     unknowns: repositories.reduce((sum, repo) => sum + repo.proposed_owner_assignments.filter((gap) => gap.state === "unknown").length, 0),
     errors: repositories.reduce((sum, repo) => sum + repo.collection_errors.length, 0),
   };
-  const report = { schema_version: SCHEMA_VERSION, collector_sha: args.collectorSha, run_issue: args.runIssue, started_at: startedAt, completed_at: new Date().toISOString(), observed_at: observedAt, installed_repository_count: installed.length, totals, repositories };
+  const report = { schema_version: SCHEMA_VERSION, schema_id: "occ-fleet-cqe/2.0.0", collector_sha: args.collectorSha, run_issue: args.runIssue, started_at: startedAt, completed_at: new Date().toISOString(), observed_at: observedAt, installed_repository_count: installed.length, totals, repositories };
   mkdirSync(dirname(resolve(args.output)), { recursive: true });
   writeFileSync(args.output, `${JSON.stringify(report, null, 2)}\n`);
   const markdown = `# Fleet CQE coverage\n\n- Schema: ${SCHEMA_VERSION}\n- Collector SHA: \`${args.collectorSha}\`\n- Run issue: ${args.runIssue}\n- Installed repositories: ${totals.repositories}\n- Coverage gaps: ${totals.coverage_gaps}\n- Unknowns: ${totals.unknowns}\n- Collection errors: ${totals.errors}\n\nThe JSON artifact is canonical. Findings are report-only proposals; no tasks or repository settings were changed.\n`;

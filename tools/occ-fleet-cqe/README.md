@@ -23,9 +23,12 @@ The live readback captured on 2026-09-07 pins immutable routine revision `2b8da2
 
 ## Coverage semantics
 
+Schema `2.0.0` is defined by [`schema.v2.json`](schema.v2.json) and is additive over v1: existing repository, branch, review, coverage, and gap fields remain unchanged. New per-PR `cqe_latency` and `static_analysis` objects and repository-level `dependency_advisories` use explicit `measured`, `denied`, `unavailable`, `unsupported`, or `missing` evidence states. A measured zero is therefore distinct from unknown coverage, so Monday consumers can safely compute trends by including only `measured` records. No historical persistence layer is added; retained weekly artifacts remain the trend source. Existing v1 consumers may continue reading their known fields and ignore the additions; rollback is a revert to the v1 collector/schema.
+
 - Branch protection checks the default branch plus `main` and `production` when present. Required `OCC Review Bot` or `CQE` is `pass`; an accessible protection response without it is `fail`; denied access is `unknown`.
 - Up to 100 recently updated closed PRs per repository are inspected by default. Merged PR bot-review states are `approved`, `stale_head`, `non_approve`, `missing`, or `unknown`.
 - Dependency coverage passes only when a matching lockfile is present and the scheduled runtime successfully probes the corresponding audit command (`composer audit --help` or `npm audit --help`), or when the repository vulnerability-alert feed is verified enabled. Lockfiles alone never pass. Unavailable tooling and denied or disabled/unavailable alert access are `unknown`, never clean.
+- Dependency advisory evidence counts open, non-dismissed Dependabot alerts by severity. Audit-command availability alone never produces a zero advisory count.
 - Owner-assignment records are bounded by the inspected repositories/branches/PRs and keyed as `owner/name:kind:subject`. They are proposals only; v1 does not emit Paperclip or GitHub issues.
 
 Collector/runtime/schema failure, a repository count other than 38, duplicate repositories, or artifact-upload failure is operational failure and must exit non-zero. Coverage findings and explicit unknowns remain report findings and do not by themselves change the collector exit status. The scheduler must treat upload failure as non-zero because upload occurs outside this process.
