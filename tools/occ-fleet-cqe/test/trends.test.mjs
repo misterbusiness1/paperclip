@@ -50,3 +50,34 @@ test("missing evidence is never treated as a measured zero by Monday trend reduc
   ].filter((item) => item.evidence_status === "measured").map((item) => item.changed_file_errors);
   assert.deepEqual(values, [0]);
 });
+
+test("multiple checks for one tool aggregate deterministically", () => {
+  const checks = { status: 200, data: { check_runs: [
+    { id: 10, name: "PHPStan app", html_url: "https://example.test/z", output: { summary: "baseline delta: -2" } },
+    { id: 11, name: "PHPStan plugin", html_url: "https://example.test/a", output: { summary: "baseline delta: +1" } },
+  ] } };
+  const annotations = new Map([
+    [10, { status: 200, data: [{ path: "changed.php", annotation_level: "failure" }] }],
+    [11, { status: 200, data: [
+      { path: "changed.php", annotation_level: "failure" },
+      { path: "changed.php", annotation_level: "warning" },
+    ] }],
+  ]);
+  const evidence = staticAnalysisEvidence(checks, annotations, { status: 200, data: [{ filename: "changed.php" }] }).phpstan;
+  assert.deepEqual(evidence, {
+    evidence_status: "measured", error_delta: 3, changed_file_errors: 3, baseline_delta: -1,
+    check_count: 2, evidence: "https://example.test/a",
+    evidence_urls: ["https://example.test/a", "https://example.test/z"],
+  });
+});
+
+test("one incomplete same-tool check makes the aggregate non-measured", () => {
+  const checks = { status: 200, data: { check_runs: [
+    { id: 10, name: "PHPStan app" }, { id: 11, name: "PHPStan plugin" },
+  ] } };
+  const annotations = new Map([[10, { status: 200, data: [] }], [11, { status: 403 }]]);
+  const evidence = staticAnalysisEvidence(checks, annotations, { status: 200, data: [] }).phpstan;
+  assert.equal(evidence.evidence_status, "denied");
+  assert.equal(evidence.changed_file_errors, null);
+  assert.equal(evidence.check_count, 2);
+});

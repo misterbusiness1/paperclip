@@ -5,7 +5,7 @@ import { dirname, resolve } from "node:path";
 import process from "node:process";
 import { classifyDependencyAudit, classifyProtection, gapRecords } from "./classify.mjs";
 import { githubApi as gh, listInstalledRepositories } from "./github.mjs";
-import { mergedReviewRecord } from "./reviews.mjs";
+import { collectDependabotAlerts, mergedReviewRecord } from "./reviews.mjs";
 import { dependencyAdvisories } from "./trends.mjs";
 
 const SCHEMA_VERSION = "2.0.0";
@@ -62,7 +62,7 @@ function dependencyCoverage(repo) {
 }
 
 function advisoryEvidence(repo) {
-  const response = gh(`/repos/${repo}/dependabot/alerts?state=open&per_page=100`, { allow: [401, 403, 404] });
+  const response = collectDependabotAlerts(repo, gh);
   return dependencyAdvisories(response);
 }
 

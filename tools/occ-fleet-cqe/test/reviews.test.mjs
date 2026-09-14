@@ -1,6 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { collectPullReviews, mergedReviewRecord, REVIEW_PAGE_SIZE } from "../src/reviews.mjs";
+import {
+  collectChangedFiles,
+  collectCheckAnnotations,
+  collectCheckRuns,
+  collectDependabotAlerts,
+  collectPullReviews,
+  mergedReviewRecord,
+  REVIEW_PAGE_SIZE,
+} from "../src/reviews.mjs";
 
 const review = (id) => ({ id, state: "COMMENTED", commit_id: "head", user: { login: "someone" } });
 
@@ -21,6 +29,43 @@ test("review retrieval continues beyond GitHub's default 30 records", () => {
     "/repos/acme/widget/pulls/7/reviews?per_page=100&page=1",
     "/repos/acme/widget/pulls/7/reviews?per_page=100&page=2",
   ]);
+});
+
+const pageNumber = (endpoint) => Number(new URL(endpoint, "https://example.test").searchParams.get("page"));
+const pagedGh = (makeItem, wrap = (items) => items) => (endpoint) => {
+  const page = pageNumber(endpoint);
+  const count = page === 1 ? REVIEW_PAGE_SIZE : 7;
+  return { status: 200, data: wrap(Array.from({ length: count }, (_, index) => makeItem((page - 1) * REVIEW_PAGE_SIZE + index + 1))) };
+};
+
+test("every trend evidence lane retrieves more than 100 records completely", () => {
+  assert.equal(collectDependabotAlerts("acme/widget", pagedGh((id) => ({ id }))).data.length, 107);
+  assert.equal(collectChangedFiles("acme/widget", 7, pagedGh((id) => ({ filename: `file-${id}.php` }))).data.length, 107);
+  assert.equal(collectCheckRuns("acme/widget", "head", pagedGh((id) => ({ id }), (items) => ({ check_runs: items }))).data.check_runs.length, 107);
+  assert.equal(collectCheckAnnotations("acme/widget", 11, pagedGh((id) => ({ id }))).data.length, 107);
+});
+
+test("every trend evidence lane preserves denied and bounded semantics", () => {
+  const denied = () => ({ status: 403, data: null });
+  const full = (_endpoint) => ({ status: 200, data: Array.from({ length: REVIEW_PAGE_SIZE }, (_, id) => ({ id })) });
+  const fullChecks = (_endpoint) => ({ status: 200, data: { check_runs: Array.from({ length: REVIEW_PAGE_SIZE }, (_, id) => ({ id })) } });
+  for (const result of [
+    collectDependabotAlerts("acme/widget", denied),
+    collectChangedFiles("acme/widget", 7, denied),
+    collectCheckRuns("acme/widget", "head", denied),
+    collectCheckAnnotations("acme/widget", 11, denied),
+  ]) assert.deepEqual({ state: result.state, status: result.status }, { state: "unknown", status: 403 });
+  const bounded = [
+    collectDependabotAlerts("acme/widget", full, { pageLimit: 2 }),
+    collectChangedFiles("acme/widget", 7, full, { pageLimit: 2 }),
+    collectCheckRuns("acme/widget", "head", fullChecks, { pageLimit: 2 }),
+    collectCheckAnnotations("acme/widget", 11, full, { pageLimit: 2 }),
+  ];
+  for (const result of bounded) {
+    assert.equal(result.state, "bounded");
+    assert.equal(result.status, 0);
+    assert.equal(result.data === null || result.data.length === 0, true);
+  }
 });
 
 test("review retrieval is bounded and never reports truncated evidence as clean", () => {

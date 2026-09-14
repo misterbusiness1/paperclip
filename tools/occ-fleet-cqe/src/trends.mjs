@@ -79,22 +79,31 @@ export function staticAnalysisEvidence(checksResult, annotationsByCheck, changed
   }
   const changed = new Set((changedFilesResult.data ?? []).map((file) => file.filename));
   const result = { phpstan: empty("missing"), phpcs: empty("missing") };
+  const grouped = { phpstan: [], phpcs: [] };
   for (const check of checksResult.data?.check_runs ?? []) {
     const tool = toolName(check);
-    if (!tool) continue;
-    const annotations = annotationsByCheck.get(check.id);
-    if (!annotations || annotations.status !== 200) {
-      result[tool] = empty(evidenceState(annotations?.status ?? 0));
+    if (tool) grouped[tool].push(check);
+  }
+  for (const [tool, checks] of Object.entries(grouped)) {
+    if (checks.length === 0) continue;
+    const annotations = checks.map((check) => annotationsByCheck.get(check.id));
+    const incomplete = annotations.find((entry) => !entry || entry.status !== 200);
+    if (incomplete) {
+      result[tool] = { ...empty(evidenceState(incomplete?.status ?? 0)), check_count: checks.length };
       continue;
     }
-    const errors = (annotations.data ?? []).filter((item) => changed.has(item.path) && ["failure", "warning"].includes(item.annotation_level)).length;
+    const errors = annotations.reduce((sum, entry) => sum + (entry.data ?? [])
+      .filter((item) => changed.has(item.path) && ["failure", "warning"].includes(item.annotation_level)).length, 0);
+    const baselines = checks.map(baselineDelta);
+    const evidenceUrls = checks.map((check) => check.html_url).filter(Boolean).sort();
     result[tool] = {
       evidence_status: "measured",
       error_delta: errors,
       changed_file_errors: errors,
-      baseline_delta: baselineDelta(check),
-      check_count: result[tool].check_count + 1,
-      evidence: check.html_url ?? null,
+      baseline_delta: baselines.every((value) => value !== null) ? baselines.reduce((sum, value) => sum + value, 0) : null,
+      check_count: checks.length,
+      evidence: evidenceUrls[0] ?? null,
+      evidence_urls: evidenceUrls,
     };
   }
   return result;
