@@ -1,4 +1,9 @@
-import type { ApprovalStatus, ApprovalType } from "./constants.js";
+import {
+  APPROVAL_STATUSES,
+  APPROVAL_TYPES,
+  type ApprovalStatus,
+  type ApprovalType,
+} from "./constants.js";
 import type {
   ApprovalDetailV2,
   ApprovalRefundDetail,
@@ -133,6 +138,25 @@ const REPLY_SIGNAL_KEYS = [
   "incomingMessage",
 ];
 
+/** Container keys whose nested object can hold a full reply/email payload. */
+const REPLY_CONTAINER_KEYS = ["reply", "email", "message", "draft"];
+
+/**
+ * True when at least one of `containerKeys` maps to a nested object on the
+ * top-level payload. A scalar value under the same key (for example a bare
+ * requester `email` string) does not count, so this does not mis-read a
+ * non-reply payload as a reply.
+ */
+function hasNestedContainer(
+  payload: Record<string, unknown>,
+  containerKeys: string[],
+): boolean {
+  return containerKeys.some((key) => {
+    const value = payload[key];
+    return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+  });
+}
+
 /** Read `action`/`type`/`kind`/`gate`-style discriminator fields as one blob. */
 function actionSignal(payload: Record<string, unknown>): string {
   return readString(payload, [
@@ -184,7 +208,7 @@ function extractRefund(
 function extractReply(
   payload: Record<string, unknown>,
 ): ApprovalReplyDetail | null {
-  const source = withContainers(payload, ["reply", "email", "message", "draft"]);
+  const source = withContainers(payload, REPLY_CONTAINER_KEYS);
   const recipient = readString(source, [
     "recipient",
     "recipientEmail",
@@ -217,6 +241,7 @@ function extractReply(
 
   const hasReplySignal =
     REPLY_SIGNAL_KEYS.some((key) => key in payload) ||
+    hasNestedContainer(payload, REPLY_CONTAINER_KEYS) ||
     /reply|email|gate\s*b/.test(actionSignal(payload)) ||
     (recipient !== null && subject !== null);
 
@@ -323,6 +348,22 @@ function buildSummary(
  * no DB, no clock. Pass an already-redacted approval when `includePayload` is
  * requested so the attached raw payload carries no unredacted material.
  */
+/**
+ * Narrow a persisted free-text column to its enum, falling back to a safe
+ * default when the stored value is not a known member. Persisted `type`/`status`
+ * columns are plain strings, so a legacy or malformed row could otherwise emit
+ * an envelope that violates the exported `approvalDetailV2Schema`.
+ */
+function coerceEnum<T extends string>(
+  value: unknown,
+  allowed: readonly T[],
+  fallback: T,
+): T {
+  return typeof value === "string" && (allowed as readonly string[]).includes(value)
+    ? (value as T)
+    : fallback;
+}
+
 export function hydrateApprovalDetailV2(
   approval: HydratableApproval,
   options: HydrateApprovalDetailOptions = {},
@@ -337,8 +378,8 @@ export function hydrateApprovalDetailV2(
     version: APPROVAL_DETAIL_CONTRACT_VERSION,
     id: approval.id,
     companyId: approval.companyId,
-    type: approval.type as ApprovalType,
-    status: approval.status as ApprovalStatus,
+    type: coerceEnum<ApprovalType>(approval.type, APPROVAL_TYPES, "request_board_approval"),
+    status: coerceEnum<ApprovalStatus>(approval.status, APPROVAL_STATUSES, "pending"),
     requestedByAgentId: approval.requestedByAgentId,
     requestedByUserId: approval.requestedByUserId,
     decisionNote: approval.decisionNote,

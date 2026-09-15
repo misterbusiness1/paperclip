@@ -36,8 +36,10 @@ export const addApprovalCommentSchema = z.object({
 export type AddApprovalComment = z.infer<typeof addApprovalCommentSchema>;
 
 // Dates survive as `Date` in-process but serialize to ISO strings over the
-// wire, so the contract validator accepts either form.
-const dateOrIso = z.union([z.date(), z.string()]);
+// wire, so the contract validator accepts either form. The string form must be
+// a real ISO 8601 datetime (offset or `Z`), which is what `Date.toISOString()`
+// and JSON serialization produce — a bare non-datetime string is rejected.
+const dateOrIso = z.union([z.date(), z.string().datetime({ offset: true })]);
 
 export const approvalSideEffectSchema = z.object({
   kind: z.string().min(1),

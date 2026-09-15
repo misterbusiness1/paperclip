@@ -145,6 +145,38 @@ describe("hydrateApprovalDetailV2", () => {
       expect(detail.reply?.subject).toBe("Your refund");
       expect(detail.reply?.proposedMessage).toBe("It has been processed.");
     });
+
+    it("keeps a reply nested under email with no subject and no top-level signal", () => {
+      const detail = hydrateApprovalDetailV2(
+        makeApproval({
+          payload: {
+            email: {
+              to: "shopper@example.com",
+              body: "Thanks for reaching out — here is the update.",
+            },
+          },
+        }),
+      );
+      expect(detail.reply).not.toBeNull();
+      expect(detail.reply?.recipient).toBe("shopper@example.com");
+      expect(detail.reply?.subject).toBeNull();
+      expect(detail.reply?.proposedMessage).toBe(
+        "Thanks for reaching out — here is the update.",
+      );
+      const replyEffect = detail.sideEffects.find((e) => e.kind === "email_reply");
+      expect(replyEffect).toBeDefined();
+      expect(replyEffect?.target).toBe("shopper@example.com");
+    });
+
+    it("does not treat a bare scalar email field as a reply", () => {
+      const detail = hydrateApprovalDetailV2(
+        makeApproval({
+          payload: { summary: "Generic board approval", email: "requester@example.com" },
+        }),
+      );
+      expect(detail.reply).toBeNull();
+      expect(detail.sideEffects.find((e) => e.kind === "email_reply")).toBeUndefined();
+    });
   });
 
   describe("hire_agent synthetic effects", () => {
