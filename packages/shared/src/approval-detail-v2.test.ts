@@ -177,6 +177,40 @@ describe("hydrateApprovalDetailV2", () => {
       expect(detail.reply).toBeNull();
       expect(detail.sideEffects.find((e) => e.kind === "email_reply")).toBeUndefined();
     });
+
+    it("does not treat a generic nested draft with no email evidence as a reply", () => {
+      const detail = hydrateApprovalDetailV2(
+        makeApproval({
+          payload: {
+            summary: "Approve the migration plan",
+            draft: { title: "Migration plan", body: "Step 1: back up. Step 2: cut over." },
+          },
+        }),
+      );
+      expect(detail.reply).toBeNull();
+      expect(detail.sideEffects.find((e) => e.kind === "email_reply")).toBeUndefined();
+    });
+  });
+
+  describe("malformed persisted enums", () => {
+    it("falls back an unknown status to the non-actionable 'cancelled', not 'pending'", () => {
+      const detail = hydrateApprovalDetailV2(
+        makeApproval({ status: "legacy_unknown_state", payload: { title: "Legacy row" } }),
+      );
+      expect(detail.status).toBe("cancelled");
+      expect(approvalDetailV2Schema.safeParse(detail).success).toBe(true);
+    });
+
+    it("falls back an unknown type to 'request_board_approval'", () => {
+      const detail = hydrateApprovalDetailV2(
+        makeApproval({
+          type: "legacy_unknown_type" as ApprovalType,
+          payload: { title: "Legacy row" },
+        }),
+      );
+      expect(detail.type).toBe("request_board_approval");
+      expect(approvalDetailV2Schema.safeParse(detail).success).toBe(true);
+    });
   });
 
   describe("hire_agent synthetic effects", () => {

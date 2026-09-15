@@ -239,9 +239,36 @@ function extractReply(
     "text",
   ]);
 
+  // Email-specific evidence: a destination address, an explicit subject, or an
+  // explicit reply field. Generic prose fields (`body`/`text`/`message`/`draft`/
+  // `title`) do NOT count on their own, so a non-email approval such as
+  // `{ draft: { title, body } }` is not mis-read as a reply and never emits a
+  // spurious `email_reply` side effect. A bare `email` scalar (a requester
+  // address) is also excluded here — only true destination keys count.
+  const destinationRecipient = readString(source, [
+    "recipient",
+    "recipientEmail",
+    "to",
+    "toAddress",
+    "customerEmail",
+  ]);
+  const explicitSubject = readString(source, ["subject", "emailSubject"]);
+  const explicitReplyBody = readString(source, [
+    "proposedMessage",
+    "proposedReply",
+    "proposed",
+    "replyBody",
+    "responseBody",
+  ]);
+  const hasEmailEvidence =
+    destinationRecipient !== null ||
+    explicitSubject !== null ||
+    originalMessage !== null ||
+    explicitReplyBody !== null;
+
   const hasReplySignal =
     REPLY_SIGNAL_KEYS.some((key) => key in payload) ||
-    hasNestedContainer(payload, REPLY_CONTAINER_KEYS) ||
+    (hasNestedContainer(payload, REPLY_CONTAINER_KEYS) && hasEmailEvidence) ||
     /reply|email|gate\s*b/.test(actionSignal(payload)) ||
     (recipient !== null && subject !== null);
 
@@ -379,7 +406,12 @@ export function hydrateApprovalDetailV2(
     id: approval.id,
     companyId: approval.companyId,
     type: coerceEnum<ApprovalType>(approval.type, APPROVAL_TYPES, "request_board_approval"),
-    status: coerceEnum<ApprovalStatus>(approval.status, APPROVAL_STATUSES, "pending"),
+    // An unknown persisted status falls back to the terminal, non-actionable
+    // `cancelled` — never `pending`. `pending` is actionable in the review UI,
+    // but the server rejects resolving a status it does not recognize, so a
+    // malformed/legacy row would otherwise show approve/reject/revision controls
+    // that can never succeed. `cancelled` surfaces the row without live controls.
+    status: coerceEnum<ApprovalStatus>(approval.status, APPROVAL_STATUSES, "cancelled"),
     requestedByAgentId: approval.requestedByAgentId,
     requestedByUserId: approval.requestedByUserId,
     decisionNote: approval.decisionNote,
