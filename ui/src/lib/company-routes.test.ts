@@ -95,6 +95,27 @@ describe("company routes", () => {
     expect(toCompanyRelativePath("/PAP/audit")).toBe("/audit");
   });
 
+  // Regression for OXFA-31188: a bare `/approvals` deep link (e.g. from a
+  // notification or bookmark) had no unprefixed redirect route in App.tsx,
+  // so the router fell through to `:companyPrefix` and treated "approvals"
+  // as an (invalid) company prefix, rendering the 404 page.
+  it("treats /approvals routes as board routes that need a company prefix", () => {
+    expect(isBoardPathWithoutPrefix("/approvals")).toBe(true);
+    expect(isBoardPathWithoutPrefix("/approvals/pending")).toBe(true);
+    expect(isBoardPathWithoutPrefix("/approvals/all")).toBe(true);
+    expect(isBoardPathWithoutPrefix("/approvals/approval-123")).toBe(true);
+    expect(extractCompanyPrefixFromPath("/approvals")).toBeNull();
+    expect(extractCompanyPrefixFromPath("/approvals/approval-123")).toBeNull();
+    expect(applyCompanyPrefix("/approvals", "PAP")).toBe("/PAP/approvals");
+    expect(applyCompanyPrefix("/approvals/pending", "PAP")).toBe("/PAP/approvals/pending");
+    expect(applyCompanyPrefix("/approvals/approval-123", "PAP")).toBe(
+      "/PAP/approvals/approval-123",
+    );
+    expect(toCompanyRelativePath("/PAP/approvals/approval-123")).toBe(
+      "/approvals/approval-123",
+    );
+  });
+
   it("treats /tools routes as board routes that need a company prefix", () => {
     expect(isBoardPathWithoutPrefix("/tools")).toBe(true);
     expect(isBoardPathWithoutPrefix("/tools/runtime")).toBe(true);
