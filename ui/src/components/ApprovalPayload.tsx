@@ -27,6 +27,115 @@ export function approvalSubject(payload?: Record<string, unknown> | null): strin
 }
 
 /**
+ * Decision-critical metadata for the approval decision card (OXFA-2799). Every
+ * field is optional and reads defensively from the freeform payload plus the
+ * approval's own top-level columns, so the card degrades cleanly when a source
+ * (e.g. an older approval with no gate/risk) is absent.
+ */
+export interface ApprovalMeta {
+  /** Normalised gate label: "A", "B", or a free-text gate name. */
+  gate: string | null;
+  /** Normalised risk: "low" | "medium" | "high", or a free-text level. */
+  risk: string | null;
+  /** SLA descriptor, e.g. "24h SLA". */
+  slaLabel: string | null;
+  /** ISO deadline string if the payload carries one. */
+  deadline: string | null;
+  requestedByAgentId: string | null;
+  /** ISO request timestamp. */
+  requestedAt: string | null;
+  /** ISO decision timestamp, once decided. */
+  decidedAt: string | null;
+}
+
+export interface ApprovalMetaSource {
+  payload?: Record<string, unknown> | null;
+  requestedByAgentId?: string | null;
+  createdAt?: string | Date | null;
+  decidedAt?: string | Date | null;
+}
+
+function normalizeGate(value: unknown): string | null {
+  const raw = firstNonEmptyString(value);
+  if (!raw) return null;
+  const match = raw.match(/gate[\s_-]*([ab])\b/i) ?? raw.match(/^([ab])$/i);
+  return match ? match[1].toUpperCase() : raw;
+}
+
+function normalizeRisk(value: unknown): string | null {
+  const raw = firstNonEmptyString(value);
+  if (!raw) return null;
+  const lower = raw.toLowerCase();
+  if (lower.includes("high") || lower.includes("critical")) return "high";
+  if (lower.includes("med") || lower.includes("moderate")) return "medium";
+  if (lower.includes("low")) return "low";
+  return raw;
+}
+
+function toIsoOrNull(value: unknown): string | null {
+  if (value == null) return null;
+  if (value instanceof Date) return Number.isNaN(value.getTime()) ? null : value.toISOString();
+  if (typeof value === "string" || typeof value === "number") {
+    const date = new Date(value);
+    return Number.isNaN(date.getTime()) ? null : date.toISOString();
+  }
+  return null;
+}
+
+/** Extract at-a-glance metadata from an approval, degrading cleanly on missing fields. */
+export function extractApprovalMeta(source: ApprovalMetaSource): ApprovalMeta {
+  const payload = source.payload ?? {};
+  const slaHours = typeof payload.slaHours === "number" ? `${payload.slaHours}h SLA` : null;
+  return {
+    gate: normalizeGate(payload.gate ?? payload.gateType ?? payload.gateLevel),
+    risk: normalizeRisk(payload.risk ?? payload.riskLevel ?? payload.severity),
+    slaLabel: firstNonEmptyString(payload.sla, payload.slaTarget, slaHours),
+    deadline: toIsoOrNull(payload.deadline ?? payload.dueAt ?? payload.slaDueAt ?? payload.dueBy),
+    requestedByAgentId:
+      firstNonEmptyString(source.requestedByAgentId, payload.requestedByAgentId) ?? null,
+    requestedAt: toIsoOrNull(source.createdAt),
+    decidedAt: toIsoOrNull(source.decidedAt),
+  };
+}
+
+const GATE_TONE: Record<string, string> = {
+  A: "border-red-500/30 bg-red-500/10 text-red-700 dark:text-red-300",
+  B: "border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300",
+};
+
+/** Gate badge; renders nothing when the gate is unknown. */
+export function GateBadge({ gate }: { gate: string | null }) {
+  if (!gate) return null;
+  const tone = GATE_TONE[gate] ?? "border-border/70 bg-background/70 text-muted-foreground";
+  return (
+    <span
+      className={`inline-flex items-center rounded-full border px-2 py-0.5 text-(length:--text-micro) font-semibold uppercase tracking-(--tracking-label) ${tone}`}
+    >
+      Gate {gate}
+    </span>
+  );
+}
+
+const RISK_TONE: Record<string, string> = {
+  high: "border-red-500/30 bg-red-500/10 text-red-700 dark:text-red-300",
+  medium: "border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300",
+  low: "border-green-500/30 bg-green-500/10 text-green-700 dark:text-green-300",
+};
+
+/** Risk badge; renders nothing when risk is unknown. */
+export function RiskBadge({ risk }: { risk: string | null }) {
+  if (!risk) return null;
+  const tone = RISK_TONE[risk] ?? "border-border/70 bg-background/70 text-muted-foreground";
+  return (
+    <span
+      className={`inline-flex items-center rounded-full border px-2 py-0.5 text-(length:--text-micro) font-semibold uppercase tracking-(--tracking-label) ${tone}`}
+    >
+      {risk} risk
+    </span>
+  );
+}
+
+/**
  * An approval is an email reply when it carries a customer-facing body plus at least
  * one email envelope field. Kept cheap and false-positive-safe so unrelated board
  * approvals continue to render through BoardApprovalPayload untouched.
