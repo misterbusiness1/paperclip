@@ -1,4 +1,14 @@
-import { createReadStream, createWriteStream, existsSync, mkdirSync, readdirSync, statSync, unlinkSync } from "node:fs";
+import {
+  chmodSync,
+  createReadStream,
+  createWriteStream,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readdirSync,
+  statSync,
+  unlinkSync,
+} from "node:fs";
 import { basename, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { spawn } from "node:child_process";
@@ -70,6 +80,8 @@ const DEFAULT_BACKUP_WRITE_BUFFER_BYTES = 1024 * 1024;
 const BACKUP_DATA_CURSOR_ROWS = 100;
 const BACKUP_CLI_STDERR_BYTES = 64 * 1024;
 const BACKUP_BREAKPOINT_DETECT_BYTES = 64 * 1024;
+const BACKUP_DIRECTORY_MODE = 0o700;
+const BACKUP_FILE_MODE = 0o600;
 
 const STATEMENT_BREAKPOINT = "-- paperclip statement breakpoint 69f6f3f1-42fd-46a6-bf17-d1d85f8f3900";
 
@@ -105,6 +117,18 @@ function isoWeekKey(date: Date): string {
 
 function monthKey(date: Date): string {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}`;
+}
+
+export function prepareBackupDirectory(backupDir: string): void {
+  mkdirSync(backupDir, { recursive: true, mode: BACKUP_DIRECTORY_MODE });
+  chmodSync(backupDir, BACKUP_DIRECTORY_MODE);
+
+  for (const name of readdirSync(backupDir)) {
+    if (!name.endsWith(".sql") && !name.endsWith(".sql.gz")) continue;
+    const backupPath = resolve(backupDir, name);
+    if (!lstatSync(backupPath).isFile()) continue;
+    chmodSync(backupPath, BACKUP_FILE_MODE);
+  }
 }
 
 /**
@@ -341,7 +365,7 @@ async function runPgDumpBackup(opts: {
   }
 
   await Promise.all([
-    pipeline(child.stdout, createGzip(), createWriteStream(opts.backupFile)),
+    pipeline(child.stdout, createGzip(), createWriteStream(opts.backupFile, { mode: BACKUP_FILE_MODE })),
     waitForChildExit(child, pgDumpBin),
   ]);
 }
@@ -437,7 +461,7 @@ async function* readRestoreStatements(backupFile: string): AsyncGenerator<string
 }
 
 export function createBufferedTextFileWriter(filePath: string, maxBufferedBytes = DEFAULT_BACKUP_WRITE_BUFFER_BYTES) {
-  const filePromise = openFile(filePath, "w");
+  const filePromise = openFile(filePath, "w", BACKUP_FILE_MODE);
   const flushThreshold = Math.max(1, Math.trunc(maxBufferedBytes));
   let bufferedLines: string[] = [];
   let bufferedBytes = 0;
@@ -533,7 +557,7 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
     sqlClosed = true;
     await sql.end();
   };
-  mkdirSync(opts.backupDir, { recursive: true });
+  prepareBackupDirectory(opts.backupDir);
   const sqlFile = resolve(opts.backupDir, `${filenamePrefix}-${timestamp()}.sql`);
   const backupFile = `${sqlFile}.gz`;
   const writer = createBufferedTextFileWriter(sqlFile);
@@ -968,8 +992,9 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
 
     // Compress the SQL file with gzip
     const sqlReadStream = createReadStream(sqlFile);
-    const gzWriteStream = createWriteStream(backupFile);
+    const gzWriteStream = createWriteStream(backupFile, { mode: BACKUP_FILE_MODE });
     await pipeline(sqlReadStream, createGzip(), gzWriteStream);
+    chmodSync(backupFile, BACKUP_FILE_MODE);
     unlinkSync(sqlFile);
 
     const sizeBytes = statSync(backupFile).size;

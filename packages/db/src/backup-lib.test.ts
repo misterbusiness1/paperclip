@@ -4,7 +4,12 @@ import path from "node:path";
 import { gunzipSync } from "node:zlib";
 import { afterEach, describe, expect, it } from "vitest";
 import postgres from "postgres";
-import { createBufferedTextFileWriter, runDatabaseBackup, runDatabaseRestore } from "./backup-lib.js";
+import {
+  createBufferedTextFileWriter,
+  prepareBackupDirectory,
+  runDatabaseBackup,
+  runDatabaseRestore,
+} from "./backup-lib.js";
 import { ensurePostgresDatabase } from "./client.js";
 import {
   getEmbeddedPostgresTestSupport,
@@ -71,6 +76,43 @@ describe("createBufferedTextFileWriter", () => {
     await writer.close();
 
     expect(fs.readFileSync(outputPath, "utf8")).toBe(lines.join("\n"));
+    expect(fs.statSync(outputPath).mode & 0o777).toBe(0o600);
+  });
+
+  it("keeps a partial temporary backup owner-only until abort removes it", async () => {
+    const tempDir = createTempDir("paperclip-buffered-writer-abort-");
+    const outputPath = path.join(tempDir, "partial.sql");
+    const writer = createBufferedTextFileWriter(outputPath);
+
+    writer.emit("BEGIN;");
+    await writer.drain();
+
+    expect(fs.statSync(outputPath).mode & 0o777).toBe(0o600);
+
+    await writer.abort();
+
+    expect(fs.existsSync(outputPath)).toBe(false);
+  });
+});
+
+describe("prepareBackupDirectory", () => {
+  it("enforces owner-only modes for the directory and existing backup artifacts", () => {
+    const parentDir = createTempDir("paperclip-backup-permissions-");
+    const backupDir = path.join(parentDir, "backups");
+    fs.mkdirSync(backupDir, { mode: 0o755 });
+    const sqlFile = path.join(backupDir, "paperclip-old.sql");
+    const gzipFile = path.join(backupDir, "paperclip-old.sql.gz");
+    const unrelatedFile = path.join(backupDir, "notes.txt");
+    fs.writeFileSync(sqlFile, "sql", { mode: 0o644 });
+    fs.writeFileSync(gzipFile, "gzip", { mode: 0o664 });
+    fs.writeFileSync(unrelatedFile, "notes", { mode: 0o644 });
+
+    prepareBackupDirectory(backupDir);
+
+    expect(fs.statSync(backupDir).mode & 0o777).toBe(0o700);
+    expect(fs.statSync(sqlFile).mode & 0o777).toBe(0o600);
+    expect(fs.statSync(gzipFile).mode & 0o777).toBe(0o600);
+    expect(fs.statSync(unrelatedFile).mode & 0o777).toBe(0o644);
   });
 });
 
@@ -134,6 +176,8 @@ describeEmbeddedPostgres("runDatabaseBackup", () => {
         expect(result.backupFile).toMatch(/paperclip-test-.*\.sql\.gz$/);
         expect(result.sizeBytes).toBeGreaterThan(0);
         expect(fs.existsSync(result.backupFile)).toBe(true);
+        expect(fs.statSync(backupDir).mode & 0o777).toBe(0o700);
+        expect(fs.statSync(result.backupFile).mode & 0o777).toBe(0o600);
 
         await runDatabaseRestore({
           connectionString: restoreConnectionString,

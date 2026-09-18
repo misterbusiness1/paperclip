@@ -655,6 +655,10 @@ schemas. Defaults:
 - retain 30 days
 - backup dir: `~/.paperclip/instances/default/data/backups`
 
+The backup runner enforces owner-only permissions on the backup directory (`0700`)
+and on both in-progress and completed SQL backup artifacts (`0600`). Each run also
+normalizes existing `.sql` and `.sql.gz` artifacts in the configured directory.
+
 Configure these in:
 
 ```sh
