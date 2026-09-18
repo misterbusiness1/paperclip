@@ -3,7 +3,12 @@
 import { act } from "react";
 import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { ApprovalPayloadRenderer, approvalLabel, isEmailReplyPayload } from "./ApprovalPayload";
+import {
+  ApprovalPayloadRenderer,
+  approvalLabel,
+  isEmailReplyPayload,
+  extractApprovalMeta,
+} from "./ApprovalPayload";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
@@ -15,6 +20,41 @@ describe("approvalLabel", () => {
         title: "Reply with an ASCII frog",
       }),
     ).toBe("Board Approval: Reply with an ASCII frog");
+  });
+});
+
+describe("extractApprovalMeta", () => {
+  it("normalises gate and risk from assorted payload spellings", () => {
+    expect(extractApprovalMeta({ payload: { gate: "Gate A" } }).gate).toBe("A");
+    expect(extractApprovalMeta({ payload: { gate: "b" } }).gate).toBe("B");
+    expect(extractApprovalMeta({ payload: { riskLevel: "HIGH risk" } }).risk).toBe("high");
+    expect(extractApprovalMeta({ payload: { severity: "moderate" } }).risk).toBe("medium");
+  });
+
+  it("builds an SLA label from slaHours and reads deadlines/timestamps", () => {
+    const meta = extractApprovalMeta({
+      payload: { slaHours: 24, dueAt: "2026-09-18T00:00:00.000Z" },
+      requestedByAgentId: "agent-1",
+      createdAt: "2026-09-17T00:00:00.000Z",
+      decidedAt: null,
+    });
+    expect(meta.slaLabel).toBe("24h SLA");
+    expect(meta.deadline).toBe("2026-09-18T00:00:00.000Z");
+    expect(meta.requestedAt).toBe("2026-09-17T00:00:00.000Z");
+    expect(meta.requestedByAgentId).toBe("agent-1");
+    expect(meta.decidedAt).toBeNull();
+  });
+
+  it("degrades cleanly to nulls when no metadata is present", () => {
+    expect(extractApprovalMeta({ payload: {} })).toEqual({
+      gate: null,
+      risk: null,
+      slaLabel: null,
+      deadline: null,
+      requestedByAgentId: null,
+      requestedAt: null,
+      decidedAt: null,
+    });
   });
 });
 
