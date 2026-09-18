@@ -114,6 +114,7 @@ import {
   SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY,
   SUCCESSFUL_RUN_MISSING_STATE_REASON,
 } from "../services/recovery/index.ts";
+import { PROVIDER_QUOTA_RECOVERY_MAX_ATTEMPTS } from "../services/recovery/service.ts";
 import {
   UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON,
   UNMANAGED_BACKGROUND_TASK_STOP_REASON,
@@ -5521,6 +5522,139 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         await waitForRunToSettle(heartbeat, row.id);
       }
     }
+  });
+
+  // OXFA-31266: the FRA quota storm was driven by this path falling back to
+  // "now + 1 hour" instead of the provider's real (multi-day-out) reset
+  // time, then rescheduling that wrong retry forever because the monitor
+  // had no attempt ceiling.
+  it("schedules provider-quota recovery at the parsed provider reset time with a bounded monitor instead of retrying immediately (OXFA-31266)", async () => {
+    const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      runErrorCode: "provider_quota",
+      // Verbatim (minus the ellipsis) from the FRA run stdout in OXFA-31266.
+      runError: "You've hit your usage limit for GPT-5. Try again at Sep 15th, 2026 1:24 AM.",
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.providerQuotaMonitored).toBe(1);
+    expect(result.escalated).toBe(0);
+    expect(result.issueIds).toEqual([issueId]);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("in_progress");
+    expect(issue?.monitorNextCheckAt).toEqual(new Date("2026-09-15T01:24:00.000Z"));
+    const monitor = (issue?.executionPolicy as Record<string, unknown> | null)?.monitor as
+      | Record<string, unknown>
+      | undefined;
+    expect(monitor).toMatchObject({
+      nextCheckAt: "2026-09-15T01:24:00.000Z",
+      maxAttempts: PROVIDER_QUOTA_RECOVERY_MAX_ATTEMPTS,
+    });
+    expect(monitor?.maxAttempts).not.toBeNull();
+
+    // Zero runs created before the single deferred retry: the only
+    // heartbeatRuns row for this agent is still the original failure.
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs.map((row) => row.id)).toEqual([runId]);
+
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(0);
+    void companyId;
+  });
+
+  // Simulates a permanently-failing quota chain (e.g. the provider never
+  // clears) to prove the continuation-retry path stops rescheduling once
+  // it hits PROVIDER_QUOTA_RECOVERY_MAX_ATTEMPTS instead of retrying
+  // forever like the pre-fix "3/chain + unbounded wait_recovery" behavior.
+  it("escalates a permanently failing provider-quota continuation chain instead of retrying forever (OXFA-31266)", async () => {
+    // errorCode "adapter_failed" + "rate limit" text is classified as
+    // provider_quota by isProviderQuotaRecovery() but NOT by
+    // classifyAdapterFailureForRecovery()'s narrower quota-text match, so
+    // this exercises classifyContinuationFailure's provider_quota branch
+    // (the exact TRANSIENT_INFRA_CONTINUATION_ERROR_CODES path named in
+    // OXFA-31266) rather than the issue-level monitor path covered above.
+    const rateLimitedError = "Upstream provider responded 429: you have been rate limited, please retry later.";
+    const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      retryReason: "issue_continuation_needed",
+      runErrorCode: "adapter_failed",
+      runError: rateLimitedError,
+    });
+
+    // Backfill consecutive prior continuation-retry failures so the bounded
+    // cap (PROVIDER_QUOTA_RECOVERY_MAX_ATTEMPTS) is reached by the latest run.
+    const olderTimestamps = Array.from(
+      { length: PROVIDER_QUOTA_RECOVERY_MAX_ATTEMPTS - 1 },
+      (_, index) => new Date(new Date("2026-03-18T23:00:00.000Z").getTime() + index * 5 * 60_000),
+    );
+    for (const finishedAt of olderTimestamps) {
+      await db.insert(heartbeatRuns).values({
+        id: randomUUID(),
+        companyId,
+        agentId,
+        invocationSource: "automation",
+        triggerDetail: "system",
+        status: "failed",
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "issue_continuation_needed",
+          retryReason: "issue_continuation_needed",
+          source: "issue.continuation_recovery",
+        },
+        errorCode: "adapter_failed",
+        error: rateLimitedError,
+        startedAt: finishedAt,
+        finishedAt,
+        createdAt: finishedAt,
+        updatedAt: finishedAt,
+      });
+    }
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.continuationRequeued).toBe(0);
+    expect(result.providerQuotaMonitored).toBe(0);
+    expect(result.escalated).toBe(1);
+    expect(result.issueIds).toEqual([issueId]);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("blocked");
+
+    // The chain must actually stop: no scheduled_retry wait_recovery run
+    // was created for this quota-exhausted chain.
+    const scheduledRetryRuns = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.status, "scheduled_retry")));
+    expect(scheduledRetryRuns).toHaveLength(0);
+
+    const recoveryAction = await db
+      .select({
+        cause: issueRecoveryActions.cause,
+        maxAttempts: issueRecoveryActions.maxAttempts,
+        monitorPolicy: issueRecoveryActions.monitorPolicy,
+      })
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(recoveryAction).toMatchObject({ cause: "provider_quota" });
+    expect(recoveryAction?.maxAttempts).not.toBeNull();
+    // The wait_recovery policy is recorded, but no scheduled_runId was ever
+    // attached because suppressProviderQuotaWait stopped it from actually
+    // being scheduled (see the scheduledRetryRuns assertion above).
+    expect(
+      (recoveryAction?.monitorPolicy as Record<string, unknown> | null)?.scheduledRunId,
+    ).toBeUndefined();
+
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments.length).toBeGreaterThan(0);
+    expect(comments[0]?.body).toContain(`${PROVIDER_QUOTA_RECOVERY_MAX_ATTEMPTS}× consecutive provider-quota failures`);
+    void runId;
   });
 
   it("leaves the productive-but-stranded continuation path unchanged under the new classifier", async () => {

@@ -1,10 +1,28 @@
 import { describe, expect, it } from "vitest";
 import {
   PROVIDER_QUOTA_RECOVERY_DEFAULT_BACKOFF_MS,
+  PROVIDER_QUOTA_RECOVERY_MAX_ATTEMPTS,
   classifyAdapterFailureForRecovery,
+  classifyContinuationFailure,
 } from "./service.js";
 
 describe("classifyAdapterFailureForRecovery", () => {
+  it("parses the exact Codex usage-limit reset date (OXFA-31266)", () => {
+    // Verbatim from the FRA run stdout that triggered the OXFA-31266 storm.
+    const now = new Date("2026-09-10T19:05:25.000Z");
+    const classification = classifyAdapterFailureForRecovery({
+      errorCode: "provider_quota",
+      error: "You've hit your usage limit … try again at Sep 15th, 2026 1:24 AM",
+      resultJson: null,
+    }, now);
+
+    expect(classification).toEqual({
+      kind: "provider_quota",
+      retryAt: new Date("2026-09-15T01:24:00.000Z"),
+      parsedResetTime: true,
+    });
+  });
+
   it("classifies usage-limit messages and parses the provider reset time", () => {
     const now = new Date("2026-07-15T20:00:00.000Z");
     const classification = classifyAdapterFailureForRecovery({
@@ -91,5 +109,53 @@ describe("classifyAdapterFailureForRecovery", () => {
       error: "Workspace storage capacity limit reached.",
       resultJson: null,
     })).toBeNull();
+  });
+});
+
+describe("classifyContinuationFailure", () => {
+  it("defers provider_quota to the parsed reset time instead of the flat transient cap (OXFA-31266)", () => {
+    const now = new Date("2026-09-10T19:05:25.000Z");
+    const classification = classifyContinuationFailure({
+      id: "run-1",
+      agentId: "agent-1",
+      status: "failed",
+      error: "You've hit your usage limit … try again at Sep 15th, 2026 1:24 AM",
+      errorCode: "provider_quota",
+      contextSnapshot: {},
+      livenessState: null,
+      resultJson: null,
+    }, now);
+
+    expect(classification.kind).toBe("provider_quota");
+    expect(classification.maxAttempts).toBe(PROVIDER_QUOTA_RECOVERY_MAX_ATTEMPTS);
+    expect(classification.maxAttempts).not.toBe(3);
+    expect(classification.retryAt).toEqual(new Date("2026-09-15T01:24:00.000Z"));
+    expect(classification.parsedResetTime).toBe(true);
+  });
+
+  it("still treats adapter_failed/timeout as a 3x transient cap (unchanged behaviour)", () => {
+    const timeout = classifyContinuationFailure({
+      id: "run-2",
+      agentId: "agent-1",
+      status: "failed",
+      error: "request timed out",
+      errorCode: "timeout",
+      contextSnapshot: {},
+      livenessState: null,
+      resultJson: null,
+    });
+    expect(timeout).toMatchObject({ kind: "transient_infra", maxAttempts: 3, errorCode: "timeout" });
+
+    const adapterFailed = classifyContinuationFailure({
+      id: "run-3",
+      agentId: "agent-1",
+      status: "failed",
+      error: "ssh: connection reset",
+      errorCode: "adapter_failed",
+      contextSnapshot: {},
+      livenessState: null,
+      resultJson: null,
+    });
+    expect(adapterFailed).toMatchObject({ kind: "transient_infra", maxAttempts: 3, errorCode: "adapter_failed" });
   });
 });

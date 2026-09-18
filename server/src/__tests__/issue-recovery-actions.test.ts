@@ -25,7 +25,7 @@ import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import { buildPaperclipWakePayload } from "../services/heartbeat.js";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
-import { recoveryService } from "../services/recovery/service.js";
+import { PROVIDER_QUOTA_RECOVERY_MAX_ATTEMPTS, recoveryService } from "../services/recovery/service.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -413,7 +413,9 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       monitor: {
         serviceName: "AI provider quota",
         externalRef: runId,
-        maxAttempts: null,
+        // OXFA-31266: bounded so a permanently-exhausted quota stops
+        // rescheduling instead of retrying forever.
+        maxAttempts: PROVIDER_QUOTA_RECOVERY_MAX_ATTEMPTS,
         recoveryPolicy: "wake_owner",
       },
     });
@@ -452,7 +454,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     const [updatedIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
     expect(updatedIssue?.executionPolicy).toMatchObject({
       monitor: {
-        maxAttempts: null,
+        maxAttempts: PROVIDER_QUOTA_RECOVERY_MAX_ATTEMPTS,
         externalRef: runId,
       },
     });
