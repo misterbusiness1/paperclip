@@ -11204,9 +11204,18 @@ export function issueService(db: Db) {
             // ("claimed"), so it must not admit a move into review: the route guard
             // never counts it, and otherwise a blocker that completes between the
             // route guard and this check would leave the issue parked with no path.
-            // An issue that is already in review keeps the earlier, wider rule.
-            const movesIntoReview = existing.status !== "in_review";
+            // An issue that is already in review keeps the earlier, wider rule. The status
+            // is read from the row locked by this transaction, not from the earlier read.
+            const movesIntoReview = receiptExisting.status !== "in_review";
+            // The route guard admits a move into review for a conversation (run
+            // finalization owns its waiting state) and for an issue with a monitor
+            // check time, also one that is due. A blocker list must not change that.
+            const hasRouteAdmittedPath =
+              movesIntoReview &&
+              (Boolean(updated.conversationAgentId && updated.conversationUserId) ||
+                updated.monitorNextCheckAt != null);
             const hasDurableAlternatePath =
+              hasRouteAdmittedPath ||
               reviewAttention
                 .get(updated.id)
                 ?.paths.some(

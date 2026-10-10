@@ -5022,6 +5022,38 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
         await db.delete(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, seeded.companyId));
       });
 
+      it("is accepted on a move into review when the issue has a monitor check time that is due", async () => {
+        const seeded = await seedResolvedBlockerHandoff(blockerStatus);
+        await db.update(issues)
+          .set({ monitorNextCheckAt: new Date(Date.now() - 60_000) })
+          .where(eq(issues.id, seeded.dependentId));
+
+        const updated = await svc.update(seeded.dependentId, {
+          status: "in_review",
+          blockedByIssueIds: [seeded.blockerId],
+          actorAgentId: seeded.assigneeAgentId,
+        });
+
+        expect(updated?.status).toBe("in_review");
+        await expectResolvedBlockerHandoffStored(seeded.dependentId, seeded.blockerId);
+      });
+
+      it("is accepted on a move into review when the issue is a conversation", async () => {
+        const seeded = await seedResolvedBlockerHandoff(blockerStatus);
+        await db.update(issues)
+          .set({ conversationAgentId: seeded.assigneeAgentId, conversationUserId: "conversation-user", conversationState: "active" })
+          .where(eq(issues.id, seeded.dependentId));
+
+        const updated = await svc.update(seeded.dependentId, {
+          status: "in_review",
+          blockedByIssueIds: [seeded.blockerId],
+          actorAgentId: seeded.assigneeAgentId,
+        });
+
+        expect(updated?.status).toBe("in_review");
+        await expectResolvedBlockerHandoffStored(seeded.dependentId, seeded.blockerId);
+      });
+
       it("is accepted when a pending interaction waits on the issue", async () => {
         const seeded = await seedResolvedBlockerHandoff(blockerStatus);
         await db.insert(issueThreadInteractions).values({
