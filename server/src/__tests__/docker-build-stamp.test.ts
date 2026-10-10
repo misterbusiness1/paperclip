@@ -70,8 +70,10 @@ describe("docker build-stamp wiring", () => {
 
   it("passes PAPERCLIP_BUILD_COMMIT as a build-arg for standard and explicit preview builds", () => {
     for (const [name, source] of [["standard", workflow], ["preview", previewWorkflow]]) {
+      // Fork (#172): docker.yml stamps the resolved source commit, which is
+      // github.sha on push and the requested exact commit on a manual dispatch.
       expect(source, `${name} must pass the source commit into the image build`)
-        .toMatch(/^\s*PAPERCLIP_BUILD_COMMIT=\$\{\{ (?:github.sha|inputs.source_ref) \}\}$/m);
+        .toMatch(/^\s*PAPERCLIP_BUILD_COMMIT=\$\{\{ (?:github.sha|inputs.source_ref|steps.image-inputs.outputs.source_sha) \}\}$/m);
     }
   });
 });
