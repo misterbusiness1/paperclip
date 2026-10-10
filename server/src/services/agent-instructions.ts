@@ -506,8 +506,19 @@ export function agentInstructionsService(db?: Db) {
     agent: AgentLike,
   ): Promise<InstructionsBundleBinding | null> {
     const derived = deriveBundleState(agent);
-    const recovered = await recoverManagedBundleState(agent, derived);
     const managedRootPath = resolveManagedInstructionsRoot(agent);
+    // Upstream #14420 keeps a configured entry file even when it is not on
+    // disk (it may live in the agent file store). An entry configured under a
+    // stale managed root names another bundle's file, so recover it from the
+    // managed root on disk instead (fork #83).
+    const staleManagedRoot = derived.mode === "managed"
+      && Boolean(derived.rootPath)
+      && path.resolve(derived.rootPath!) !== managedRootPath;
+    const { [ENTRY_KEY]: _staleEntry, ...configWithoutEntry } = derived.config;
+    const recovered = await recoverManagedBundleState(
+      agent,
+      staleManagedRoot ? { ...derived, config: configWithoutEntry } : derived,
+    );
     if (
       !recovered.mode
       || !recovered.rootPath
