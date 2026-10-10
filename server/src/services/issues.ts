@@ -1972,6 +1972,7 @@ type IssueSubtreeDiagnosticsActivityResultRow =
 export type IssueDependencyReadiness = {
   issueId: string;
   blockerIssueIds: string[];
+  blockerGenerations: Array<{ issueId: string; completedAt: Date | null }>;
   unresolvedBlockerIssueIds: string[];
   unresolvedBlockerCount: number;
   /** Blockers whose status is `done` but whose execution workspace has not yet finalized. */
@@ -2272,6 +2273,7 @@ function createIssueDependencyReadiness(
   return {
     issueId,
     blockerIssueIds: [],
+    blockerGenerations: [],
     unresolvedBlockerIssueIds: [],
     unresolvedBlockerCount: 0,
     pendingFinalizeBlockerIssueIds: [],
@@ -2549,6 +2551,7 @@ async function listIssueDependencyReadinessMap(
       issueId: issueRelations.relatedIssueId,
       blockerIssueId: issueRelations.issueId,
       blockerStatus: issues.status,
+      blockerCompletedAt: issues.completedAt,
       blockerExecutionWorkspaceId: issues.executionWorkspaceId,
     })
     .from(issueRelations)
@@ -2588,6 +2591,10 @@ async function listIssueDependencyReadinessMap(
       readinessMap.get(row.issueId) ??
       createIssueDependencyReadiness(row.issueId);
     current.blockerIssueIds.push(row.blockerIssueId);
+    current.blockerGenerations.push({
+      issueId: row.blockerIssueId,
+      completedAt: row.blockerCompletedAt,
+    });
     // Only done blockers resolve dependents; cancelled blockers stay unresolved
     // until an operator removes or replaces the blocker relationship explicitly.
     if (row.blockerStatus !== "done") {
@@ -9161,6 +9168,7 @@ export function issueService(db: Db) {
           id: candidate.id,
           assigneeAgentId: candidate.assigneeAgentId!,
           blockerIssueIds: readiness.blockerIssueIds,
+          blockerGenerations: readiness.blockerGenerations,
           blockedTransitionAt: candidate.blockedTransitionAt,
         }));
     },

@@ -296,8 +296,9 @@ describe("automatic readiness wakes while an interaction is pending", () => {
       .toBe("skipped");
   });
 
-  it("executes once when the final blocker resolves during its due-monitor turn", async () => {
+  it("delivers a same-blocker cycle created during its due-monitor turn exactly once", async () => {
     const f = await seed({ interactionStatus: "answered" });
+    const svc = issueService(db);
     const gate = deferred<void>();
     adapterState.gate = gate.promise;
     await scheduleFutureMonitor(f);
@@ -306,10 +307,8 @@ describe("automatic readiness wakes while an interaction is pending", () => {
       status: "in_review",
       monitorNextCheckAt: dueAt,
     }).where(eq(issues.id, f.issueId));
-    await db.update(issues).set({ status: "in_progress" })
-      .where(eq(issues.id, f.blockerId));
-    await db.update(issues).set({ status: "done" })
-      .where(eq(issues.id, f.blockerId));
+    await svc.update(f.blockerId, { status: "todo" });
+    await svc.update(f.blockerId, { status: "done" });
 
     expect(await heartbeat.triggerIssueMonitor(f.issueId, {
       actorType: "system",
@@ -326,11 +325,17 @@ describe("automatic readiness wakes while an interaction is pending", () => {
     // unrelated review-path repair.
     await db.update(issues).set({ status: "in_progress" })
       .where(eq(issues.id, f.issueId));
-    const dependencyWake = heartbeat.wakeup(
-      f.agentId,
-      options(f, "issue_blockers_resolved"),
-    );
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    const generationBefore = await svc.getById(f.blockerId);
+    await svc.update(f.blockerId, { status: "todo" });
+    const generationBetween = await svc.getById(f.blockerId);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    await svc.update(f.blockerId, { status: "done" });
+    const generationAfter = await svc.getById(f.blockerId);
+    expect(generationBefore?.completedAt).toBeInstanceOf(Date);
+    expect(generationBetween?.completedAt).toBeNull();
+    expect(generationAfter?.completedAt).toBeInstanceOf(Date);
+    expect(generationAfter?.completedAt?.toISOString())
+      .not.toBe(generationBefore?.completedAt?.toISOString());
     const beforeRelease = await db.select().from(heartbeatRuns)
       .where(eq(heartbeatRuns.companyId, f.companyId));
     expect(beforeRelease.map((run) => ({
@@ -339,7 +344,6 @@ describe("automatic readiness wakes while an interaction is pending", () => {
     }))).toEqual([{ status: "running", wakeReason: "issue_monitor_due" }]);
 
     gate.resolve();
-    expect(await dependencyWake).not.toBeNull();
     await heartbeat.drainActiveRunExecutions();
     const finalRuns = await db.select().from(heartbeatRuns)
       .where(eq(heartbeatRuns.companyId, f.companyId));
@@ -351,36 +355,19 @@ describe("automatic readiness wakes while an interaction is pending", () => {
     expect(adapterState.sideEffects).toBe(1);
     expect(finalRuns).toHaveLength(1);
 
+    await db.update(issues).set({ status: "in_review" })
+      .where(eq(issues.id, f.issueId));
     await heartbeat.reconcileResolvedDependencyWakes({ companyId: f.companyId });
-    await heartbeat.reconcileResolvedDependencyWakes({ companyId: f.companyId });
+    await db.update(issues).set({ status: "in_progress" })
+      .where(eq(issues.id, f.issueId));
     await heartbeat.drainActiveRunExecutions();
     const reconciledRuns = await db.select().from(heartbeatRuns)
       .where(eq(heartbeatRuns.companyId, f.companyId));
-    expect(reconciledRuns).toHaveLength(1);
-    expect(execute).toHaveBeenCalledTimes(1);
-    expect(adapterState.sideEffects).toBe(1);
-
-    const freshBlockerId = randomUUID();
-    const freshCycle = new Date();
-    await db.insert(issues).values({
-      id: freshBlockerId,
-      companyId: f.companyId,
-      title: "Fresh blocker generation",
-      status: "todo",
-      priority: "medium",
-    });
-    await db.insert(issueRelations).values({
-      companyId: f.companyId,
-      issueId: freshBlockerId,
-      relatedIssueId: f.issueId,
-      type: "blocks",
-    });
-    await db.update(issues).set({
-      status: "blocked",
-      blockedTransitionAt: freshCycle,
-    }).where(eq(issues.id, f.issueId));
-    await db.update(issues).set({ status: "done" })
-      .where(eq(issues.id, freshBlockerId));
+    expect(reconciledRuns).toHaveLength(2);
+    expect(execute).toHaveBeenCalledTimes(2);
+    expect(adapterState.sideEffects).toBe(2);
+    await db.update(issues).set({ status: "in_review" })
+      .where(eq(issues.id, f.issueId));
     await heartbeat.reconcileResolvedDependencyWakes({ companyId: f.companyId });
     await heartbeat.drainActiveRunExecutions();
     expect(execute).toHaveBeenCalledTimes(2);
@@ -400,10 +387,12 @@ describe("automatic readiness wakes while an interaction is pending", () => {
     });
     await db.update(issues).set({
       assigneeAgentId: successorAgentId,
-      status: "blocked",
+      status: "in_review",
     })
       .where(eq(issues.id, f.issueId));
     await heartbeat.reconcileResolvedDependencyWakes({ companyId: f.companyId });
+    await db.update(issues).set({ status: "in_progress" })
+      .where(eq(issues.id, f.issueId));
     await heartbeat.drainActiveRunExecutions();
     expect(execute).toHaveBeenCalledTimes(3);
     expect(adapterState.sideEffects).toBe(3);

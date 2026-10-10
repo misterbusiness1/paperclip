@@ -6980,7 +6980,17 @@ export function shouldQueueFollowupForRunningIssueWake(input: {
     wakeReason === ISSUE_BLOCKERS_RESOLVED_WAKE_REASON &&
     runningWakeReason === "issue_monitor_due"
   ) {
-    return false;
+    const incomingGeneration = readNonEmptyString(
+      input.contextSnapshot?.dependencyReadyStateKey,
+    );
+    const runningGeneration = readNonEmptyString(
+      input.runningContextSnapshot?.dependencyReadyStateKey,
+    );
+    return Boolean(
+      incomingGeneration &&
+      runningGeneration &&
+      incomingGeneration !== runningGeneration,
+    );
   }
   return Boolean(
     wakeReason && RUNNING_ISSUE_WAKE_REASONS_REQUIRING_FOLLOWUP.has(wakeReason),
@@ -11623,6 +11633,7 @@ export function heartbeatService(
         ? buildIssueBlockersResolvedWakeStateKey({
             dependentIssueId: claimed.id,
             blockerIssueIds: dependencyReadiness.blockerIssueIds,
+            blockerGenerations: dependencyReadiness.blockerGenerations,
             blockedTransitionAt: claimed.blockedTransitionAt,
           })
         : null;
