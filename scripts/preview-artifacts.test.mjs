@@ -231,10 +231,10 @@ test("cloud builds start per commit and preserve tag promotion dependencies", ()
   assert.match(readiness, /uses: \.\/\.github\/workflows\/docker-cloud.yml/);
   assert.doesNotMatch(cloud, /^  push:/m);
   assert.match(cloud, /workflow_call:/);
-  assert.match(cloud, /group: docker-cloud-\$\{\{ github.sha \}\}/);
+  assert.match(cloud, /group: docker-cloud-\$\{\{ inputs.source_ref \|\| github.sha \}\}/);
   assert.match(cloud, /cancel-in-progress: false/);
   assert.doesNotMatch(cloud, /uses: .*@v\d\b/);
-  assert.match(cloud, /cache-to: type=registry,ref=ghcr.io\/\$\{\{ github.repository \}\}:buildcache-cloud-\$\{\{ github.sha \}\},mode=max/);
+  assert.match(cloud, /cache-to: type=registry,ref=\$\{\{ steps.image-inputs.outputs.image_repository \}\}:buildcache-cloud-\$\{\{ steps.image-inputs.outputs.source_sha \}\},mode=max/);
   const caller = docker.split("  build-and-push-cloud:")[1].split("  promote_canary_channel:")[0];
   assert.match(caller, /if: github.event_name != 'push' \|\| github.ref != 'refs\/heads\/master'/);
   assert.match(caller, /uses: .\/.github\/workflows\/docker-cloud.yml/);
@@ -252,7 +252,7 @@ test("cloud builds bake the managed runtime identity and verify it before public
   assert.ok(verify > workflow.indexOf("      - name: Verify the pushed image resolves the declared Sentry version"));
   assert.ok(verify < workflow.indexOf("      - name: Publish verified full-SHA cloud tag"));
   const step = workflow.slice(verify).split("\n      - name:")[0];
-  assert.match(step, /IMAGE: ghcr.io\/\$\{\{ github.repository \}\}@\$\{\{ steps.build-cloud.outputs.digest \}\}/);
+  assert.match(step, /IMAGE: \$\{\{ steps.image-inputs.outputs.image_repository \}\}@\$\{\{ steps.build-cloud.outputs.digest \}\}/);
   assert.doesNotMatch(step, /continue-on-error:|if:/);
   assert.ok(step.indexOf('--entrypoint sh "$IMAGE"') < step.indexOf('-e USER_UID=1001 -e USER_GID=1001'));
   for (const flag of ["u", "g"]) {
@@ -316,12 +316,13 @@ test("normal cloud builds publish the checked digest only when source and platfo
   const publish = cloud.indexOf("      - name: Publish verified full-SHA cloud tag");
   assert.ok(verify >= 0 && publish > verify);
   const verification = cloud.slice(verify, publish);
-  assert.match(verification, /IMAGE: ghcr.io\/\$\{\{ github.repository \}\}@\$\{\{ steps.build-cloud.outputs.digest \}\}/);
+  assert.match(verification, /IMAGE: \$\{\{ steps.image-inputs.outputs.image_repository \}\}@\$\{\{ steps.build-cloud.outputs.digest \}\}/);
   assert.doesNotMatch(verification, /continue-on-error:|if: always\(/);
   const step = cloud.slice(publish).split(/\n(?:  #|      - name:)/)[0];
   assert.doesNotMatch(step, /continue-on-error:|if:/);
-  assert.match(step, /FULL_SHA_TAG: ghcr.io\/\$\{\{ github.repository \}\}:sha-\$\{\{ github.sha \}\}-cloud/);
-  const script = step.split("        run: |\n")[1].split("\n").map((line) => line.replace(/^ {10}/, "")).join("\n");
+  assert.match(step, /FULL_SHA_TAG: \$\{\{ steps.image-inputs.outputs.image_repository \}\}:sha-\$\{\{ steps.image-inputs.outputs.source_sha \}\}-cloud/);
+  const script = step.split("        run: |\n")[1].split("\n").map((line) => line.replace(/^ {10}/, "")).join("\n")
+    .replaceAll("${{ steps.image-inputs.outputs.source_sha }}", "$GITHUB_SHA");
   const dir = mkdtempSync(path.join(tmpdir(), "cloud-tag-test-"));
   const image = `ghcr.io/paperclipai/paperclip@sha256:${"b".repeat(64)}`;
   const tag = `ghcr.io/paperclipai/paperclip:sha-${sha}-cloud`;
