@@ -1,9 +1,11 @@
-import { publishRuntimeSkillSnapshot, resolvePublishedRuntimeSkillSnapshot } from "./skill-runtime-snapshot.js";
+import { resolvePublishedRuntimeSkillSnapshot } from "./skill-runtime-snapshot.js";
 import { logger } from "../middleware/logger.js";
 import { removeRuntimeSkillCache, resolveRuntimeSkillCache, runtimeSkillCacheSpec } from "./runtime-skill-cache.js";
 import { createHash, randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
+import os from "node:os";
+import { skillFileBytes, snapshotFile, assertSkillSnapshotPath } from "./skill-snapshot.js";
 import { fileURLToPath } from "node:url";
 import { and, asc, desc, eq, inArray, isNull, lt, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
@@ -274,6 +276,133 @@ type ParsedSkillImportSource = {
   warnings: string[];
 };
 
+type SkillSnapshotFile = Pick<CompanySkillVersionFileInventoryEntry, "path" | "content" | "encoding" | "executable">;
+
+// In-process dedupe of identical snapshot publications (keyed by snapshot dir).
+const skillSnapshotFlights = new Map<string, Promise<void>>();
+
+/**
+ * Publish a complete, content-addressed skill snapshot at
+ * `<root>/.snapshots/<digest>` and atomically repoint `<root>/.snapshots/current`
+ * (read back through resolvePublishedRuntimeSkillSnapshot).
+ *
+ * Guarantees (fork, runtime skill isolation):
+ * - a published snapshot directory is never rewritten in place, so a reader
+ *   holding a returned path keeps a consistent file set; old snapshots and
+ *   legacy files directly under `root` are left alone;
+ * - files are staged in a private directory and published with one rename;
+ *   concurrent publishers of the same content converge on one directory;
+ * - paths are validated (no absolute/escaping/duplicate paths) and SKILL.md
+ *   is required.
+ * Upstream semantics (v2026.1005.0 version snapshots):
+ * - bytes come from skillFileBytes (base64 or utf8) and the executable bit is
+ *   kept; readOnly publishes 0o444/0o555 like upstream immutable versions;
+ * - identical in-flight publications in this process share one staging pass;
+ * - an existing snapshot whose bytes or executable bits do not match is
+ *   replaced instead of failing forever.
+ * Plain utf8, non-executable files hash exactly as the fork's original
+ * publisher did, so snapshots already on disk are reused.
+ */
+async function publishSkillFileSnapshot(
+  root: string,
+  input: SkillSnapshotFile[],
+  options: { readOnly?: boolean } = {},
+): Promise<string> {
+  const files: Array<{ path: string; content: string; encoding?: "base64"; executable?: true }> = input.map((file) => {
+    const relative = file.path.replace(/\\/g, "/");
+    const normalized = path.posix.normalize(relative);
+    if (!normalized || normalized === "." || normalized === ".." || normalized.startsWith("../") || path.posix.isAbsolute(normalized)) {
+      throw new Error(`Invalid runtime skill path: ${file.path}`);
+    }
+    return {
+      path: normalized,
+      content: file.content,
+      ...(file.encoding === "base64" ? { encoding: "base64" as const } : {}),
+      ...(file.executable ? { executable: true as const } : {}),
+    };
+  }).sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
+  if (!files.some((file) => file.path === "SKILL.md")) throw new Error("Runtime skill snapshot requires SKILL.md");
+  if (new Set(files.map((file) => file.path)).size !== files.length) throw new Error("Duplicate runtime skill path");
+
+  const digest = createHash("sha256").update(JSON.stringify(files)).digest("hex");
+  const snapshotsRoot = path.join(root, ".snapshots");
+  const snapshot = path.join(snapshotsRoot, digest);
+  const fileMode = (file: (typeof files)[number]) => options.readOnly
+    ? (file.executable ? 0o555 : 0o444)
+    : (file.executable ? 0o755 : 0o644);
+
+  async function matches() {
+    async function listFiles(dir: string, prefix = ""): Promise<string[]> {
+      const found: string[] = [];
+      for (const entry of await fs.readdir(dir, { withFileTypes: true })) {
+        const relative = prefix ? `${prefix}/${entry.name}` : entry.name;
+        if (entry.isDirectory()) found.push(...await listFiles(path.join(dir, entry.name), relative));
+        else if (entry.isFile()) found.push(relative);
+        else throw new Error("Runtime skill snapshots must contain regular files");
+      }
+      return found;
+    }
+    const existing = await listFiles(snapshot).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return null;
+      throw error;
+    });
+    if (!existing || JSON.stringify(existing.sort()) !== JSON.stringify(files.map((file) => file.path))) return false;
+    for (const file of files) {
+      const target = path.join(snapshot, file.path);
+      const bytes = await fs.readFile(target).catch(() => null);
+      if (!bytes?.equals(skillFileBytes(file))) return false;
+      if (Boolean((await fs.stat(target)).mode & 0o111) !== Boolean(file.executable)) return false;
+    }
+    return true;
+  }
+
+  async function publish() {
+    await fs.mkdir(snapshotsRoot, { recursive: true });
+    if (await matches()) return;
+    const staging = await fs.mkdtemp(path.join(snapshotsRoot, ".staging-"));
+    try {
+      for (const file of files) {
+        const target = path.join(staging, file.path);
+        await fs.mkdir(path.dirname(target), { recursive: true });
+        await fs.writeFile(target, skillFileBytes(file), { mode: fileMode(file) });
+      }
+      // Another process may have published the same snapshot while we staged it.
+      if (await matches()) return;
+      try {
+        await fs.rename(staging, snapshot);
+      } catch (error) {
+        if (await matches()) return;
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code !== "EEXIST" && code !== "ENOTEMPTY") throw error;
+        // The directory under this digest does not hold the digest's content
+        // (damaged): replace it rather than fail every later materialization.
+        await fs.rm(snapshot, { recursive: true, force: true });
+        await fs.rename(staging, snapshot);
+      }
+    } finally {
+      await fs.rm(staging, { recursive: true, force: true });
+    }
+  }
+
+  let flight = skillSnapshotFlights.get(snapshot);
+  if (!flight) {
+    flight = publish().finally(() => skillSnapshotFlights.delete(snapshot));
+    skillSnapshotFlights.set(snapshot, flight);
+  }
+  await flight;
+
+  // Every caller repoints the discovery link itself (not the shared flight),
+  // so the latest publication wins. Readers receive the immutable target.
+  const pendingLink = path.join(snapshotsRoot, `.current-${randomUUID()}`);
+  try {
+    await fs.symlink(digest, pendingLink, "dir");
+    await fs.rename(pendingLink, path.join(snapshotsRoot, "current"));
+  } finally {
+    await fs.rm(pendingLink, { force: true });
+  }
+  return snapshot;
+}
+
 const EXTERNAL_SKILL_SOURCE_TYPES = new Set<CompanySkillSourceType>(["github", "skills_sh", "url"]);
 
 function isPinnedCommitRef(value: string | null | undefined) {
@@ -394,7 +523,11 @@ type CreateVersionOptions = {
   updateCurrentVersion?: boolean;
   skipInventoryRefresh?: boolean;
   skill?: CompanySkill;
+  database?: DbOrTransaction;
 };
+
+type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
+type DbOrTransaction = Db | DbTransaction;
 
 type PlannedSkillReassignment = {
   agentId: string;
@@ -638,6 +771,8 @@ export const PAPERCLIP_CORE_SKILL_KEYS = [
   "paperclipai/paperclip/para-memory-files",
 ] as const;
 
+export const ONBOARDING_FIRST_TASK_SKILL_KEY = "paperclipai/paperclip/first-task";
+
 function deriveCanonicalSkillKey(
   companyId: string,
   input: Pick<ImportedSkill, "slug" | "sourceType" | "sourceLocator" | "metadata">,
@@ -684,14 +819,12 @@ function deriveCanonicalSkillKey(
   return `company/${companyId}/${slug}`;
 }
 
-function classifyInventoryKind(relativePath: string): CompanySkillFileInventoryEntry["kind"] {
+export function classifyInventoryKind(relativePath: string): CompanySkillFileInventoryEntry["kind"] {
   const normalized = normalizePortablePath(relativePath).toLowerCase();
   if (normalized.endsWith("/skill.md") || normalized === "skill.md") return "skill";
-  if (normalized.startsWith("references/")) return "reference";
-  if (normalized.startsWith("scripts/")) return "script";
-  if (normalized.startsWith("assets/")) return "asset";
-  if (normalized.endsWith(".md")) return "markdown";
   const fileName = path.posix.basename(normalized);
+  // Font packages commonly keep their binary assets in a dedicated fonts folder.
+  if (/\.(ttf|otf|woff2?|eot)$/i.test(fileName)) return "asset";
   if (
     fileName.endsWith(".sh")
     || fileName.endsWith(".js")
@@ -704,6 +837,10 @@ function classifyInventoryKind(relativePath: string): CompanySkillFileInventoryE
   ) {
     return "script";
   }
+  if (normalized.startsWith("scripts/")) return "script";
+  if (normalized.startsWith("references/")) return "reference";
+  if (normalized.startsWith("assets/")) return "asset";
+  if (normalized.endsWith(".md")) return "markdown";
   if (
     fileName.endsWith(".png")
     || fileName.endsWith(".jpg")
@@ -1895,6 +2032,8 @@ function serializeVersionFileInventory(
     path: entry.path,
     kind: entry.kind,
     content: entry.content,
+    ...(entry.encoding ? { encoding: entry.encoding } : {}),
+    ...(entry.executable ? { executable: true } : {}),
   }));
 }
 
@@ -1912,6 +2051,8 @@ function toCompanySkillVersion(row: CompanySkillVersionRow): CompanySkillVersion
           path: String(entry.path ?? ""),
           kind: (String(entry.kind ?? "other") as CompanySkillFileInventoryEntry["kind"]),
           content: String(entry.content ?? ""),
+          ...(entry.encoding === "base64" ? { encoding: "base64" as const } : {}),
+          ...(entry.executable === true ? { executable: true } : {}),
         }];
       })
       : [],
@@ -2584,7 +2725,9 @@ async function auditInstalledSkillBytes(skill: CompanySkill): Promise<CompanySki
     if (file.kind === "asset" || file.kind === "script" || file.kind === "other") {
       pushFinding(findings, `${file.kind}_trust`, "warning", `Skill includes a ${file.kind} file.`, file.path);
     }
-    if (file.kind === "asset") continue;
+    // Text assets still require content checks; a directory or extension must
+    // not hide remote execution or secret exfiltration instructions.
+    if (file.kind === "asset" && contentLooksBinary(file.bytes)) continue;
 
     const text = file.bytes.toString("utf8");
     if (remoteExecPattern.test(text)) {
@@ -2628,6 +2771,21 @@ async function auditInstalledSkillBytes(skill: CompanySkill): Promise<CompanySki
     scannedAt,
     scanVersion: SKILL_AUDIT_SCAN_VERSION,
   };
+}
+
+/** Audit downloaded packages before they become installed company content. */
+export async function auditSkillSnapshot(files: CompanySkillVersionFileInventoryEntry[]) {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skill-audit-"));
+  try {
+    for (const file of files) {
+      const target = path.join(root, assertSkillSnapshotPath(file.path));
+      await fs.mkdir(path.dirname(target), { recursive: true });
+      await fs.writeFile(target, skillFileBytes(file), { mode: 0o600 });
+    }
+    const result = await auditInstalledSkillBytes({ sourceType: "local_path", sourceLocator: root,
+      fileInventory: files, metadata: null } as unknown as CompanySkill);
+    return result.findings;
+  } finally { await fs.rm(root, { recursive: true, force: true }); }
 }
 
 function inferLanguageFromPath(filePath: string) {
@@ -2946,6 +3104,13 @@ export function companySkillService(db: Db) {
   }
 
   async function ensureBundledSkills(companyId: string) {
+    // Onboarding owns this skill's wording. The server build copies this asset
+    // directory into dist, so it uses the same import path in source and npm.
+    const firstTaskSkill = await readLocalSkillImportFromDirectory(
+      companyId,
+      fileURLToPath(new URL("../onboarding-assets/first-task/skills/first-task/", import.meta.url)),
+      { metadata: { sourceKind: "paperclip_bundled" } },
+    );
     for (const skillsRoot of resolveBundledSkillsRoot()) {
       const stats = await fs.stat(skillsRoot).catch(() => null);
       if (!stats?.isDirectory()) continue;
@@ -2966,9 +3131,9 @@ export function companySkillService(db: Db) {
         })))
         .catch(() => [] as ImportedSkill[]);
       if (bundledSkills.length === 0) continue;
-      return upsertImportedSkills(companyId, bundledSkills);
+      return upsertImportedSkills(companyId, [...bundledSkills, firstTaskSkill]);
     }
-    return [];
+    return upsertImportedSkills(companyId, [firstTaskSkill]);
   }
 
   async function readBundledSkillReleaseRegistry() {
@@ -3004,8 +3169,7 @@ export function companySkillService(db: Db) {
   ): Promise<CompanySkillVersionFileInventoryEntry[]> {
     const inventory = await collectLocalSkillInventory(skillDir);
     return Promise.all(inventory.map(async (entry) => ({
-      ...entry,
-      content: await fs.readFile(path.join(skillDir, entry.path), "utf8"),
+      ...snapshotFile(entry.path, entry.kind, await fs.readFile(path.join(skillDir, entry.path)), Boolean((await fs.stat(path.join(skillDir, entry.path))).mode & 0o111)),
     })));
   }
 
@@ -3333,8 +3497,8 @@ export function companySkillService(db: Db) {
     return rows as CompanySkillReferenceRow[];
   }
 
-  async function getById(companyId: string, id: string) {
-    const row = await db
+  async function getById(companyId: string, id: string, database: DbOrTransaction = db) {
+    const row = await database
       .select(selectCompanySkillColumns())
       .from(companySkills)
       .where(and(eq(companySkills.companyId, companyId), eq(companySkills.id, id)))
@@ -3342,8 +3506,8 @@ export function companySkillService(db: Db) {
     return row ? enrichFolderPath(companyId, toCompanySkill(row)) : null;
   }
 
-  async function getByKey(companyId: string, key: string) {
-    const row = await db
+  async function getByKey(companyId: string, key: string, database: DbOrTransaction = db) {
+    const row = await database
       .select(selectCompanySkillColumns())
       .from(companySkills)
       .where(and(eq(companySkills.companyId, companyId), eq(companySkills.key, key)))
@@ -3448,6 +3612,14 @@ export function companySkillService(db: Db) {
     await ensureSkillInventoryCurrent(companyId);
     const skill = await getById(companyId, skillId);
     if (!skill) return null;
+    if (skill.metadata?.skillSourceId && skill.metadata?.snapshotHash && skill.currentVersionId) {
+      const version = await getVersion(companyId, skill.id, skill.currentVersionId);
+      if (!version) throw unprocessable("Installed skill version is unavailable.");
+      const sourceLocator = await materializeVersionSnapshot(companyId, skill, version);
+      const audit = await auditInstalledSkillBytes({ ...skill, sourceType: "local_path", sourceLocator });
+      await persistAuditMetadata(skill, audit);
+      return audit;
+    }
     if (skill.sourceType !== "catalog" && skill.sourceType !== "local_path") {
       throw unprocessable("Only local-path and catalog-managed company skills support audit.");
     }
@@ -3549,6 +3721,8 @@ export function companySkillService(db: Db) {
         path: detail.path,
         kind: detail.kind,
         content: detail.content,
+        ...(detail.encoding ? { encoding: detail.encoding } : {}),
+        ...(detail.executable ? { executable: true } : {}),
       });
     }
     return out;
@@ -3573,12 +3747,12 @@ export function companySkillService(db: Db) {
     options: CreateVersionOptions = {},
   ): Promise<CompanySkillVersion> {
     if (!options.skipInventoryRefresh) await ensureSkillInventoryCurrent(companyId);
-    const skill = options.skill ?? await getById(companyId, skillId);
+    const skill = options.skill ?? await getById(companyId, skillId, options.database);
     if (!skill) throw notFound("Skill not found");
     const fileInventory = serializeVersionFileInventory(
       options.fileInventory ?? await collectVersionFileInventory(companyId, skill),
     );
-    const versionRow = await db.transaction(async (tx) => {
+    const persist = async (tx: DbOrTransaction) => {
       await tx.execute(sql`
         select ${companySkills.id}
         from ${companySkills}
@@ -3616,7 +3790,8 @@ export function companySkillService(db: Db) {
           .where(and(eq(companySkills.id, skillId), eq(companySkills.companyId, companyId)));
       }
       return row;
-    });
+    };
+    const versionRow = options.database ? await persist(options.database) : await db.transaction(persist);
     if (!versionRow) throw notFound("Failed to persist skill version");
     return toCompanySkillVersion(versionRow);
   }
@@ -3943,7 +4118,7 @@ export function companySkillService(db: Db) {
       if (!detail) continue;
       const targetPath = path.resolve(forkDir, detail.path);
       await fs.mkdir(path.dirname(targetPath), { recursive: true });
-      await fs.writeFile(targetPath, detail.content, "utf8");
+      await fs.writeFile(targetPath, skillFileBytes(detail), { mode: detail.executable ? 0o755 : 0o644 });
     }
     const skillFilePath = path.join(forkDir, "SKILL.md");
     const markdown = await fs.readFile(skillFilePath, "utf8").catch(() => source.markdown);
@@ -4022,153 +4197,161 @@ export function companySkillService(db: Db) {
     input: CompanySkillRenameRequest,
   ): Promise<CompanySkillRenameResult> {
     await ensureSkillInventoryCurrent(companyId);
-    const skill = await getById(companyId, skillId);
-    if (!skill) throw notFound("Skill not found");
-
-    if (!isPaperclipManagedRenameTarget(skill)) {
-      throw unprocessable(
-        "Only Paperclip-managed skills can be renamed. Catalog, external, project-scanned, and unmanaged local skills are read-only.",
-        { skillId: skill.id, sourceType: skill.sourceType, sourceKind: getSkillMeta(skill).sourceKind ?? null },
-      );
-    }
-
-    const newName = input.name.trim();
-    if (!newName) throw unprocessable("Skill name is required.");
-    const newSlug = normalizeSkillSlug(input.slug ?? null) ?? normalizeSkillSlug(newName);
-    if (!newSlug) {
-      throw unprocessable("Skill name must contain at least one letter or number to derive a slug.");
-    }
-    const newKey = `company/${companyId}/${newSlug}`;
-
-    const previousName = skill.name;
-    const previousSlug = skill.slug;
-    const previousKey = skill.key;
-
-    // Normalized no-op: nothing changes, so skip all filesystem/DB work.
-    if (newName === previousName && newSlug === previousSlug && newKey === previousKey) {
-      return { skill, previousName, previousSlug, previousKey, reassignments: [] };
-    }
-
-    // Authoritative conflict detection against slug and key within the company.
-    if (newSlug !== previousSlug || newKey !== previousKey) {
-      const existing = await listFull(companyId);
-      for (const other of existing) {
-        if (other.id === skill.id) continue;
-        if ((normalizeSkillSlug(other.slug) ?? other.slug) === newSlug) {
-          throw conflict(`A company skill with slug "${newSlug}" already exists.`, {
-            conflict: "slug",
-            slug: newSlug,
-          });
-        }
-        if (other.key === newKey) {
-          throw conflict(`A company skill with key "${newKey}" already exists.`, {
-            conflict: "key",
-            key: newKey,
-          });
-        }
-      }
-    }
-
+    if (!await getById(companyId, skillId)) throw notFound("Skill not found");
     const managedRoot = resolveManagedSkillsRoot(companyId);
-    const oldDir = normalizeSkillDirectory(skill)!;
-    const newDir = path.resolve(managedRoot, newSlug);
-    const directoryMoved = newDir !== oldDir;
+    let result: CompanySkillRenameResult | undefined;
+    let restoreSource: (() => Promise<void>) | undefined;
+    // Cache lifecycle locks always precede name locks, as in deletion.
+    await removeRuntimeSkillCache(managedRoot, skillId, async () => {
+      try {
+        result = await withSkillFileMutation(companyId, skillId, async (skill, tx) => {
+          if (!isPaperclipManagedRenameTarget(skill)) {
+            throw unprocessable(
+              "Only Paperclip-managed skills can be renamed. Catalog, external, project-scanned, and unmanaged local skills are read-only.",
+              { skillId: skill.id, sourceType: skill.sourceType, sourceKind: getSkillMeta(skill).sourceKind ?? null },
+            );
+          }
 
-    if (directoryMoved && (await statPath(newDir))) {
-      throw conflict(`A managed skill directory already exists at ${newDir}.`, { conflict: "directory" });
-    }
+          const newName = input.name.trim();
+          if (!newName) throw unprocessable("Skill name is required.");
+          const newSlug = normalizeSkillSlug(input.slug ?? null) ?? normalizeSkillSlug(newName);
+          if (!newSlug) {
+            throw unprocessable("Skill name must contain at least one letter or number to derive a slug.");
+          }
+          const newKey = `company/${companyId}/${newSlug}`;
 
-    // Plan agent reassignments from the old key to the new key, preserving each
-    // pinned versionId. Resolve against the pre-rename reference targets so the
-    // old key still maps cleanly.
-    const referenceSkills = await listReferenceTargets(companyId);
-    const agentRows = await agents.list(companyId, { includeTerminated: true });
-    const plannedReassignments: CompanySkillForkReassignment[] = agentRows
-      .filter((agent) =>
-        resolveDesiredSkillEntries(referenceSkills, agent.adapterConfig as Record<string, unknown>)
-          .some((entry) => entry.key === previousKey))
-      .map((agent) => ({ agentId: agent.id, previousSkillKey: previousKey, nextSkillKey: newKey }));
+          const previousName = skill.name;
+          const previousSlug = skill.slug;
+          const previousKey = skill.key;
 
-    // Reversible filesystem stage: capture the original SKILL.md so a failed DB
-    // transaction can be rolled back to the pre-rename on-disk state.
-    const originalMarkdown = await fs.readFile(path.join(oldDir, "SKILL.md"), "utf8").catch(() => null);
-    const rewrittenMarkdown = rewriteFrontmatterName(originalMarkdown ?? skill.markdown, newName);
-    let movedDir = false;
-    try {
-      if (directoryMoved) {
-        await fs.mkdir(path.dirname(newDir), { recursive: true });
-        await fs.rename(oldDir, newDir);
-        movedDir = true;
+          // Normalized no-op: nothing changes, so skip all filesystem/DB work.
+          if (newName === previousName && newSlug === previousSlug && newKey === previousKey) {
+            return { skill, previousName, previousSlug, previousKey, reassignments: [] };
+          }
+
+          // Authoritative conflict detection against slug and key within the company.
+          if (newSlug !== previousSlug || newKey !== previousKey) {
+            const existing = await listFull(companyId);
+            for (const other of existing) {
+              if (other.id === skill.id) continue;
+              if ((normalizeSkillSlug(other.slug) ?? other.slug) === newSlug) {
+                throw conflict(`A company skill with slug "${newSlug}" already exists.`, {
+                  conflict: "slug",
+                  slug: newSlug,
+                });
+              }
+              if (other.key === newKey) {
+                throw conflict(`A company skill with key "${newKey}" already exists.`, {
+                  conflict: "key",
+                  key: newKey,
+                });
+              }
+            }
+          }
+
+          const oldDir = normalizeSkillDirectory(skill)!;
+          const newDir = path.resolve(managedRoot, newSlug);
+          const directoryMoved = newDir !== oldDir;
+
+          if (directoryMoved && (await statPath(newDir))) {
+            throw conflict(`A managed skill directory already exists at ${newDir}.`, { conflict: "directory" });
+          }
+
+          // Plan agent reassignments from the old key to the new key, preserving each
+          // pinned versionId. Resolve against the pre-rename reference targets so the
+          // old key still maps cleanly.
+          const referenceSkills = await listReferenceTargets(companyId);
+          const agentRows = await agents.list(companyId, { includeTerminated: true });
+          const plannedReassignments: CompanySkillForkReassignment[] = agentRows
+            .filter((agent) =>
+              resolveDesiredSkillEntries(referenceSkills, agent.adapterConfig as Record<string, unknown>)
+                .some((entry) => entry.key === previousKey))
+            .map((agent) => ({ agentId: agent.id, previousSkillKey: previousKey, nextSkillKey: newKey }));
+
+          // Reversible filesystem stage: capture the original SKILL.md so a failed DB
+          // transaction can be rolled back to the pre-rename on-disk state.
+          const originalMarkdown = await fs.readFile(path.join(oldDir, "SKILL.md"), "utf8").catch(() => null);
+          const rewrittenMarkdown = rewriteFrontmatterName(originalMarkdown ?? skill.markdown, newName);
+          let movedDir = false;
+          restoreSource = async () => {
+            if (originalMarkdown !== null) {
+              await fs.writeFile(path.join(movedDir ? newDir : oldDir, "SKILL.md"), originalMarkdown, "utf8").catch(() => {});
+            }
+            if (movedDir) await fs.rename(newDir, oldDir).catch(() => {});
+            restoreSource = undefined;
+          };
+          try {
+            if (directoryMoved) {
+              await fs.mkdir(path.dirname(newDir), { recursive: true });
+              await fs.rename(oldDir, newDir);
+              movedDir = true;
+            }
+            if (originalMarkdown !== null) {
+              if (rewrittenMarkdown !== originalMarkdown) {
+                await fs.writeFile(path.join(newDir, "SKILL.md"), rewrittenMarkdown, "utf8");
+              }
+            }
+
+            const updated = await tx
+              .update(companySkills)
+              .set({
+                name: newName,
+                slug: newSlug,
+                key: newKey,
+                sourceLocator: newDir,
+                markdown: rewrittenMarkdown,
+                updatedAt: new Date(),
+              })
+              .where(and(eq(companySkills.id, skill.id), eq(companySkills.companyId, companyId)))
+              .returning({ id: companySkills.id })
+              .then((rows) => rows[0] ?? null);
+            if (!updated) throw notFound("Skill not found");
+
+            for (const item of plannedReassignments) {
+              const row = await tx
+                .select({ id: agentsTable.id, adapterConfig: agentsTable.adapterConfig })
+                .from(agentsTable)
+                .where(and(eq(agentsTable.companyId, companyId), eq(agentsTable.id, item.agentId)))
+                .for("update")
+                .then((rows) => rows[0] ?? null);
+              if (!row) continue;
+              const adapterConfig = row.adapterConfig as Record<string, unknown>;
+              const nextEntries = resolveDesiredSkillEntries(referenceSkills, adapterConfig).map((entry) =>
+                entry.key === previousKey
+                  ? { key: newKey, versionId: entry.versionId ?? null }
+                  : entry);
+              await tx
+                .update(agentsTable)
+                .set({
+                  adapterConfig: writePaperclipSkillSyncPreference(adapterConfig, nextEntries),
+                  updatedAt: new Date(),
+                })
+                .where(and(eq(agentsTable.companyId, companyId), eq(agentsTable.id, item.agentId)));
+            }
+          } catch (error) {
+            // Restore while the name locks are still held.
+            await restoreSource?.();
+            throw error;
+          }
+
+          const renamed = await getById(companyId, skill.id, tx);
+          if (!renamed) throw notFound("Renamed skill not found");
+          return { skill: renamed, previousName, previousSlug, previousKey, reassignments: plannedReassignments };
+        }, [normalizeSkillSlug(input.slug ?? null) ?? normalizeSkillSlug(input.name) ?? ""]);
+      } catch (error) {
+        await restoreSource?.();
+        throw error;
       }
-      if (originalMarkdown !== null) {
-        if (rewrittenMarkdown !== originalMarkdown) {
-          await fs.writeFile(path.join(newDir, "SKILL.md"), rewrittenMarkdown, "utf8");
-        }
+      restoreSource = undefined;
+      // Database commit is complete; do not report cache cleanup as a failed rename.
+      if (result) {
+        await fs.rm(path.resolve(managedRoot, "__runtime__", buildSkillRuntimeName(result.previousKey, result.previousSlug)),
+          { recursive: true, force: true }).catch((error) => {
+          logger.warn({ err: error, companyId, skillId }, "Skill renamed; obsolete runtime cache cleanup failed");
+        });
       }
-
-      await db.transaction(async (tx) => {
-        const updated = await tx
-          .update(companySkills)
-          .set({
-            name: newName,
-            slug: newSlug,
-            key: newKey,
-            sourceLocator: newDir,
-            markdown: rewrittenMarkdown,
-            updatedAt: new Date(),
-          })
-          .where(and(eq(companySkills.id, skill.id), eq(companySkills.companyId, companyId)))
-          .returning({ id: companySkills.id })
-          .then((rows) => rows[0] ?? null);
-        if (!updated) throw notFound("Skill not found");
-
-        for (const item of plannedReassignments) {
-          const row = await tx
-            .select({ id: agentsTable.id, adapterConfig: agentsTable.adapterConfig })
-            .from(agentsTable)
-            .where(and(eq(agentsTable.companyId, companyId), eq(agentsTable.id, item.agentId)))
-            .for("update")
-            .then((rows) => rows[0] ?? null);
-          if (!row) continue;
-          const adapterConfig = row.adapterConfig as Record<string, unknown>;
-          const nextEntries = resolveDesiredSkillEntries(referenceSkills, adapterConfig).map((entry) =>
-            entry.key === previousKey
-              ? { key: newKey, versionId: entry.versionId ?? null }
-              : entry);
-          await tx
-            .update(agentsTable)
-            .set({
-              adapterConfig: writePaperclipSkillSyncPreference(adapterConfig, nextEntries),
-              updatedAt: new Date(),
-            })
-            .where(and(eq(agentsTable.companyId, companyId), eq(agentsTable.id, item.agentId)));
-        }
-      });
-    } catch (error) {
-      // Roll back the filesystem to its pre-rename state.
-      if (originalMarkdown !== null) {
-        await fs
-          .writeFile(path.join(movedDir ? newDir : oldDir, "SKILL.md"), originalMarkdown, "utf8")
-          .catch(() => {});
-      }
-      if (movedDir) {
-        await fs.rename(newDir, oldDir).catch(() => {});
-      }
-      throw error;
-    }
-
-    // The rename has committed. Cache cleanup must not make a successful rename appear to fail.
-    try {
-      await fs.rm(path.resolve(managedRoot, "__runtime__", buildSkillRuntimeName(previousKey, previousSlug)),
-        { recursive: true, force: true });
-      await removeRuntimeSkillCache(managedRoot, skill.id);
-    } catch (error) {
-      logger.warn({ err: error, companyId, skillId: skill.id }, "Skill renamed; obsolete runtime cache cleanup failed");
-    }
-
-    const renamed = await getById(companyId, skill.id);
-    if (!renamed) throw notFound("Renamed skill not found");
-    return { skill: renamed, previousName, previousSlug, previousKey, reassignments: plannedReassignments };
+    });
+    return result!;
   }
 
   async function updateStatus(companyId: string, skillId: string): Promise<CompanySkillUpdateStatus | null> {
@@ -4291,15 +4474,22 @@ export function companySkillService(db: Db) {
     }
 
     const source = deriveSkillSourceInfo(skill);
+    if (skill.metadata?.skillSourceId && skill.metadata?.snapshotHash && skill.currentVersionId) {
+      const version = await getCurrentVersion(skill);
+      const file = version?.fileInventory.find(entry => entry.path === normalizedPath);
+      if (!file) throw notFound("Installed skill snapshot is missing a file.");
+      return { ...file, skillId: skill.id, language: file.encoding === "base64" ? null : inferLanguageFromPath(normalizedPath),
+        markdown: file.encoding !== "base64" && isMarkdownPath(normalizedPath), editable: false };
+    }
     let content = "";
 
     if (skill.sourceType === "local_path" || skill.sourceType === "catalog") {
       const absolutePath = resolveLocalSkillFilePath(skill, normalizedPath);
-      const diskContent = absolutePath
-        ? await fs.readFile(absolutePath, "utf8").catch(() => null)
-        : null;
-      if (diskContent !== null) {
-        content = diskContent;
+      const diskBytes = absolutePath ? await fs.readFile(absolutePath).catch(() => null) : null;
+      if (diskBytes !== null) {
+        const file = snapshotFile(normalizedPath, fileEntry.kind, diskBytes, Boolean((await fs.stat(absolutePath!)).mode & 0o111));
+        return { ...file, skillId: skill.id, language: file.encoding === "base64" ? null : inferLanguageFromPath(normalizedPath),
+          markdown: file.encoding !== "base64" && isMarkdownPath(normalizedPath), editable: source.editable && file.encoding !== "base64" };
       } else if (normalizedPath === "SKILL.md") {
         content = skill.markdown;
       } else {
@@ -4410,10 +4600,6 @@ export function companySkillService(db: Db) {
     if (input.folderId) await folderSvc.validateSkillFolder(companyId, input.folderId);
     const slug = normalizeSkillSlug(input.slug ?? input.name) ?? "skill";
     const key = `company/${companyId}/${slug}`;
-    const existing = await getByKey(companyId, key);
-    if (existing) {
-      throw conflict(`A company skill with slug "${slug}" already exists.`);
-    }
 
     const forkSource = input.forkedFromSkillId
       ? await getById(companyId, input.forkedFromSkillId)
@@ -4424,20 +4610,6 @@ export function companySkillService(db: Db) {
     const sharingScope = normalizeMutableSharingScope(input.sharingScope) ?? "company";
     const managedRoot = resolveManagedSkillsRoot(companyId);
     const skillDir = path.resolve(managedRoot, slug);
-    const skillFilePath = path.resolve(skillDir, "SKILL.md");
-
-    await fs.rm(skillDir, { recursive: true, force: true });
-    await fs.mkdir(skillDir, { recursive: true });
-
-    if (forkSource) {
-      for (const entry of forkSource.fileInventory) {
-        const detail = await readFile(companyId, forkSource.id, entry.path);
-        if (!detail) continue;
-        const targetPath = path.resolve(skillDir, detail.path);
-        await fs.mkdir(path.dirname(targetPath), { recursive: true });
-        await fs.writeFile(targetPath, detail.content, "utf8");
-      }
-    }
 
     const fallbackMarkdown = [
         "---",
@@ -4454,67 +4626,165 @@ export function companySkillService(db: Db) {
       ? input.markdown
       : forkSource?.markdown ?? fallbackMarkdown;
 
-    await fs.writeFile(skillFilePath, markdown, "utf8");
+    return db.transaction(async (tx) => {
+      await tx.execute(sql`
+        select pg_advisory_xact_lock(hashtextextended(${`${companyId}:${slug}`}, 0))
+      `);
+      const existing = await getByKey(companyId, key, tx);
+      if (existing) throw conflict(`A company skill with slug "${slug}" already exists.`);
 
-    const inventory = forkSource
-      ? await collectLocalSkillInventory(skillDir)
-      : [{ path: "SKILL.md", kind: "skill" as const }];
-    const parsed = parseFrontmatterMarkdown(markdown);
-    const metadata = {
-      sourceKind: "managed_local",
-      ...(forkSource ? {
-        forkedFromSkillId: forkSource.id,
-        forkedFromCompanyId: forkSource.companyId,
-        forkedByAgentId: actor?.type === "agent" ? actor.agentId ?? null : null,
-        forkedByUserId: actor?.type === "user" ? actor.userId ?? null : null,
-      } : {}),
-    };
-    const imported = await upsertImportedSkills(companyId, [{
-      key,
-      slug,
-      name: asString(parsed.frontmatter.name) ?? input.name,
-      description: asString(parsed.frontmatter.description) ?? input.description?.trim() ?? forkSource?.description ?? null,
-      markdown,
-      sourceType: "local_path",
-      sourceLocator: skillDir,
-      sourceRef: null,
+      // Stage in a unique directory. Publication is a single rename and never
+      // removes an existing directory, so a failed retry cannot clobber bytes.
+      const stagingRoot = path.join(managedRoot, ".staging");
+      await fs.mkdir(stagingRoot, { recursive: true });
+      const stagingDir = await fs.mkdtemp(path.join(stagingRoot, `${slug}-${randomUUID()}-`));
+      let published = false;
+      try {
+        if (forkSource) {
+          for (const entry of forkSource.fileInventory) {
+            const detail = await readFile(companyId, forkSource.id, entry.path);
+            if (!detail) continue;
+            const targetPath = path.resolve(stagingDir, detail.path);
+            await fs.mkdir(path.dirname(targetPath), { recursive: true });
+            await fs.writeFile(targetPath, skillFileBytes(detail), { mode: detail.executable ? 0o755 : 0o644 });
+          }
+        }
+        await fs.writeFile(path.join(stagingDir, "SKILL.md"), markdown, "utf8");
+        await fs.mkdir(managedRoot, { recursive: true });
+        const existingPublishedDir = await resolveExistingSkillDirectory(skillDir);
+        if (existingPublishedDir) {
+          // A publish can survive an outer database rollback. Recover only an
+          // exact file-for-file retry. Never silently adopt different content.
+          const existingStat = await fs.lstat(skillDir);
+          if (existingStat.isSymbolicLink() || !existingStat.isDirectory()) {
+            throw conflict(`The storage location for skill "${slug}" is unavailable.`);
+          }
+          const stagedInventory = await collectLocalSkillInventory(stagingDir);
+          const existingInventory = await collectLocalSkillInventory(skillDir);
+          const stagedPaths = stagedInventory.map(entry => entry.path).sort();
+          const existingPaths = existingInventory.map(entry => entry.path).sort();
+          if (JSON.stringify(stagedPaths) !== JSON.stringify(existingPaths)) {
+            throw conflict(`Different files already exist for skill "${slug}". Choose another name.`);
+          }
+          for (const file of stagedPaths) {
+            const target = path.join(skillDir, file);
+            const stat = await fs.lstat(target);
+            const root = await fs.realpath(skillDir);
+            const real = await fs.realpath(target);
+            if (stat.isSymbolicLink() || !stat.isFile() || !real.startsWith(`${root}${path.sep}`)
+              || !(await fs.readFile(target)).equals(await fs.readFile(path.join(stagingDir, file)))) {
+              throw conflict(`Different files already exist for skill "${slug}". Choose another name.`);
+            }
+          }
+          await fs.rm(stagingDir, { recursive: true, force: true });
+        } else {
+          await fs.rename(stagingDir, skillDir);
+        }
+        published = true;
+
+        const inventory = (forkSource || existingPublishedDir)
+          ? await collectLocalSkillInventory(skillDir)
+          : [{ path: "SKILL.md", kind: "skill" as const }];
+        const parsed = parseFrontmatterMarkdown(markdown);
+        const metadata = {
+          sourceKind: "managed_local",
+          ...(forkSource ? {
+            forkedFromSkillId: forkSource.id,
+            forkedFromCompanyId: forkSource.companyId,
+            forkedByAgentId: actor?.type === "agent" ? actor.agentId ?? null : null,
+            forkedByUserId: actor?.type === "user" ? actor.userId ?? null : null,
+          } : {}),
+        };
+        const imported = await upsertImportedSkills(companyId, [{
+          key,
+          slug,
+          name: asString(parsed.frontmatter.name) ?? input.name,
+          description: asString(parsed.frontmatter.description) ?? input.description?.trim() ?? forkSource?.description ?? null,
+          markdown,
+          sourceType: "local_path",
+          sourceLocator: skillDir,
+          sourceRef: null,
+          trustLevel: deriveTrustLevel(inventory),
+          compatibility: forkSource?.compatibility ?? "compatible",
+          fileInventory: inventory,
+          metadata,
+        }], tx);
+        const created = imported[0]!;
+        const row = await tx
+          .update(companySkills)
+          .set({
+            iconUrl: normalizeStoreText(input.iconUrl, 2000) ?? forkSource?.iconUrl ?? created.iconUrl,
+            color: normalizeStoreText(input.color, 64) ?? forkSource?.color ?? created.color,
+            tagline: normalizeStoreText(input.tagline, 120) ?? forkSource?.tagline ?? created.tagline,
+            authorName: normalizeStoreText(input.authorName, 200) ?? forkSource?.authorName ?? created.authorName,
+            homepageUrl: normalizeStoreText(input.homepageUrl, 2000) ?? forkSource?.homepageUrl ?? created.homepageUrl,
+            categories: input.categories ? normalizeCategoryList(input.categories) : forkSource?.categories ?? created.categories,
+            folderId: input.folderId ?? null,
+            sharingScope,
+            forkedFromSkillId: forkSource?.id ?? null,
+            forkedFromCompanyId: forkSource?.companyId ?? null,
+            updatedAt: new Date(),
+          })
+          .where(and(eq(companySkills.id, created.id), eq(companySkills.companyId, companyId)))
+          .returning()
+          .then((rows) => rows[0] ?? null);
+        if (forkSource) {
+          await tx
+            .update(companySkills)
+            .set({ forkCount: sql`${companySkills.forkCount} + 1`, installCount: sql`${companySkills.installCount} + 1`, updatedAt: new Date() })
+            .where(and(eq(companySkills.id, forkSource.id), eq(companySkills.companyId, companyId)));
+        }
+        const versionInventory = await Promise.all(inventory.map(async (entry) => ({
+          ...entry,
+          content: await fs.readFile(path.join(skillDir, entry.path), "utf8"),
+        })));
+        await createVersion(companyId, created.id, { label: "Initial version" }, actor, {
+          database: tx,
+          skipInventoryRefresh: true,
+          skill: row ? toCompanySkill(row) : created,
+          fileInventory: versionInventory,
+        });
+        return (await getById(companyId, created.id, tx)) ?? (row ? toCompanySkill(row) : created);
+      } catch (error) {
+        if (!published) await fs.rm(stagingDir, { recursive: true, force: true }).catch(() => {});
+        throw error;
+      }
+    });
+  }
+
+  async function withSkillFileMutation<T>(
+    companyId: string,
+    skillId: string,
+    mutate: (skill: CompanySkill, tx: DbOrTransaction) => Promise<T>,
+    additionalSlugs: string[] = [],
+  ): Promise<T> {
+    await ensureSkillInventoryCurrent(companyId);
+    const initial = await getById(companyId, skillId);
+    if (!initial) throw notFound("Skill not found");
+    return db.transaction(async (tx) => {
+      // Share the creation/deletion name lock. The identity must be checked
+      // again after waiting: a new skill can now own the same source folder.
+      for (const slug of [...new Set([initial.slug, ...additionalSlugs])].filter(Boolean).sort()) {
+        await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`${companyId}:${slug}`}, 0))`);
+      }
+      const skill = await getById(companyId, skillId, tx);
+      if (!skill) throw notFound("Skill not found");
+      if (skill.slug !== initial.slug) throw conflict("Skill was renamed. Retry the operation.");
+      return mutate(skill, tx);
+    });
+  }
+
+  async function refreshEditedSkillInventory(skill: CompanySkill, tx: DbOrTransaction) {
+    const entries = await collectLocalSkillInventory(normalizeSkillDirectory(skill)!, inferLocalSkillInventoryMode(skill));
+    const inventory = await Promise.all(entries.map(async (entry) => ({
+      ...snapshotFile(entry.path, entry.kind, await fs.readFile(path.join(normalizeSkillDirectory(skill)!, entry.path)), Boolean((await fs.stat(path.join(normalizeSkillDirectory(skill)!, entry.path))).mode & 0o111)),
+    })));
+    await tx.update(companySkills).set({
+      fileInventory: serializeFileInventory(inventory),
       trustLevel: deriveTrustLevel(inventory),
-      compatibility: forkSource?.compatibility ?? "compatible",
-      fileInventory: inventory,
-      metadata,
-    }]);
-
-    const created = imported[0]!;
-    const row = await db
-      .update(companySkills)
-      .set({
-        iconUrl: normalizeStoreText(input.iconUrl, 2000) ?? forkSource?.iconUrl ?? created.iconUrl,
-        color: normalizeStoreText(input.color, 64) ?? forkSource?.color ?? created.color,
-        tagline: normalizeStoreText(input.tagline, 120) ?? forkSource?.tagline ?? created.tagline,
-        authorName: normalizeStoreText(input.authorName, 200) ?? forkSource?.authorName ?? created.authorName,
-        homepageUrl: normalizeStoreText(input.homepageUrl, 2000) ?? forkSource?.homepageUrl ?? created.homepageUrl,
-        categories: input.categories ? normalizeCategoryList(input.categories) : forkSource?.categories ?? created.categories,
-        folderId: input.folderId ?? null,
-        sharingScope,
-        forkedFromSkillId: forkSource?.id ?? null,
-        forkedFromCompanyId: forkSource?.companyId ?? null,
-        updatedAt: new Date(),
-      })
-      .where(and(eq(companySkills.id, created.id), eq(companySkills.companyId, companyId)))
-      .returning()
-      .then((rows) => rows[0] ?? null);
-    if (forkSource) {
-      await db
-        .update(companySkills)
-        .set({
-          forkCount: sql`${companySkills.forkCount} + 1`,
-          installCount: sql`${companySkills.installCount} + 1`,
-          updatedAt: new Date(),
-        })
-        .where(and(eq(companySkills.id, forkSource.id), eq(companySkills.companyId, companyId)));
-    }
-    await createVersion(companyId, created.id, { label: "Initial version" }, actor);
-    return (await getById(companyId, created.id)) ?? (row ? toCompanySkill(row) : created);
+    })
+      .where(and(eq(companySkills.companyId, skill.companyId), eq(companySkills.id, skill.id)));
+    return inventory;
   }
 
   async function updateFile(
@@ -4523,50 +4793,62 @@ export function companySkillService(db: Db) {
     relativePath: string,
     content: string,
     actor: SkillActor | null = null,
+    format: { encoding?: "utf8" | "base64"; executable?: boolean } = {},
   ): Promise<CompanySkillFileDetail> {
-    await ensureSkillInventoryCurrent(companyId);
-    const skill = await getById(companyId, skillId);
-    if (!skill) throw notFound("Skill not found");
+    return withSkillFileMutation(companyId, skillId, async (skill, tx) => {
 
-    const source = deriveSkillSourceInfo(skill);
-    if (!source.editable || skill.sourceType !== "local_path") {
-      throw unprocessable(source.editableReason ?? "This skill cannot be edited.");
-    }
+      const source = deriveSkillSourceInfo(skill);
+      if (!source.editable || skill.sourceType !== "local_path") {
+        throw unprocessable(source.editableReason ?? "This skill cannot be edited.");
+      }
 
-    const normalizedPath = normalizePortablePath(relativePath);
-    const absolutePath = resolveLocalSkillFilePath(skill, normalizedPath);
-    if (!absolutePath) throw notFound("Skill file not found");
+      const normalizedPath = normalizePortablePath(relativePath);
+      const absolutePath = resolveLocalSkillFilePath(skill, normalizedPath);
+      if (!absolutePath) throw notFound("Skill file not found");
 
-    const previousContent = await fs.readFile(absolutePath, "utf8").catch(() => null);
-    await fs.mkdir(path.dirname(absolutePath), { recursive: true });
-    await fs.writeFile(absolutePath, content, "utf8");
+      if (normalizedPath === "SKILL.md" && format.encoding === "base64") throw unprocessable("SKILL.md must be UTF-8 text.");
+      const bytes = skillFileBytes({ content, encoding: format.encoding });
+      if (format.encoding === "base64" && bytes.toString("base64") !== content) {
+        throw unprocessable("Binary files must use canonical base64 encoding.");
+      }
+      const previousContent = await fs.readFile(absolutePath).catch(() => null);
+      const previousMode = (await fs.stat(absolutePath).catch(() => null))?.mode ?? 0o644;
+      const mode = (format.executable ?? Boolean(previousMode & 0o111)) ? 0o755 : 0o644;
+      await fs.mkdir(path.dirname(absolutePath), { recursive: true });
+      await fs.writeFile(absolutePath, bytes);
+      await fs.chmod(absolutePath, mode);
 
-    if (normalizedPath === "SKILL.md") {
-      const parsed = parseFrontmatterMarkdown(content);
-      await db
-        .update(companySkills)
-        .set({
-          name: asString(parsed.frontmatter.name) ?? skill.name,
-          description: asString(parsed.frontmatter.description) ?? skill.description,
-          markdown: content,
-          ...readSkillStoreMetadata(parsed.frontmatter, skill.metadata),
-          updatedAt: new Date(),
-        })
-        .where(eq(companySkills.id, skill.id));
-    } else {
-      await db
-        .update(companySkills)
-        .set({ updatedAt: new Date() })
-        .where(eq(companySkills.id, skill.id));
-    }
+      if (normalizedPath === "SKILL.md") {
+        const parsed = parseFrontmatterMarkdown(content);
+        await tx
+          .update(companySkills)
+          .set({
+            name: asString(parsed.frontmatter.name) ?? skill.name,
+            description: asString(parsed.frontmatter.description) ?? skill.description,
+            markdown: content,
+            ...readSkillStoreMetadata(parsed.frontmatter, skill.metadata),
+            updatedAt: new Date(),
+          })
+          .where(eq(companySkills.id, skill.id));
+      } else {
+        await tx
+          .update(companySkills)
+          .set({ updatedAt: new Date() })
+          .where(eq(companySkills.id, skill.id));
+      }
 
-    if (previousContent !== content) {
-      await createVersion(companyId, skillId, {}, actor);
-    }
+      const inventory = await refreshEditedSkillInventory(skill, tx);
+      if (!previousContent?.equals(bytes) || Boolean(previousMode & 0o111) !== Boolean(mode & 0o111)) {
+        await createVersion(companyId, skillId, {}, actor, {
+          database: tx, skipInventoryRefresh: true, skill, fileInventory: inventory,
+        });
+      }
 
-    const detail = await readFile(companyId, skillId, normalizedPath);
-    if (!detail) throw notFound("Skill file not found");
-    return detail;
+      const updated = await getById(companyId, skillId, tx);
+      const detail = updated ? await readLoadedSkillFile(updated, normalizedPath) : null;
+      if (!detail) throw notFound("Skill file not found");
+      return detail;
+    });
   }
 
   async function deleteFile(
@@ -4575,56 +4857,55 @@ export function companySkillService(db: Db) {
     input: CompanySkillFileDeleteRequest,
     actor: SkillActor | null = null,
   ): Promise<CompanySkillFileDeleteResult> {
-    await ensureSkillInventoryCurrent(companyId);
-    const skill = await getById(companyId, skillId);
-    if (!skill) throw notFound("Skill not found");
+    return withSkillFileMutation(companyId, skillId, async (skill, tx) => {
 
-    const source = deriveSkillSourceInfo(skill);
-    if (!source.editable || skill.sourceType !== "local_path") {
-      throw unprocessable(source.editableReason ?? "This skill cannot be edited.");
-    }
+      const source = deriveSkillSourceInfo(skill);
+      if (!source.editable || skill.sourceType !== "local_path") {
+        throw unprocessable(source.editableReason ?? "This skill cannot be edited.");
+      }
 
-    const normalizedPath = normalizePortablePath(input.path);
-    if (!normalizedPath) {
-      throw unprocessable("Skill file path is required.");
-    }
+      const normalizedPath = normalizePortablePath(input.path);
+      if (!normalizedPath) {
+        throw unprocessable("Skill file path is required.");
+      }
 
-    const deletedPaths = input.target === "folder"
-      ? skill.fileInventory
-        .map((entry) => normalizePortablePath(entry.path))
-        .filter((entryPath) => entryPath.startsWith(`${normalizedPath}/`))
-      : skill.fileInventory
-        .map((entry) => normalizePortablePath(entry.path))
-        .filter((entryPath) => entryPath === normalizedPath);
+      const deletedPaths = input.target === "folder"
+        ? skill.fileInventory
+          .map((entry) => normalizePortablePath(entry.path))
+          .filter((entryPath) => entryPath.startsWith(`${normalizedPath}/`))
+        : skill.fileInventory
+          .map((entry) => normalizePortablePath(entry.path))
+          .filter((entryPath) => entryPath === normalizedPath);
 
-    if (deletedPaths.length === 0) {
-      throw notFound(input.target === "folder" ? "Skill folder not found" : "Skill file not found");
-    }
-    if (deletedPaths.includes("SKILL.md")) {
-      throw unprocessable("SKILL.md cannot be deleted.");
-    }
-
-    const absolutePath = resolveLocalSkillFilePath(skill, normalizedPath);
-    if (!absolutePath) throw notFound("Skill file not found");
-
-    await fs.rm(absolutePath, {
-      recursive: input.target === "folder",
-      force: false,
-    }).catch((error) => {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      if (deletedPaths.length === 0) {
         throw notFound(input.target === "folder" ? "Skill folder not found" : "Skill file not found");
       }
-      throw error;
+      if (deletedPaths.includes("SKILL.md")) {
+        throw unprocessable("SKILL.md cannot be deleted.");
+      }
+
+      const absolutePath = resolveLocalSkillFilePath(skill, normalizedPath);
+      if (!absolutePath) throw notFound("Skill file not found");
+
+      await fs.rm(absolutePath, {
+        recursive: input.target === "folder",
+        force: false,
+      }).catch((error) => {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+          throw notFound(input.target === "folder" ? "Skill folder not found" : "Skill file not found");
+        }
+        throw error;
     });
 
-    await db
+    await tx
       .update(companySkills)
       .set({ updatedAt: new Date() })
       .where(eq(companySkills.id, skill.id));
 
+    const inventory = await refreshEditedSkillInventory(skill, tx);
     await createVersion(companyId, skillId, {
       label: input.target === "folder" ? `Deleted ${normalizedPath}/` : `Deleted ${normalizedPath}`,
-    }, actor);
+    }, actor, { database: tx, skipInventoryRefresh: true, skill, fileInventory: inventory });
 
     return {
       skillId: skill.id,
@@ -4632,6 +4913,7 @@ export function companySkillService(db: Db) {
       target: input.target,
       deletedPaths,
     };
+    });
   }
 
   async function installUpdate(companyId: string, skillId: string, options: { force?: boolean } = {}): Promise<CompanySkill | null> {
@@ -5676,26 +5958,33 @@ export function companySkillService(db: Db) {
   }
 
   async function materializeRuntimeSkillFiles(companyId: string, skill: CompanySkill) {
-    const files: Array<{ path: string; content: string }> = [];
+    const files: SkillSnapshotFile[] = [];
     for (const entry of skill.fileInventory) {
       const normalizedPath = normalizePortablePath(entry.path);
       const detail = await readLoadedSkillFile(skill, normalizedPath);
-      const content = detail?.content ?? (normalizedPath === "SKILL.md" ? skill.markdown : null);
+      const fromDetail = detail?.content != null;
+      const content = fromDetail ? detail.content : (normalizedPath === "SKILL.md" ? skill.markdown : null);
       if (content === null) throw unprocessable("Declared skill file is unavailable");
-      files.push({ path: normalizedPath, content });
+      // Carry encoding and executable bit so binary files and scripts are
+      // published byte-for-byte with their mode, not as UTF-8 text.
+      files.push(fromDetail
+        ? { path: normalizedPath, content, encoding: detail.encoding, executable: detail.executable }
+        : { path: normalizedPath, content });
     }
     if (!files.some((file) => file.path === "SKILL.md")) {
       throw unprocessable("Company skill could not be materialized because its stored SKILL.md copy is missing.");
     }
-    return publishRuntimeSkillSnapshot(resolveRuntimeSkillMaterializedPath(companyId, skill), files);
+    return publishSkillFileSnapshot(resolveRuntimeSkillMaterializedPath(companyId, skill), files);
   }
 
-  async function materializeVersionSnapshot(companyId: string, skill: CompanySkill, version: CompanySkillVersion) {
-    const runtimeRoot = path.resolve(resolveManagedSkillsRoot(companyId), "__versions__");
+  async function materializeVersionSnapshot(companyId: string, skill: CompanySkill, version: CompanySkillVersion): Promise<string> {
+    const versionRoot = path.resolve(resolveManagedSkillsRoot(companyId), "__versions__", skill.id, version.id);
     if (!version.fileInventory.some((file) => normalizePortablePath(file.path) === "SKILL.md")) {
       throw unprocessable("Company skill version could not be materialized because its SKILL.md snapshot is missing.");
     }
-    return publishRuntimeSkillSnapshot(path.resolve(runtimeRoot, skill.id, version.id), version.fileInventory);
+    // Immutable version content: publish read-only files (0o444, or 0o555 for
+    // executables) like upstream, inside the fork's content-addressed snapshot.
+    return publishSkillFileSnapshot(versionRoot, version.fileInventory, { readOnly: true });
   }
 
   function resolveRuntimeSkillMaterializedPath(companyId: string, skill: Pick<CompanySkill, "key" | "slug">) {
@@ -5708,7 +5997,8 @@ export function companySkillService(db: Db) {
     skill: CompanySkill,
     options: RuntimeSkillEntryOptions,
   ): Promise<RuntimeSkillSourceResolution | null> {
-    const selectedVersionId = options.versionSelections?.get(skill.key) ?? null;
+    const selectedVersionId = options.versionSelections?.get(skill.key)
+      ?? (skill.metadata?.skillSourceId && skill.metadata?.snapshotHash ? skill.currentVersionId : null);
     if (selectedVersionId) {
       const versionPath = path.resolve(resolveManagedSkillsRoot(companyId), "__versions__", skill.id, selectedVersionId);
       const version = await getVersion(companyId, skill.id, selectedVersionId);
@@ -5803,7 +6093,7 @@ export function companySkillService(db: Db) {
         key: skill.key,
         runtimeName: buildSkillRuntimeName(skill.key, skill.slug),
         source: sourceResolution.source,
-        versionId: options.versionSelections?.get(skill.key) ?? null,
+        versionId: options.versionSelections?.get(skill.key) ?? (skill.metadata?.skillSourceId && skill.metadata?.snapshotHash ? skill.currentVersionId : null),
         currentVersionId: skill.currentVersionId,
         sourceStatus: sourceResolution.status,
         missingDetail: sourceResolution.status === "missing" ? sourceResolution.detail : null,
@@ -5953,12 +6243,16 @@ export function companySkillService(db: Db) {
     return out;
   }
 
-  async function upsertImportedSkills(companyId: string, imported: ImportedSkill[]): Promise<CompanySkill[]> {
+  async function upsertImportedSkills(
+    companyId: string,
+    imported: ImportedSkill[],
+    database: DbOrTransaction = db,
+  ): Promise<CompanySkill[]> {
     const out: CompanySkill[] = [];
     for (const skill of imported) {
       assertImportedSkillKeyAllowed(skill);
       assertImportedSkillSourceAllowed(skill);
-      const existing = await getByKey(companyId, skill.key);
+      const existing = await getByKey(companyId, skill.key, database);
       const existingMeta = existing ? getSkillMeta(existing) : {};
       const incomingMeta = skill.metadata && isPlainRecord(skill.metadata) ? skill.metadata : {};
       const incomingOwner = asString(incomingMeta.owner);
@@ -6020,13 +6314,13 @@ export function companySkillService(db: Db) {
         continue;
       }
       const row = existing
-        ? await db
+        ? await database
           .update(companySkills)
           .set(values)
           .where(eq(companySkills.id, existing.id))
           .returning()
           .then((rows) => rows[0] ?? null)
-        : await db
+        : await database
           .insert(companySkills)
           .values(values)
           .returning()
@@ -6850,41 +7144,82 @@ export function companySkillService(db: Db) {
   }
 
   async function deleteSkill(companyId: string, skillId: string): Promise<CompanySkill | null> {
-    const row = await db
-      .select()
-      .from(companySkills)
-      .where(and(eq(companySkills.id, skillId), eq(companySkills.companyId, companyId)))
-      .then((rows) => rows[0] ?? null);
-    if (!row) return null;
-
-    const skill = toCompanySkill(row);
-    const usedByAgents = await usage(companyId, skill.key);
-
-    if (usedByAgents.length > 0) {
+    const initial = await getById(companyId, skillId);
+    if (!initial) return null;
+    async function assertUnused(skill: CompanySkill) {
+      const usedByAgents = await usage(companyId, skill.key);
+      if (usedByAgents.length === 0) return;
       const agentNames = usedByAgents.map((agent) => agent.name).sort((left, right) => left.localeCompare(right));
       throw unprocessable(
         `Cannot delete skill "${skill.name}" while it is still used by ${agentNames.join(", ")}. Detach it from those agents first.`,
         {
-          skillId: skill.id,
-          skillKey: skill.key,
+          skillId: skill.id, skillKey: skill.key,
           usedByAgents: usedByAgents.map((agent) => ({
-            id: agent.id,
-            name: agent.name,
-            urlKey: agent.urlKey,
-            adapterType: agent.adapterType,
+            id: agent.id, name: agent.name, urlKey: agent.urlKey, adapterType: agent.adapterType,
           })),
         },
       );
     }
-
-    // Take the cache lifecycle lock before deleting the row. A busy publisher must not
-    // turn a committed deletion into an apparent API failure, nor recreate its cache.
-    await removeRuntimeSkillCache(resolveManagedSkillsRoot(companyId), skill.id, async () => {
-      await fs.rm(resolveRuntimeSkillMaterializedPath(companyId, skill), { recursive: true, force: true });
-      await db.delete(companySkills).where(eq(companySkills.id, skillId));
+    await assertUnused(initial);
+    const managedRoot = resolveManagedSkillsRoot(companyId);
+    let movedSource: { source: string; quarantine: string } | undefined;
+    let deleted: CompanySkill | null = null;
+    async function restoreSource() {
+      if (!movedSource) return;
+      await fs.rename(movedSource.quarantine, movedSource.source);
+      movedSource = undefined;
+    }
+    // Keep the cache lifecycle lock through database commit. A publisher must
+    // not see the old row after cache removal and republish a deleted skill.
+    await removeRuntimeSkillCache(managedRoot, initial.id, async () => {
+      try {
+        deleted = await db.transaction(async (tx) => {
+          // Share creation's name lock and re-read the ID, so a second delete
+          // cannot remove a newly recreated skill with the same name.
+          await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`${companyId}:${initial.slug}`}, 0))`);
+          const skill = await getById(companyId, skillId, tx);
+          if (!skill) return null;
+          if (skill.slug !== initial.slug) throw conflict("Skill changed during deletion. Retry the request.");
+          await assertUnused(skill);
+          try {
+            await fs.rm(resolveRuntimeSkillMaterializedPath(companyId, skill), { recursive: true, force: true });
+            if (isPaperclipManagedRenameTarget(skill)) {
+              const source = normalizeSkillDirectory(skill)!;
+              const stat = await fs.lstat(source).catch((error: NodeJS.ErrnoException) => {
+                if (error.code === "ENOENT") return null;
+                throw error;
+              });
+              if (stat) {
+                const quarantineRoot = path.join(managedRoot, ".deleted");
+                await fs.mkdir(quarantineRoot, { recursive: true });
+                const quarantine = path.join(quarantineRoot, `${skill.id}-${randomUUID()}`);
+                // Do not follow symlinks or delete external/project sources.
+                // Retain bytes until the database deletion commits.
+                await fs.rename(source, quarantine);
+                movedSource = { source, quarantine };
+              }
+            }
+            await tx.delete(companySkills).where(and(eq(companySkills.id, skillId), eq(companySkills.companyId, companyId)));
+          } catch (error) {
+            // Restore before releasing the name lock on a failed write.
+            await restoreSource();
+            throw error;
+          }
+          return skill;
+        });
+      } catch (error) {
+        await restoreSource();
+        throw error;
+      }
     });
-
-    return skill;
+    // Only remove the unique quarantine path after commit. Cleanup must not
+    // remove a replacement skill or report a committed delete as failed.
+    if (movedSource) {
+      await fs.rm(movedSource.quarantine, { recursive: true, force: true }).catch((error) => {
+        logger.warn({ err: error, companyId, skillId }, "Skill deleted; quarantined source cleanup failed");
+      });
+    }
+    return deleted;
   }
 
   return {
