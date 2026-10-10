@@ -138,7 +138,10 @@ describeEmbeddedPostgres("heartbeat queued-run claim isolation", () => {
   }
 
   // A queued-comment interrupt wake whose receipt cannot be verified. The run
-  // identity check rejects it with a 403 every time the run is claimed.
+  // identity check rejects it with a 403 every time the run is claimed. The
+  // fork (#115) fails this run in place instead of using #14738's generic
+  // cancellation, which would release the issue and could promote the saved,
+  // unverified receipt.
   function insertUnverifiableInterruptRun(companyId: string, agentId: string, createdAt = new Date(Date.now() - 60_000)) {
     return insertQueuedRun(companyId, agentId, {
       reason: "issue_commented",
@@ -177,28 +180,31 @@ describeEmbeddedPostgres("heartbeat queued-run claim isolation", () => {
       .then((rows) => rows[0] ?? null);
   }
 
-  it("cancels a queued run whose claim is rejected instead of failing recovery", async () => {
+  it("fails a queued interrupt whose authority is unavailable instead of failing recovery", async () => {
     const { companyId, agentId } = await insertAgent();
     const { runId, wakeupRequestId } = await insertUnverifiableInterruptRun(companyId, agentId);
 
     await expect(heartbeat.resumeQueuedRuns()).resolves.toBeUndefined();
 
     expect(await runStatus(runId)).toMatchObject({
-      status: "cancelled",
-      errorCode: "queued_run_claim_rejected",
-      error: "Cancelled because the queued run cannot be claimed: Queued-message interrupt authority is unavailable",
+      status: "failed",
+      errorCode: "queued_comment_interrupt_authority_unavailable",
+      error: "Queued-message interrupt authority is unavailable",
     });
     const wakeup = await db
       .select({ status: agentWakeupRequests.status })
       .from(agentWakeupRequests)
       .where(sql`${agentWakeupRequests.id} = ${wakeupRequestId}`)
       .then((rows) => rows[0] ?? null);
-    expect(wakeup).toMatchObject({ status: "cancelled" });
+    expect(wakeup).toMatchObject({ status: "failed" });
 
     // Recovery runs again on the next cycle and on every restart. The run must
     // stay settled instead of failing the claim loop again.
     await expect(heartbeat.resumeQueuedRuns()).resolves.toBeUndefined();
-    expect(await runStatus(runId)).toMatchObject({ status: "cancelled" });
+    expect(await runStatus(runId)).toMatchObject({
+      status: "failed",
+      errorCode: "queued_comment_interrupt_authority_unavailable",
+    });
   });
 
   it("claims the agent's next queued run after a rejected one", async () => {
@@ -210,8 +216,8 @@ describeEmbeddedPostgres("heartbeat queued-run claim isolation", () => {
     await heartbeat.drainActiveRunExecutions();
 
     expect(await runStatus(rejectedRunId)).toMatchObject({
-      status: "cancelled",
-      errorCode: "queued_run_claim_rejected",
+      status: "failed",
+      errorCode: "queued_comment_interrupt_authority_unavailable",
     });
     expect(mockAdapterExecute).toHaveBeenCalledOnce();
     expect(await runStatus(healthyRunId)).toMatchObject({ status: "succeeded" });
@@ -239,7 +245,10 @@ describeEmbeddedPostgres("heartbeat queued-run claim isolation", () => {
     await expect(heartbeat.resumeQueuedRuns()).resolves.toBeUndefined();
     await heartbeat.drainActiveRunExecutions();
 
-    expect(await runStatus(rejectedRunId)).toMatchObject({ status: "cancelled" });
+    expect(await runStatus(rejectedRunId)).toMatchObject({
+      status: "failed",
+      errorCode: "queued_comment_interrupt_authority_unavailable",
+    });
     expect(await runStatus(healthyRunId)).toMatchObject({ status: "succeeded" });
   });
 });
