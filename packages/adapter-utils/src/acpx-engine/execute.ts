@@ -5127,15 +5127,18 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
             ? channelLostMessage
             : formatTerminalSessionFailure(resultErrorMessage(terminal), failureDiagnostic);
         const terminalStopReason = terminal.status === "failed" ? terminal.error.message : terminal.stopReason;
-        // A typed terminal session failure is classified only by the adapter's
-        // structured classifier (upstream). Without one, the fork's message
-        // classifier (Kimi wrapped five-hour quota #120, auth, 429; #136)
-        // still classifies the terminal error text.
+        // A typed terminal session failure is classified by the adapter's
+        // structured classifier (upstream), whose null is a deliberate "not
+        // quota". An adapter without one (kimi_local and other plugins) keeps
+        // the fork's message classifier (Kimi wrapped five-hour quota #120,
+        // auth, 429; #136), typed failure or not.
         const typedTerminalFailureReported = terminalSessionFailure !== null;
         const classifiedFailure = !timedOut && !channelLost && terminal.status === "failed"
-          ? typedTerminalFailureReported
+          ? typedTerminalFailureReported && deps.classifyTerminalSessionFailure
             ? terminalFailureClassification
-            : classifyAcpTerminalFailure(terminal.error.message, now())
+            // The fork classifier anchors its patterns to one message, so a
+            // typed failure is classified by its own title.
+            : classifyAcpTerminalFailure(terminalSessionFailure?.title ?? terminal.error.message, now())
           : null;
         // Typed failures keep upstream's omit-when-absent fields; every other
         // result keeps the fork's explicit null recovery fields.
