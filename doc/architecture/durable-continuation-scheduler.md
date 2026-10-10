@@ -53,6 +53,18 @@ than an in-memory timer owned by an agent:
 Because these records survive a process restart, startup reconciliation can
 resume queued work or repair an issue whose previous execution disappeared.
 
+An assigned task in `blocked` or `in_review` with a future
+`monitor_next_check_at` already has a timed wake path. Automatic
+`issue_blockers_resolved` and `issue_unblock_requested` signals wait for that
+monitor instead of starting another assignee session. Admission records a
+coalesced `issue_monitor_pending` receipt; dispatch checks the current monitor
+again so an earlier queued signal cannot bypass a newly scheduled wait.
+Dependency completion, workspace finalization and periodic reconciliation use
+the same admission check. Due monitors, fresh comments, explicit manual wakes
+and a different unblock owner's work remain eligible. An agent waiting for an
+external event should schedule a bounded monitor or record a live response or
+dependency path rather than repeatedly checking out and re-blocking the task.
+
 ## Explicit continuations
 
 A native result can report `yielded` with a continuation containing:

@@ -16,6 +16,8 @@ vi.mock("../adapters/index.ts", async () => ({
   getServerAdapter: vi.fn(() => ({ supportsLocalAgentJwt: false, execute })),
 }));
 import { heartbeatService } from "../services/heartbeat.ts";
+import { issueService } from "../services/issues.ts";
+import { deliverAgentUnblockNotification } from "../services/routable-blocked.ts";
 
 describe("automatic readiness wakes while an interaction is pending", () => {
   let temporary: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
@@ -209,6 +211,125 @@ describe("automatic readiness wakes while an interaction is pending", () => {
       .where(eq(issues.id, f.issueId));
     return { runId, wakeId: wake.id };
   }
+
+  async function scheduleFutureMonitor(f: Awaited<ReturnType<typeof seed>>) {
+    const nextCheckAt = new Date(Date.now() + 60 * 60_000);
+    await db.update(issues).set({
+      monitorNextCheckAt: nextCheckAt,
+      executionPolicy: { monitor: {
+        kind: "external_service", nextCheckAt: nextCheckAt.toISOString(),
+        maxAttempts: 4, scheduledBy: "assignee", notes: "Wait for publication",
+      } },
+    }).where(eq(issues.id, f.issueId));
+    return nextCheckAt;
+  }
+
+  it.each(["issue_blockers_resolved", "issue_unblock_requested"])(
+    "parks %s until the assignee's scheduled monitor is due", async (reason) => {
+      const f = await seed({ interactionStatus: "answered" });
+      await scheduleFutureMonitor(f);
+      for (let cycle = 0; cycle < 3; cycle++) {
+        const wake = options(f, reason);
+        expect(await heartbeat.wakeup(f.agentId, {
+          ...wake, idempotencyKey: `${wake.idempotencyKey}:${cycle}`,
+        })).toBeNull();
+      }
+      await heartbeat.drainActiveRunExecutions();
+      expect(execute).not.toHaveBeenCalled();
+      const wakes = await db.select().from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.companyId, f.companyId));
+      expect(wakes).toHaveLength(1);
+      expect(wakes[0]).toMatchObject({ reason: "issue_monitor_pending", coalescedCount: 2 });
+    },
+  );
+
+  it("does not turn a checkout/re-block into a new self-unblock session before a due monitor", async () => {
+    const f = await seed({ interactionStatus: "answered" });
+    const svc = issueService(db);
+    await svc.checkout(f.issueId, f.agentId, ["blocked"], null);
+    const blocked = await svc.update(f.issueId, {
+      status: "blocked", unblockDescriptor: { owner: { agentId: f.agentId }, action: "Wait for publication" },
+    });
+    await scheduleFutureMonitor(f);
+    await deliverAgentUnblockNotification({
+      issue: blocked!, wakeup: heartbeat.wakeup,
+      markNotified: async (blockedOwnerNotifiedAt) => {
+        await db.update(issues).set({ blockedOwnerNotifiedAt }).where(eq(issues.id, f.issueId));
+      },
+    });
+    await heartbeat.reconcileResolvedDependencyWakes({ companyId: f.companyId });
+    await heartbeat.reconcileResolvedDependencyWakes({ companyId: f.companyId, source: "workspace.finalize", blockerIssueId: f.blockerId });
+    await heartbeat.drainActiveRunExecutions();
+    expect(execute).not.toHaveBeenCalled();
+    expect((await db.select().from(issues).where(eq(issues.id, f.issueId)))[0])
+      .toMatchObject({ status: "blocked", executionRunId: null });
+  });
+
+  it("rechecks a monitor scheduled after a readiness run was queued", async () => {
+    const f = await seed({ interactionStatus: "answered" });
+    const { runId, wakeId } = await seedQueuedReadiness(f);
+    await scheduleFutureMonitor(f);
+    await heartbeat.resumeQueuedRuns();
+    await heartbeat.drainActiveRunExecutions();
+    expect(execute).not.toHaveBeenCalled();
+    expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)))[0])
+      .toMatchObject({ status: "cancelled", errorCode: "issue_monitor_pending" });
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeId)))[0].status)
+      .toBe("skipped");
+  });
+
+  it("still admits a due monitor and a fresh user comment", async () => {
+    const f = await seed({ interactionStatus: "answered" });
+    await scheduleFutureMonitor(f);
+    const commentId = await seedComment(f);
+    const wake = options(f, "issue_blockers_resolved");
+    expect(await heartbeat.wakeup(f.agentId, {
+      ...wake, contextSnapshot: { ...wake.contextSnapshot, commentId, wakeCommentId: commentId },
+    })).not.toBeNull();
+    await heartbeat.drainActiveRunExecutions();
+    expect(execute).toHaveBeenCalled();
+    await db.update(issues).set({ status: "blocked", monitorNextCheckAt: new Date(Date.now() - 1_000) })
+      .where(eq(issues.id, f.issueId));
+    expect(await heartbeat.wakeup(f.agentId, {
+      ...options(f, "issue_blockers_resolved"), idempotencyKey: `monitor-due:${f.issueId}`,
+    })).not.toBeNull();
+  });
+
+  it("preserves a distinct unblock owner's work while the assignee has a future monitor", async () => {
+    const f = await seed({ interactionStatus: "answered", differentAssignee: true });
+    await scheduleFutureMonitor(f);
+    expect(await heartbeat.wakeup(f.agentId, options(f, "issue_unblock_requested"))).not.toBeNull();
+    await heartbeat.drainActiveRunExecutions();
+    const wakes = await db.select().from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.companyId, f.companyId));
+    expect(wakes.every(wake => wake.reason !== "issue_monitor_pending")).toBe(true);
+  });
+
+  it("preserves an explicit manual wake despite a future monitor", async () => {
+    const f = await seed({ interactionStatus: "answered" });
+    await scheduleFutureMonitor(f);
+    expect(await heartbeat.wakeup(f.agentId, {
+      source: "on_demand", triggerDetail: "manual", reason: "manual",
+      payload: { issueId: f.issueId }, contextSnapshot: { issueId: f.issueId, wakeReason: "manual" },
+    })).not.toBeNull();
+  });
+
+  it("parks a persisted native dependency intent until the scheduled monitor is due", async () => {
+    const f = await seed({ interactionStatus: "answered" });
+    await scheduleFutureMonitor(f);
+    await db.insert(agentWakeupRequests).values({
+      companyId: f.companyId, agentId: f.agentId, reason: "issue_blockers_resolved",
+      source: "automation", triggerDetail: "system", status: "queued",
+      requestedByActorType: "system", requestedByActorId: "native-status-committer",
+      idempotencyKey: `native-monitor:${f.issueId}`,
+      payload: { issueId: f.issueId, taskId: f.issueId,
+        _paperclipWakeContext: { issueId: f.issueId, taskId: f.issueId, source: "native_status_decision", wakeReason: "issue_blockers_resolved" } },
+    });
+    await heartbeat.dispatchPendingNativeStatusWakeups({ companyId: f.companyId });
+    await heartbeat.drainActiveRunExecutions();
+    expect(execute).not.toHaveBeenCalled();
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId))).toHaveLength(0);
+  });
 
   it("cancels a readiness run queued before the interaction was created", async () => {
     const f = await seed();
