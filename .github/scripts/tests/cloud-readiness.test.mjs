@@ -21,7 +21,9 @@ test("retirement preserves exact-source verification without issuing legacy depl
 test("standard image provenance and independent exact-source migrators remain available", () => {
   const docker = readFileSync(new URL("../../workflows/docker.yml", import.meta.url), "utf8");
   assert.match(docker, /target: production/);
-  assert.match(docker, /type=raw,value=sha-\$\{\{ github.sha \}\}/);
+  // Fork (#172): the full-SHA tag names the resolved source commit, which is
+  // github.sha on push and the requested exact commit on a manual dispatch.
+  assert.match(docker, /type=raw,value=sha-\$\{\{ steps.image-inputs.outputs.source_sha \}\}/);
   assert.match(docker, /run: node scripts\/standard-image-contract.mjs --resolve "\$GITHUB_SHA"/);
   assert.match(docker, /subject-digest: \$\{\{ steps.standard.outputs.digest \}\}/);
   const migrator = readFileSync(new URL("../../workflows/cloud-migrator-artifacts.yml", import.meta.url), "utf8");

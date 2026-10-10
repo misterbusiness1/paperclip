@@ -13,6 +13,11 @@ on:
   # the new tag ref instead. The tag mapping below keys off github.ref either
   # way.
   workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Full immutable source commit SHA to build
+        required: false
+        type: string
 
 # Least privilege: nothing at the workflow level; each job declares exactly
 # the token scopes it uses (checkout needs contents:read, GHCR pushes need
@@ -29,7 +34,7 @@ permissions: {}
 # channel afterwards, only if it still matches the npm `canary`
 # dist-tag, so the channel moves monotonically and always mirrors npm.
 concurrency:
-  group: docker-${{ github.ref }}
+  group: docker-${{ inputs.source_ref || github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -78,9 +83,23 @@ jobs:
       contents: read
       packages: write
     steps:
-      - name: Checkout
+      - name: Checkout protected builder controls
         uses: actions/checkout@v7
         with:
+          ref: ${{ github.workflow_sha }}
+          path: .image-builder
+          persist-credentials: false
+
+      - name: Resolve immutable source and image repository
+        id: image-inputs
+        run: |
+          node .image-builder/scripts/resolve-image-build-inputs.mjs "${{ inputs.source_ref }}" "${{ github.sha }}" "${{ github.repository }}"
+          rm -rf .image-builder
+
+      - name: Checkout immutable source
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.image-inputs.outputs.source_sha }}
           # Full history and tags so `git describe` below can compute the
           # release version to stamp into the image.
           fetch-depth: 0
@@ -208,16 +227,17 @@ jobs:
         id: meta
         uses: docker/metadata-action@v6
         with:
-          images: ghcr.io/${{ github.repository }}
+          images: ${{ steps.image-inputs.outputs.image_repository }}
           tags: |
             type=raw,value=nightly,enable=${{ startsWith(github.ref, 'refs/tags/nightly/v') }}
             type=raw,value=beta,enable=${{ startsWith(github.ref, 'refs/tags/beta/v') }}
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
             type=semver,pattern={{version}},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
             type=semver,pattern={{major}}.{{minor}},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
-            type=sha
-            type=raw,value=sha-${{ github.sha }},enable=${{ github.repository == 'paperclipai/paperclip' && github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+            type=sha,enable=${{ github.event_name != 'workflow_dispatch' }}
+            type=raw,value=sha-${{ steps.image-inputs.outputs.source_sha }},enable=${{ github.event_name == 'workflow_dispatch' || (github.repository == 'paperclipai/paperclip' && github.event_name == 'push' && github.ref == 'refs/heads/master') }}
           labels: |
+            org.opencontainers.image.revision=${{ steps.image-inputs.outputs.source_sha }}
             io.github.paperclipai.schema.last-migration=${{ steps.schema.outputs.last }}
             io.github.paperclipai.schema.migration-count=${{ steps.schema.outputs.count }}
       - name: Build and push by digest
@@ -231,13 +251,14 @@ jobs:
           target: production
           build-args: |
             PAPERCLIP_BUILD_VERSION=${{ steps.build-version.outputs.version }}
-            PAPERCLIP_BUILD_COMMIT=${{ github.sha }}
+            PAPERCLIP_BUILD_COMMIT=${{ steps.image-inputs.outputs.source_sha }}
             CLI_TOOLS_CACHE_EPOCH=${{ steps.tools-epoch.outputs.epoch }}
           platforms: ${{ matrix.platform }}
           # By digest, not by tag: two runners cannot each push the same tag
           # and end up with a manifest list. Each leg publishes an untagged
           # image and `merge` names them together.
-          outputs: type=image,name=ghcr.io/${{ github.repository }},push-by-digest=true,name-canonical=true,push=true
+          outputs: type=image,name=${{ steps.image-inputs.outputs.image_repository }},push-by-digest=true,name-canonical=true,push=true
+          provenance: mode=max
           # Registry-backed BuildKit cache instead of type=gha: the Actions
           # cache is capped at 10GB per repo, and two multi-arch mode=max jobs
           # evict each other, so most builds ran effectively cold. The cache
@@ -246,8 +267,8 @@ jobs:
           #
           # Per-arch refs now the legs are separate runners: a shared ref would
           # have each leg overwrite the other's cache on every build.
-          cache-from: type=registry,ref=ghcr.io/${{ github.repository }}:buildcache-${{ matrix.arch }}
-          cache-to: type=registry,ref=ghcr.io/${{ github.repository }}:buildcache-${{ matrix.arch }},mode=max
+          cache-from: type=registry,ref=${{ steps.image-inputs.outputs.image_repository }}:buildcache-${{ matrix.arch }}
+          cache-to: type=registry,ref=${{ steps.image-inputs.outputs.image_repository }}:buildcache-${{ matrix.arch }},mode=max
           labels: ${{ steps.meta.outputs.labels }}
 
       # The digest is the only thing `merge` needs from this job. Carried as an
@@ -284,9 +305,23 @@ jobs:
     steps:
       # Checked out for `packages/db` (schema labels) and the orphan-reaping
       # script the verification step pipes in.
-      - name: Checkout
+      - name: Checkout protected builder controls
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          ref: ${{ github.workflow_sha }}
+          path: .image-builder
+          persist-credentials: false
+
+      - name: Resolve immutable source and image repository
+        id: image-inputs
+        run: |
+          node .image-builder/scripts/resolve-image-build-inputs.mjs "${{ inputs.source_ref }}" "${{ github.sha }}" "${{ github.repository }}"
+          rm -rf .image-builder
+
+      - name: Checkout immutable source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ steps.image-inputs.outputs.source_sha }}
           fetch-depth: 0
 
       - name: Download digests
@@ -326,16 +361,17 @@ jobs:
         id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
         with:
-          images: ghcr.io/${{ github.repository }}
+          images: ${{ steps.image-inputs.outputs.image_repository }}
           tags: |
             type=raw,value=nightly,enable=${{ startsWith(github.ref, 'refs/tags/nightly/v') }}
             type=raw,value=beta,enable=${{ startsWith(github.ref, 'refs/tags/beta/v') }}
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
             type=semver,pattern={{version}},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
             type=semver,pattern={{major}}.{{minor}},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
-            type=sha
-            type=raw,value=sha-${{ github.sha }},enable=${{ github.repository == 'paperclipai/paperclip' && github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+            type=sha,enable=${{ github.event_name != 'workflow_dispatch' }}
+            type=raw,value=sha-${{ steps.image-inputs.outputs.source_sha }},enable=${{ github.event_name == 'workflow_dispatch' || (github.repository == 'paperclipai/paperclip' && github.event_name == 'push' && github.ref == 'refs/heads/master') }}
           labels: |
+            org.opencontainers.image.revision=${{ steps.image-inputs.outputs.source_sha }}
             io.github.paperclipai.schema.last-migration=${{ steps.schema.outputs.last }}
             io.github.paperclipai.schema.migration-count=${{ steps.schema.outputs.count }}
 
@@ -345,7 +381,7 @@ jobs:
           set -euo pipefail
           docker buildx imagetools create \
             $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            $(printf 'ghcr.io/${{ github.repository }}@sha256:%s ' *)
+            $(printf '${{ steps.image-inputs.outputs.image_repository }}@sha256:%s ' *)
 
       # PID 1 must be an init that reaps adopted orphans. With node there, the
       # orphans agent runs leave behind are never wait()ed and pin as zombies
@@ -417,6 +453,17 @@ jobs:
       group: docker-canary-channel-promotion
       cancel-in-progress: false
     steps:
+      - name: Checkout protected builder controls
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .image-builder
+          persist-credentials: false
+
+      - name: Resolve image repository
+        id: image-inputs
+        run: node .image-builder/scripts/resolve-image-build-inputs.mjs "${{ github.sha }}" "${{ github.sha }}" "${{ github.repository }}"
+
       - name: Login to GitHub Container Registry
         uses: docker/login-action@v4
         with:
@@ -426,7 +473,7 @@ jobs:
 
       - name: Converge the channel tags onto the current npm canary
         env:
-          IMAGE: ghcr.io/${{ github.repository }}
+          IMAGE: ${{ steps.image-inputs.outputs.image_repository }}
           GH_TOKEN: ${{ github.token }}
         run: |
           current="$(curl -fsS "https://registry.npmjs.org/-/package/@paperclipai%2Fdb/dist-tags" | jq -er .canary)"
