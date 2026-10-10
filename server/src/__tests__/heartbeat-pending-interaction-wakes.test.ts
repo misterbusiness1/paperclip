@@ -311,20 +311,21 @@ describe("automatic readiness wakes while an interaction is pending", () => {
     await db.update(issues).set({ status: "done" })
       .where(eq(issues.id, f.blockerId));
 
-    const monitorWake = options(f, "issue_monitor_due");
-    expect(await heartbeat.wakeup(f.agentId, monitorWake)).not.toBeNull();
+    expect(await heartbeat.triggerIssueMonitor(f.issueId, {
+      actorType: "system",
+      actorId: "test-monitor-scheduler",
+      now: new Date(),
+    })).toMatchObject({ outcome: "triggered" });
     await vi.waitFor(
       () => expect(execute).toHaveBeenCalledTimes(1),
       { timeout: 5_000 },
     );
-    // The scheduler clears the one-shot monitor as it fires; this test invokes
-    // the wake directly so it can hold the adapter at the race boundary.
-    await db.update(issues).set({
-      status: "in_progress",
-      monitorNextCheckAt: null,
-      executionPolicy: null,
-    }).where(eq(issues.id, f.issueId));
-
+    // Keep this fixture focused on dependency-ready generation dedup. The real
+    // canary maintains a pending approval; this smaller fixture uses an answered
+    // interaction, so move it out of review before finalization can schedule the
+    // unrelated review-path repair.
+    await db.update(issues).set({ status: "in_progress" })
+      .where(eq(issues.id, f.issueId));
     const dependencyWake = heartbeat.wakeup(
       f.agentId,
       options(f, "issue_blockers_resolved"),
@@ -349,6 +350,63 @@ describe("automatic readiness wakes while an interaction is pending", () => {
     expect(execute).toHaveBeenCalledTimes(1);
     expect(adapterState.sideEffects).toBe(1);
     expect(finalRuns).toHaveLength(1);
+
+    await heartbeat.reconcileResolvedDependencyWakes({ companyId: f.companyId });
+    await heartbeat.reconcileResolvedDependencyWakes({ companyId: f.companyId });
+    await heartbeat.drainActiveRunExecutions();
+    const reconciledRuns = await db.select().from(heartbeatRuns)
+      .where(eq(heartbeatRuns.companyId, f.companyId));
+    expect(reconciledRuns).toHaveLength(1);
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(adapterState.sideEffects).toBe(1);
+
+    const freshBlockerId = randomUUID();
+    const freshCycle = new Date();
+    await db.insert(issues).values({
+      id: freshBlockerId,
+      companyId: f.companyId,
+      title: "Fresh blocker generation",
+      status: "todo",
+      priority: "medium",
+    });
+    await db.insert(issueRelations).values({
+      companyId: f.companyId,
+      issueId: freshBlockerId,
+      relatedIssueId: f.issueId,
+      type: "blocks",
+    });
+    await db.update(issues).set({
+      status: "blocked",
+      blockedTransitionAt: freshCycle,
+    }).where(eq(issues.id, f.issueId));
+    await db.update(issues).set({ status: "done" })
+      .where(eq(issues.id, freshBlockerId));
+    await heartbeat.reconcileResolvedDependencyWakes({ companyId: f.companyId });
+    await heartbeat.drainActiveRunExecutions();
+    expect(execute).toHaveBeenCalledTimes(2);
+    expect(adapterState.sideEffects).toBe(2);
+
+    const successorAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: successorAgentId,
+      companyId: f.companyId,
+      name: "Successor owner",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      permissions: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+    });
+    await db.update(issues).set({
+      assigneeAgentId: successorAgentId,
+      status: "blocked",
+    })
+      .where(eq(issues.id, f.issueId));
+    await heartbeat.reconcileResolvedDependencyWakes({ companyId: f.companyId });
+    await heartbeat.drainActiveRunExecutions();
+    expect(execute).toHaveBeenCalledTimes(3);
+    expect(adapterState.sideEffects).toBe(3);
   });
 
   it("still admits a due monitor and a fresh user comment", async () => {

@@ -190,6 +190,7 @@ export async function findExistingIssueBlockersResolvedWakeForReadyState(
   db: Db,
   input: {
     companyId: string;
+    agentId?: string | null;
     dependentIssueId: string;
     blockerIssueIds: string[];
     blockedTransitionAt?: IssueBlockersResolvedWakeCycleInput;
@@ -216,15 +217,16 @@ export async function findExistingIssueBlockersResolvedWakeForReadyState(
     .select({
       id: agentWakeupRequests.id,
       status: agentWakeupRequests.status,
-      idempotencyKey: sql<string | null>`case when ${agentWakeupRequests.idempotencyKey} like 'issue-comment-request:%' then coalesce(${agentWakeupRequests.payload}->>'dependencyReadyStateKey', ${agentWakeupRequests.idempotencyKey}) else ${agentWakeupRequests.idempotencyKey} end`,
+      idempotencyKey: sql<string | null>`case when ${agentWakeupRequests.idempotencyKey} like 'issue-comment-request:%' or ${agentWakeupRequests.idempotencyKey} like 'issue-monitor:%' then coalesce(${agentWakeupRequests.payload}->>'dependencyReadyStateKey', ${agentWakeupRequests.idempotencyKey}) else ${agentWakeupRequests.idempotencyKey} end`,
       requestedAt: agentWakeupRequests.requestedAt,
     })
     .from(agentWakeupRequests)
     .where(
       and(
         eq(agentWakeupRequests.companyId, input.companyId),
+        ...(input.agentId ? [eq(agentWakeupRequests.agentId, input.agentId)] : []),
         or(inArray(agentWakeupRequests.idempotencyKey, lookupKeys),
-          and(sql`${agentWakeupRequests.idempotencyKey} like 'issue-comment-request:%'`, inArray(sql<string>`${agentWakeupRequests.payload}->>'dependencyReadyStateKey'`, lookupKeys)))!,
+          and(or(sql`${agentWakeupRequests.idempotencyKey} like 'issue-comment-request:%'`, sql`${agentWakeupRequests.idempotencyKey} like 'issue-monitor:%'`)!, inArray(sql<string>`${agentWakeupRequests.payload}->>'dependencyReadyStateKey'`, lookupKeys)))!,
       ),
     );
 

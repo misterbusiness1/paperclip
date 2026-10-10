@@ -5904,6 +5904,7 @@ export function recoveryService(
         const existingWake =
           await findExistingIssueBlockersResolvedWakeForReadyState(db, {
             companyId,
+            agentId,
             dependentIssueId: candidate.id,
             blockerIssueIds: readiness.blockerIssueIds,
             blockedTransitionAt: candidate.blockedTransitionAt,

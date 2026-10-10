@@ -413,7 +413,10 @@ import {
 import { createToolGatewayService } from "./tool-gateway.js";
 import { toolAccessService } from "./tool-access.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
-import { ISSUE_BLOCKERS_RESOLVED_WAKE_REASON } from "./issue-dependency-wakeups.js";
+import {
+  buildIssueBlockersResolvedWakeStateKey,
+  ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
+} from "./issue-dependency-wakeups.js";
 import {
   buildIssueMonitorClearedPatch,
   buildIssueMonitorTriggeredPatch,
@@ -11165,6 +11168,7 @@ export function heartbeatService(
     monitorAttemptCount: issues.monitorAttemptCount,
     monitorNotes: issues.monitorNotes,
     monitorScheduledBy: issues.monitorScheduledBy,
+    blockedTransitionAt: issues.blockedTransitionAt,
   };
 
   interface IssueMonitorDispatchRow {
@@ -11187,6 +11191,7 @@ export function heartbeatService(
     monitorAttemptCount: number | null;
     monitorNotes: string | null;
     monitorScheduledBy: string | null;
+    blockedTransitionAt: Date | null;
   }
 
   function parseMonitorDate(value: string | null | undefined) {
@@ -11608,6 +11613,19 @@ export function heartbeatService(
             "The previous reviewer run reached provider quota. Resume this execution-review stage now that the quota wait has elapsed.",
         }
       : {};
+    const dependencyReadiness = !isProviderQuotaReviewMonitor
+      ? (await issuesSvc.listDependencyReadiness(claimed.companyId, [claimed.id]))
+          .get(claimed.id)
+      : null;
+    const dependencyReadyStateKey =
+      dependencyReadiness?.isDependencyReady === true &&
+      dependencyReadiness.blockerIssueIds.length > 0
+        ? buildIssueBlockersResolvedWakeStateKey({
+            dependentIssueId: claimed.id,
+            blockerIssueIds: dependencyReadiness.blockerIssueIds,
+            blockedTransitionAt: claimed.blockedTransitionAt,
+          })
+        : null;
 
     if (clearReason) {
       return clearIssueMonitorAndRecover({
@@ -11697,6 +11715,7 @@ export function heartbeatService(
             monitorNotes: claimed.monitorNotes ?? null,
             ...monitorMetadata,
             ...reviewRecoveryContext,
+            ...(dependencyReadyStateKey ? { dependencyReadyStateKey } : {}),
             source: input.activitySource,
           },
           requestedByActorType: input.actorType,
@@ -11712,6 +11731,7 @@ export function heartbeatService(
             monitorNotes: claimed.monitorNotes ?? null,
             ...monitorMetadata,
             ...reviewRecoveryContext,
+            ...(dependencyReadyStateKey ? { dependencyReadyStateKey } : {}),
             manualTrigger: input.activitySource === "manual",
           },
         });
