@@ -172,6 +172,16 @@ describeEmbeddedPostgres("heartbeat queued-run claim isolation", () => {
     }, createdAt);
   }
 
+  // A manual wake that names no user. Claiming it is refused with a 403 that is
+  // not the queued-message interrupt case, so upstream #14738 cancels it.
+  function insertUserlessManualRun(companyId: string, agentId: string, createdAt = new Date(Date.now() - 120_000)) {
+    return insertQueuedRun(companyId, agentId, {
+      requestedByActorType: "system",
+      requestedByActorId: "heartbeat_test",
+      payload: { manualUserWake: true },
+    }, createdAt);
+  }
+
   async function runStatus(runId: string) {
     return db
       .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode, error: heartbeatRuns.error })
@@ -221,6 +231,28 @@ describeEmbeddedPostgres("heartbeat queued-run claim isolation", () => {
     });
     expect(mockAdapterExecute).toHaveBeenCalledOnce();
     expect(await runStatus(healthyRunId)).toMatchObject({ status: "succeeded" });
+  });
+
+  it("cancels a run whose claim is permanently rejected and claims the run behind it", async () => {
+    const { companyId, agentId } = await insertAgent();
+    const { runId: rejectedRunId, wakeupRequestId } = await insertUserlessManualRun(companyId, agentId);
+    const { runId: healthyRunId } = await insertClaimableRun(companyId, agentId);
+
+    await expect(heartbeat.resumeQueuedRuns()).resolves.toBeUndefined();
+    await heartbeat.drainActiveRunExecutions();
+
+    expect(await runStatus(rejectedRunId)).toMatchObject({ status: "cancelled", errorCode: "queued_run_claim_rejected" });
+    const wakeup = await db
+      .select({ status: agentWakeupRequests.status })
+      .from(agentWakeupRequests)
+      .where(sql`${agentWakeupRequests.id} = ${wakeupRequestId}`)
+      .then((rows) => rows[0] ?? null);
+    expect(wakeup).toMatchObject({ status: "cancelled" });
+    expect(mockAdapterExecute).toHaveBeenCalledOnce();
+    expect(await runStatus(healthyRunId)).toMatchObject({ status: "succeeded" });
+
+    await expect(heartbeat.resumeQueuedRuns()).resolves.toBeUndefined();
+    expect(await runStatus(rejectedRunId)).toMatchObject({ status: "cancelled", errorCode: "queued_run_claim_rejected" });
   });
 
   it("keeps a recoverable rejection queued without blocking the runs behind it", async () => {
