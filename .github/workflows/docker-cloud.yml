@@ -2,7 +2,16 @@ name: Docker cloud
 
 on:
   workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Full immutable source commit SHA to build
+        required: false
+        type: string
   workflow_call:
+    inputs:
+      source_ref:
+        required: false
+        type: string
 
 permissions: {}
 
@@ -10,7 +19,7 @@ permissions: {}
 # Repeated requests for the same source serialize without cancelling a build.
 # No mutable canary channel is promoted here; docker.yml owns that operation.
 concurrency:
-  group: docker-cloud-${{ github.sha }}
+  group: docker-cloud-${{ inputs.source_ref || github.sha }}
   cancel-in-progress: false
 
 jobs:
@@ -25,9 +34,23 @@ jobs:
       contents: read
       packages: write
     steps:
-      - name: Checkout
+      - name: Checkout protected builder controls
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          ref: ${{ github.workflow_sha }}
+          path: .image-builder
+          persist-credentials: false
+
+      - name: Resolve immutable source and image repository
+        id: image-inputs
+        run: |
+          node .image-builder/scripts/resolve-image-build-inputs.mjs "${{ inputs.source_ref }}" "${{ github.sha }}" "${{ github.repository }}"
+          rm -rf .image-builder
+
+      - name: Checkout immutable source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ steps.image-inputs.outputs.source_sha }}
           # Full history and tags so `git describe` below can compute the
           # release version to stamp into the image.
           fetch-depth: 0
@@ -148,7 +171,7 @@ jobs:
       - name: Select cloud cache ancestry
         id: cloud-cache
         env:
-          CACHE_IMAGE: ghcr.io/${{ github.repository }}
+          CACHE_IMAGE: ${{ steps.image-inputs.outputs.image_repository }}
         run: node scripts/select-cloud-cache.mjs
 
       # Deployment tooling reads these labels from the registry to verify an
@@ -173,7 +196,7 @@ jobs:
         id: meta-cloud
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
         with:
-          images: ghcr.io/${{ github.repository }}
+          images: ${{ steps.image-inputs.outputs.image_repository }}
           flavor: |
             suffix=-cloud,onlatest=true
           tags: |
@@ -182,8 +205,10 @@ jobs:
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
             type=semver,pattern={{version}},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
             type=semver,pattern={{major}}.{{minor}},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
-            type=sha
+            type=sha,enable=${{ github.event_name != 'workflow_dispatch' }}
+            type=raw,value=sha-${{ steps.image-inputs.outputs.source_sha }},enable=${{ github.event_name == 'workflow_dispatch' }}
           labels: |
+            org.opencontainers.image.revision=${{ steps.image-inputs.outputs.source_sha }}
             io.github.paperclipai.schema.last-migration=${{ steps.schema.outputs.last }}
             io.github.paperclipai.schema.migration-count=${{ steps.schema.outputs.count }}
 
@@ -204,7 +229,7 @@ jobs:
             CLOUD_BUNDLED_PLUGINS=daytona
             CLOUD_BUNDLED_SERVER_DEPS=@sentry/node
             PAPERCLIP_BUILD_VERSION=${{ steps.build-version.outputs.version }}
-            PAPERCLIP_BUILD_COMMIT=${{ github.sha }}
+            PAPERCLIP_BUILD_COMMIT=${{ steps.image-inputs.outputs.source_sha }}
             CLI_TOOLS_CACHE_EPOCH=${{ steps.tools-epoch.outputs.epoch }}
           # amd64 only, unlike the self-hosted image above: the cloud variant
           # is consumed exclusively by managed-deployment hosts, which run
@@ -212,11 +237,12 @@ jobs:
           # clock, and dropping it roughly halves time-to-deployable-image.
           platforms: linux/amd64
           push: true
+          provenance: mode=max
           # Same-SHA builds serialize above; different SHAs never share a
           # writable cache ref. Registry layers are content-addressed and
           # shared even when cache manifests have separate tags.
           cache-from: ${{ steps.cloud-cache.outputs.source }}
-          cache-to: type=registry,ref=ghcr.io/${{ github.repository }}:buildcache-cloud-${{ github.sha }},mode=max
+          cache-to: type=registry,ref=${{ steps.image-inputs.outputs.image_repository }}:buildcache-cloud-${{ steps.image-inputs.outputs.source_sha }},mode=max
           tags: ${{ steps.meta-cloud.outputs.tags }}
           labels: ${{ steps.meta-cloud.outputs.labels }}
 
@@ -228,7 +254,7 @@ jobs:
 
       - name: Verify the pushed image resolves the declared Sentry version
         env:
-          IMAGE: ghcr.io/${{ github.repository }}@${{ steps.build-cloud.outputs.digest }}
+          IMAGE: ${{ steps.image-inputs.outputs.image_repository }}@${{ steps.build-cloud.outputs.digest }}
         run: |
           set -euo pipefail
 
@@ -252,7 +278,7 @@ jobs:
       # Check before the entrypoint can repair a wrongly built identity.
       - name: Verify cloud runtime user
         env:
-          IMAGE: ghcr.io/${{ github.repository }}@${{ steps.build-cloud.outputs.digest }}
+          IMAGE: ${{ steps.image-inputs.outputs.image_repository }}@${{ steps.build-cloud.outputs.digest }}
         run: |
           set -euo pipefail
           docker run --rm --entrypoint sh "$IMAGE" -ec '
@@ -271,7 +297,7 @@ jobs:
       # the self-hosted manifest job. The Sentry check already pulled it.
       - name: Verify cloud PID 1 reaps orphaned processes
         env:
-          IMAGE: ghcr.io/${{ github.repository }}@${{ steps.build-cloud.outputs.digest }}
+          IMAGE: ${{ steps.image-inputs.outputs.image_repository }}@${{ steps.build-cloud.outputs.digest }}
         run: docker run --rm -i "$IMAGE" sh -s < scripts/assert-orphan-reaping.sh
 
       # Cloud's commit resolver and preview-artifact planner use the full SHA.
@@ -279,12 +305,12 @@ jobs:
       # Retagging reuses the registry manifest and does not rebuild the image.
       - name: Publish verified full-SHA cloud tag
         env:
-          IMAGE: ghcr.io/${{ github.repository }}@${{ steps.build-cloud.outputs.digest }}
-          FULL_SHA_TAG: ghcr.io/${{ github.repository }}:sha-${{ github.sha }}-cloud
+          IMAGE: ${{ steps.image-inputs.outputs.image_repository }}@${{ steps.build-cloud.outputs.digest }}
+          FULL_SHA_TAG: ${{ steps.image-inputs.outputs.image_repository }}:sha-${{ steps.image-inputs.outputs.source_sha }}-cloud
         run: |
           set -euo pipefail
           revision="$(docker image inspect "$IMAGE" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')"
           platform="$(docker image inspect "$IMAGE" --format '{{ .Os }}/{{ .Architecture }}')"
-          test "$revision" = "$GITHUB_SHA"
+          test "$revision" = "${{ steps.image-inputs.outputs.source_sha }}"
           test "$platform" = linux/amd64
           docker buildx imagetools create --prefer-index=false --tag "$FULL_SHA_TAG" "$IMAGE"
