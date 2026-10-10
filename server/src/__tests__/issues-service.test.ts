@@ -74,6 +74,91 @@ describe("issue list limit helpers", () => {
   });
 });
 
+describeEmbeddedPostgres("issueService locked review-transition receipt", () => {
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+  let db!: ReturnType<typeof createDb>;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-review-receipt-race-");
+    db = createDb(tempDb.connectionString);
+  }, 20_000);
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  it("uses the locked status when a concurrent writer changes the transition baseline", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const blockerId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Locked receipt race",
+      issuePrefix: `R${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Implementation owner",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values([
+      {
+        id: issueId,
+        companyId,
+        title: "Move back into review",
+        status: "in_review",
+        assigneeAgentId: agentId,
+      },
+      {
+        id: blockerId,
+        companyId,
+        title: "Already resolved dependency",
+        status: "done",
+      },
+    ]);
+    await db.insert(agentWakeupRequests).values({
+      companyId,
+      agentId,
+      reason: "issue_blockers_resolved",
+      source: "automation",
+      triggerDetail: "system",
+      status: "claimed",
+      payload: { issueId },
+    });
+
+    let racedUpdate!: Promise<unknown>;
+    await db.transaction(async (lockingTx) => {
+      await lockingTx.select({ id: issues.id }).from(issues)
+        .where(eq(issues.id, issueId)).for("update");
+      racedUpdate = issueService(db).update(issueId, {
+        status: "in_review",
+        blockedByIssueIds: [blockerId],
+        actorAgentId: agentId,
+      });
+      // The service's initial unlocked read sees in_review, then its receipt read
+      // waits behind this transaction. The concurrent status change below must be
+      // the baseline used after that row lock is acquired.
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      await lockingTx.update(issues).set({ status: "in_progress" })
+        .where(eq(issues.id, issueId));
+    });
+
+    await expect(racedUpdate).rejects.toMatchObject({ status: 422 });
+    const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(issue.status).toBe("in_progress");
+    expect(await db.select().from(issueRelations).where(eq(issueRelations.relatedIssueId, issueId)))
+      .toHaveLength(0);
+  });
+});
+
 describeEmbeddedPostgres("issueService run attachment artifacts", () => {
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
 

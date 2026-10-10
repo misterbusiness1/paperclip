@@ -7,10 +7,18 @@ import {
 } from "@paperclipai/db";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 
-const execute = vi.hoisted(() => vi.fn(async () => ({
-  exitCode: 0, signal: null, timedOut: false, errorMessage: null,
-  summary: "Readiness wake completed.", provider: "test", model: "test-model",
-})));
+const adapterState = vi.hoisted(() => ({
+  gate: null as Promise<void> | null,
+  sideEffects: 0,
+}));
+const execute = vi.hoisted(() => vi.fn(async () => {
+  await adapterState.gate;
+  adapterState.sideEffects += 1;
+  return {
+    exitCode: 0, signal: null, timedOut: false, errorMessage: null,
+    summary: "Readiness wake completed.", provider: "test", model: "test-model",
+  };
+}));
 vi.mock("../adapters/index.ts", async () => ({
   ...await vi.importActual<typeof import("../adapters/index.ts")>("../adapters/index.ts"),
   getServerAdapter: vi.fn(() => ({ supportsLocalAgentJwt: false, execute })),
@@ -18,6 +26,14 @@ vi.mock("../adapters/index.ts", async () => ({
 import { heartbeatService } from "../services/heartbeat.ts";
 import { issueService } from "../services/issues.ts";
 import { deliverAgentUnblockNotification } from "../services/routable-blocked.ts";
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((promiseResolve) => {
+    resolve = promiseResolve;
+  });
+  return { promise, resolve };
+}
 
 describe("automatic readiness wakes while an interaction is pending", () => {
   let temporary: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
@@ -34,6 +50,8 @@ describe("automatic readiness wakes while an interaction is pending", () => {
     await heartbeat.drainActiveRunExecutions();
     await db.execute(sql`TRUNCATE companies CASCADE`);
     execute.mockClear();
+    adapterState.gate = null;
+    adapterState.sideEffects = 0;
   });
   afterAll(async () => { await temporary?.cleanup(); }, 30_000);
 
@@ -276,6 +294,61 @@ describe("automatic readiness wakes while an interaction is pending", () => {
       .toMatchObject({ status: "cancelled", errorCode: "issue_monitor_pending" });
     expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeId)))[0].status)
       .toBe("skipped");
+  });
+
+  it("executes once when the final blocker resolves during its due-monitor turn", async () => {
+    const f = await seed({ interactionStatus: "answered" });
+    const gate = deferred<void>();
+    adapterState.gate = gate.promise;
+    await scheduleFutureMonitor(f);
+    const dueAt = new Date(Date.now() - 1_000);
+    await db.update(issues).set({
+      status: "in_review",
+      monitorNextCheckAt: dueAt,
+    }).where(eq(issues.id, f.issueId));
+    await db.update(issues).set({ status: "in_progress" })
+      .where(eq(issues.id, f.blockerId));
+    await db.update(issues).set({ status: "done" })
+      .where(eq(issues.id, f.blockerId));
+
+    const monitorWake = options(f, "issue_monitor_due");
+    expect(await heartbeat.wakeup(f.agentId, monitorWake)).not.toBeNull();
+    await vi.waitFor(
+      () => expect(execute).toHaveBeenCalledTimes(1),
+      { timeout: 5_000 },
+    );
+    // The scheduler clears the one-shot monitor as it fires; this test invokes
+    // the wake directly so it can hold the adapter at the race boundary.
+    await db.update(issues).set({
+      status: "in_progress",
+      monitorNextCheckAt: null,
+      executionPolicy: null,
+    }).where(eq(issues.id, f.issueId));
+
+    const dependencyWake = heartbeat.wakeup(
+      f.agentId,
+      options(f, "issue_blockers_resolved"),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const beforeRelease = await db.select().from(heartbeatRuns)
+      .where(eq(heartbeatRuns.companyId, f.companyId));
+    expect(beforeRelease.map((run) => ({
+      status: run.status,
+      wakeReason: (run.contextSnapshot as Record<string, unknown>)?.wakeReason,
+    }))).toEqual([{ status: "running", wakeReason: "issue_monitor_due" }]);
+
+    gate.resolve();
+    expect(await dependencyWake).not.toBeNull();
+    await heartbeat.drainActiveRunExecutions();
+    const finalRuns = await db.select().from(heartbeatRuns)
+      .where(eq(heartbeatRuns.companyId, f.companyId));
+    expect(finalRuns.map((run) => ({
+      status: run.status,
+      wakeReason: (run.contextSnapshot as Record<string, unknown>)?.wakeReason,
+    }))).toEqual([{ status: "succeeded", wakeReason: "issue_monitor_due" }]);
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(adapterState.sideEffects).toBe(1);
+    expect(finalRuns).toHaveLength(1);
   });
 
   it("still admits a due monitor and a fresh user comment", async () => {
