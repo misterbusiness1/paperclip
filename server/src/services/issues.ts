@@ -11200,12 +11200,20 @@ export function issueService(db: Db) {
               existing.companyId,
               [updated],
             );
+            // A wake request is the acting run's own trigger while that run is alive
+            // ("claimed"), so it must not admit a move into review: the route guard
+            // never counts it, and otherwise a blocker that completes between the
+            // route guard and this check would leave the issue parked with no path.
+            // An issue that is already in review keeps the earlier, wider rule.
+            const movesIntoReview = existing.status !== "in_review";
             const hasDurableAlternatePath =
               reviewAttention
                 .get(updated.id)
                 ?.paths.some(
                   (path) =>
-                    path.kind !== "blocker" && path.kind !== "active_run",
+                    path.kind !== "blocker" &&
+                    path.kind !== "active_run" &&
+                    !(movesIntoReview && path.kind === "queued_wake"),
                 ) === true;
             if (!hasDurableAlternatePath) {
               throw unprocessable(

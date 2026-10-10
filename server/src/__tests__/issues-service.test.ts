@@ -4,6 +4,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { sql } from "drizzle-orm";
 import {
   activityLog,
+  agentWakeupRequests,
   agents,
   approvals,
   companies,
@@ -4998,6 +4999,27 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
         expect(updated?.status).toBe("in_review");
         expect(updated?.assigneeUserId).toBe(seeded.reviewerUserId);
         await expectResolvedBlockerHandoffStored(seeded.dependentId, seeded.blockerId);
+      });
+
+      it("is refused on a move into review when the only other path is the agent's own claimed wake", async () => {
+        const seeded = await seedResolvedBlockerHandoff(blockerStatus);
+        await db.insert(agentWakeupRequests).values({
+          companyId: seeded.companyId,
+          agentId: seeded.assigneeAgentId,
+          source: "assignment",
+          reason: "issue_assigned",
+          status: "claimed",
+          payload: { issueId: seeded.dependentId },
+        });
+
+        await expect(svc.update(seeded.dependentId, {
+          status: "in_review",
+          blockedByIssueIds: [seeded.blockerId],
+          actorAgentId: seeded.assigneeAgentId,
+        })).rejects.toThrow(/live unresolved blocker/);
+        const stored = await db.select({ status: issues.status }).from(issues).where(eq(issues.id, seeded.dependentId));
+        expect(stored[0]?.status).not.toBe("in_review");
+        await db.delete(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, seeded.companyId));
       });
 
       it("is accepted when a pending interaction waits on the issue", async () => {
