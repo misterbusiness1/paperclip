@@ -10364,6 +10364,16 @@ export function heartbeatService(
         // warm-session deferred destruction, explicit provider resource
         // disposition); only legacy-adapter leases are swept here.
         ne(heartbeatRuns.runtimeMode, "native"),
+        // A local lease that unexpectedly holds a provider resource must never
+        // be released as a bookkeeping no-op. Leave its run to the orphaned
+        // lease sweep, which parks the lease for cleanup instead.
+        sql`not exists (
+          select 1 from ${environmentLeases} as unexpected_resource
+          where unexpected_resource.heartbeat_run_id = ${heartbeatRuns.id}
+            and unexpected_resource.status = 'active'
+            and unexpected_resource.provider = 'local'
+            and unexpected_resource.provider_lease_id is not null
+        )`,
       ));
 
     let released = 0;

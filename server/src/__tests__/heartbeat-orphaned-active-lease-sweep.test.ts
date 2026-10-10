@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  activityLog,
   agents,
   companies,
   createDb,
@@ -62,6 +63,9 @@ describeEmbeddedPostgres("heartbeat sweepOrphanedActiveLeases", () => {
 
   afterEach(async () => {
     await db.delete(environmentLeases);
+    // Fork reaping releases an interrupted run's lease through the orchestrator,
+    // which records environment.lease_released against the run.
+    await db.delete(activityLog);
     await db.delete(heartbeatRuns);
     await db.delete(environments);
     await db.delete(agents);
@@ -173,8 +177,13 @@ describeEmbeddedPostgres("heartbeat sweepOrphanedActiveLeases", () => {
 
     await heartbeatService(db).reapOrphanedRuns({ staleThresholdMs: 0 });
 
-    expect(await leaseRow(leaseId)).toMatchObject({ status: "expired", cleanupStatus: "success" });
-    expect((await leaseRow(leaseId))?.releasedAt).toBeInstanceOf(Date);
+    // Fork #54 releases a terminal run's ordinary local lease right away
+    // ("released"); without its environment the orphaned-lease sweep expires
+    // it after cleanup. Either way the bookkeeping lease is no longer active.
+    const lease = await leaseRow(leaseId);
+    expect(["released", "expired"]).toContain(lease?.status);
+    if (lease?.status === "expired") expect(lease.cleanupStatus).toBe("success");
+    expect(lease?.releasedAt).toBeInstanceOf(Date);
   });
 
   it("does not discard an unexpected provider resource from a local lease", async () => {
