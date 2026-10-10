@@ -13,7 +13,11 @@ export const chatTaskHandoffs = pgTable("chat_task_handoffs", {
   agentId: uuid("agent_id").notNull().references(() => agents.id, { onDelete: "cascade" }),
   sessionGeneration: integer("session_generation").notNull(),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-}, t => ({ sourceIdx: index("chat_task_handoffs_source_idx").on(t.companyId, t.conversationId) }));
+}, t => ({
+  sourceIdx: index("chat_task_handoffs_source_idx").on(t.companyId, t.conversationId),
+  // Fork: index FK references to removal parents (9008).
+  conversationIdFkIdx: index("chat_task_handoffs_conversation_id_fk_idx").on(t.conversationId),
+}));
 
 /** Content-free outbox; results remain on the source task and its documents. */
 export const chatCompletionDeliveries = pgTable("chat_completion_deliveries", {
@@ -31,4 +35,6 @@ export const chatCompletionDeliveries = pgTable("chat_completion_deliveries", {
 }, t => ({
   transitionUq: uniqueIndex("chat_completion_deliveries_transition_uq").on(t.taskId, t.statusVersion),
   pendingIdx: index("chat_completion_deliveries_pending_idx").on(t.status, t.nextAttemptAt),
+  // Fork: index FK references to removal parents (9008).
+  targetRunIdFkIdx: index("chat_completion_deliveries_target_run_id_fk_idx").on(t.targetRunId),
 }));

@@ -10,4 +10,8 @@ export const runnerApiResponseReservations = pgTable("runner_api_response_reserv
   assetId: uuid("asset_id").references(() => assets.id, { onDelete: "cascade" }),
   reservedBytes: bigint("reserved_bytes", { mode: "number" }).notNull(),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-}, table => ({ companyIdx: index("runner_api_response_reservations_company_idx").on(table.companyId) }));
+}, table => ({
+  companyIdx: index("runner_api_response_reservations_company_idx").on(table.companyId),
+  // Fork: index FK references to removal parents (9008).
+  runIdFkIdx: index("runner_api_response_reservations_run_id_fk_idx").on(table.runId),
+}));

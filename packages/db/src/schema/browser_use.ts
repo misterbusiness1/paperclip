@@ -66,6 +66,8 @@ export const browserUseSessions = pgTable(
   (t) => [
     index("browser_use_sessions_task_idx").on(t.companyId, t.issueId),
     uniqueIndex("browser_use_sessions_provider_uq").on(t.providerSessionId),
+    // Fork: index FK references to removal parents (9008).
+    index("browser_use_sessions_issue_id_fk_idx").on(t.issueId),
   ],
 );
 export const browserUseRuns = pgTable(
@@ -99,6 +101,8 @@ export const browserUseRuns = pgTable(
     uniqueIndex("browser_use_runs_invocation_uq").on(t.invocationId),
     uniqueIndex("browser_use_runs_provider_uq").on(t.providerRunId),
     index("browser_use_runs_session_idx").on(t.sessionId),
+    // Fork: index FK references to removal parents (9008).
+    index("browser_use_runs_heartbeat_run_id_fk_idx").on(t.heartbeatRunId),
   ],
 );
 export const browserUseBrowsers = pgTable(

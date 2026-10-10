@@ -144,6 +144,8 @@ export const chatGitHubReviews = pgTable(
       t.endpointId,
       t.deliveryId,
     ),
+    // Fork: index FK references to removal parents (9008).
+    index("chat_github_reviews_run_id_fk_idx").on(t.runId),
     index("chat_github_reviews_pull_idx").on(
       t.endpointId,
       t.repositoryId,
