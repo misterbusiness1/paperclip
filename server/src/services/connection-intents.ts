@@ -183,6 +183,7 @@ export function connectionIntentService(db: Db) {
         companyId: issues.companyId,
         status: issues.status,
         assigneeAgentId: issues.assigneeAgentId,
+        checkoutRunId: issues.checkoutRunId,
       }).from(issues).where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId))).then((rows) => rows[0] ?? null),
       db.select({ id: agents.id, companyId: agents.companyId, name: agents.name })
         .from(agents)
@@ -206,9 +207,19 @@ export function connectionIntentService(db: Db) {
     ) {
       throw forbidden("Responsible user is no longer authorized for company write access");
     }
-    if (issue.assigneeAgentId !== agent.id) throw conflict("The requesting agent no longer owns this task");
+    if (issue.assigneeAgentId !== agent.id) {
+      throw conflict(
+        `Runtime tools rejected for run ${run.id}: agent ${agent.id} is not the assignee of bound task ${issue.id} ` +
+        `(assigneeAgentId: ${issue.assigneeAgentId ?? "none"}, checkoutRunId: ${issue.checkoutRunId ?? "none"}). ` +
+        "A runtime-tools token is only usable on the task assigned to its run's agent.",
+        { runId: run.id, agentId: agent.id, issueId: issue.id, assigneeAgentId: issue.assigneeAgentId, checkoutRunId: issue.checkoutRunId },
+      );
+    }
     if (issue.status === "done" || issue.status === "cancelled") {
-      throw conflict("Connection requests cannot be created on a closed task");
+      throw conflict(
+        `Runtime tools rejected for run ${run.id}: bound task ${issue.id} is ${issue.status}; connection surfaces close on done/cancelled tasks.`,
+        { runId: run.id, agentId: agent.id, issueId: issue.id, issueStatus: issue.status },
+      );
     }
     return { run, issue, agent };
   }

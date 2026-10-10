@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { agents, companies, companyMemberships, createDb, issues } from "@paperclipai/db";
+import { agents, companies, companyMemberships, createDb, issueComments, issues } from "@paperclipai/db";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { connectionIntentService } from "../services/connection-intents.ts";
@@ -45,10 +45,12 @@ describe("runtime connection tools require a task", () => {
     vi.stubEnv("PAPERCLIP_AGENT_JWT_SECRET", "isolated-runtime-tool-test-secret");
     warn = vi.spyOn(logger, "warn");
     adapter.execute.mockImplementation(async (ctx: AdapterExecutionContext) => {
-      const tools = ctx.runtimeTools;
+      const contextTools = ctx.context.paperclipRuntimeTools as AdapterExecutionContext["runtimeTools"];
+      const nativeTools = ctx.runtimeMcp?.getServers().find((server) => server.connectionId === "paperclip-runtime-tools");
+      const token = ctx.runtimeTools?.bearerToken ?? contextTools?.bearerToken ?? nativeTools?.token;
       let validation: "accepted" | "rejected" | "not_advertised" = "not_advertised";
-      if (tools) {
-        const claims = verifyRuntimeToolsToken(tools.bearerToken);
+      if (token) {
+        const claims = verifyRuntimeToolsToken(token);
         if (!claims) throw new Error("Runtime capability was not valid");
         try {
           await connectionIntentService(db).validate(claims);
@@ -58,14 +60,17 @@ describe("runtime connection tools require a task", () => {
         }
       }
       deliveries.push({
-        runtimeTools: tools,
+        runtimeTools: ctx.runtimeTools,
         contextTools: ctx.context.paperclipRuntimeTools,
         mcpConnectionIds: (ctx.runtimeMcp?.getServers() ?? []).map((server) => server.connectionId),
         validation,
       });
       // Model a provider finishing its task, so teardown has no follow-up work.
       if (typeof ctx.context.issueId === "string") {
-        await db.update(issues).set({ status: "done" }).where(eq(issues.id, ctx.context.issueId));
+        const task = await db.select().from(issues).where(eq(issues.id, ctx.context.issueId)).then((rows) => rows[0]);
+        if (task?.assigneeAgentId === ctx.agent.id && !["done", "cancelled"].includes(task.status)) {
+          await db.update(issues).set({ status: "done" }).where(eq(issues.id, task.id));
+        }
       }
       return { exitCode: 0, signal: null, timedOut: false, summary: "Runtime tool delivery checked." };
     });
@@ -139,7 +144,7 @@ describe("runtime connection tools require a task", () => {
       expect(actual.runtimeTools).toBeUndefined();
       expect(actual.contextTools).toBeUndefined();
       expect(actual.mcpConnectionIds).toContain("paperclip-runtime-tools");
-      expect(actual.validation).toBe("not_advertised");
+      expect(actual.validation).toBe("accepted");
     },
   );
 
@@ -160,7 +165,57 @@ describe("runtime connection tools require a task", () => {
     expect(actual.runtimeTools).toBeUndefined();
     expect(actual.contextTools).toBeDefined();
     expect(actual.mcpConnectionIds).not.toContain("paperclip-runtime-tools");
-    expect(actual.validation).toBe("not_advertised");
+    expect(actual.validation).toBe("accepted");
+  });
+
+  it.each([
+    ["native_mcp", "foreign_owner"], ["invocation_context", "foreign_owner"], ["environment", "foreign_owner"],
+    ["native_mcp", "done"], ["invocation_context", "done"], ["environment", "done"],
+    ["native_mcp", "cancelled"], ["invocation_context", "cancelled"], ["environment", "cancelled"],
+  ] as const)("does not advertise %s connection tools on a %s comment-mention run", async (delivery, state) => {
+    adapter.delivery = delivery;
+    const fixture = await seed(true, "kimi_local");
+    let expectedAssignee = fixture.agentId;
+    if (state === "foreign_owner") {
+      expectedAssignee = randomUUID();
+      await db.insert(agents).values({
+        id: expectedAssignee, companyId: fixture.companyId, name: "Task owner", role: "engineer", status: "idle",
+        adapterType: "kimi_local", adapterConfig: {}, permissions: {},
+        runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      });
+      await db.update(issues).set({ assigneeAgentId: expectedAssignee }).where(eq(issues.id, fixture.issueId!));
+    } else {
+      await db.update(issues).set({ status: state }).where(eq(issues.id, fixture.issueId!));
+    }
+    const [comment] = await db.insert(issueComments).values({
+      companyId: fixture.companyId, issueId: fixture.issueId!, authorType: "user",
+      authorUserId: "test-operator", body: "@Worker Please review this task without taking ownership.",
+    }).returning();
+    const run = await heartbeat.wakeup(fixture.agentId, {
+      source: "automation", triggerDetail: "system", reason: "issue_comment_mentioned",
+      requestedByActorType: "user", requestedByActorId: "test-operator",
+      payload: { issueId: fixture.issueId, commentId: comment.id },
+      contextSnapshot: { issueId: fixture.issueId, taskId: fixture.issueId, wakeReason: "issue_comment_mentioned",
+        source: "comment.mention", commentId: comment.id, wakeCommentId: comment.id },
+    });
+    expect(run).not.toBeNull();
+    await heartbeat.drainActiveRunExecutions();
+    if (state === "foreign_owner") {
+      expect((await heartbeat.getRun(run!.id))?.status).toBe("succeeded");
+      expect(deliveries).toHaveLength(1);
+      const actual = deliveries[0]!;
+      // Boolean assertions keep even isolated test bearer tokens out of failure logs.
+      expect(actual.runtimeTools !== undefined).toBe(false);
+      expect(actual.contextTools !== undefined).toBe(false);
+      expect(actual.mcpConnectionIds).not.toContain("paperclip-runtime-tools");
+      expect(actual.validation).toBe("not_advertised");
+    } else {
+      expect((await heartbeat.getRun(run!.id))?.status).toBe("cancelled");
+      expect(deliveries).toHaveLength(0);
+    }
+    const task = await db.select().from(issues).where(eq(issues.id, fixture.issueId!)).then((rows) => rows[0]);
+    expect(task.assigneeAgentId).toBe(expectedAssignee);
+    if (state !== "foreign_owner") expect(task.status).toBe(state);
   });
 
   it("retains a delivery warning for a bound run with no reachable API URL", async () => {
