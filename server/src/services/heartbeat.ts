@@ -22,6 +22,7 @@ import { executionBlockerPredicate, getExecutionBlocker } from "./execution-bloc
 import { CONVERSATION_ADAPTER_TYPES, CONVERSATION_CONTINUATION_POLICY, claimedAdapterType, runUsedConversationAdapter, hasConversationContinuationPolicy, isConversationAdapter } from "./conversation-continuation.js";
 import { recordExecutionWait } from "./execution-wait.js";
 import { findPendingAssigneeWakeInteraction } from "./issue-wake-interactions.js";
+import { findFutureAssigneeWakeMonitor } from "./issue-wake-monitors.js";
 import {
   legacyExecutionNeedsReconciliation,
   terminalizeLegacyExecution,
@@ -17301,6 +17302,22 @@ export function heartbeatService(
       // Re-check at dispatch as well as admission: a human response may have
       // become necessary while this automatic notification was queued.
       if (isAutomaticIssueReadinessWake(run.invocationSource, context)) {
+        const futureMonitor = await findFutureAssigneeWakeMonitor(db, {
+          companyId: run.companyId, issueId, agentId: run.agentId,
+        });
+        if (futureMonitor) {
+          await cancelQueuedRunForIssueWait(run, issueId, {
+            errorCode: "issue_monitor_pending",
+            reason: "Cancelled automatic readiness wake because the assignee's monitor is not due",
+            timeoutSource: "monitor_gate",
+            details: { nextCheckAt: futureMonitor.nextCheckAt?.toISOString() },
+          });
+          await releaseIssueExecutionAndPromote(run, {
+            suppressImmediateRecovery: true,
+            deferredPostCommitEffects,
+          });
+          return null;
+        }
         const pendingInteraction = await findPendingAssigneeWakeInteraction(db, {
           companyId: run.companyId, issueId, agentId: run.agentId,
         });
@@ -21397,6 +21414,7 @@ export function heartbeatService(
             identifier: issueContext.identifier,
             title: issueContext.title,
             status: issueContext.status,
+            assigneeAgentId: issueContext.assigneeAgentId,
             priority: issueContext.priority,
             workMode: issueContext.workMode,
             conversationAgentId: issueContext.conversationAgentId,
@@ -25037,16 +25055,25 @@ export function heartbeatService(
             };
             const skillAdvisory = advisorySkillContext(skillSuggestionShadow);
             if (skillAdvisory) adapterContext.paperclipSkillRelevanceAdvisory = skillAdvisory;
-            // Connection intents require a live task-bound run. Unbound
-            // diagnostics and timer wakes cannot use this capability.
-            const runtimeTools = issueRef
-              ? createAdapterRuntimeToolAccess({
-                  agentId: agent.id,
-                  companyId: agent.companyId,
-                  runId: run.id,
-                  responsibleUserId: run.responsibleUserId,
-                })
-              : undefined;
+            // Connection intents require a live task-bound run owned by the
+            // running agent. Unbound diagnostics and timer wakes cannot use
+            // this capability, and a run woken on someone else's task (for
+            // example a comment mention) must not receive a token it could
+            // only have rejected at call time.
+            const ownsBoundTask =
+              issueRef !== null &&
+              issueRef.assigneeAgentId === agent.id &&
+              issueRef.status !== "done" &&
+              issueRef.status !== "cancelled";
+            const runtimeTools =
+              issueRef && ownsBoundTask
+                ? createAdapterRuntimeToolAccess({
+                    agentId: agent.id,
+                    companyId: agent.companyId,
+                    runId: run.id,
+                    responsibleUserId: run.responsibleUserId,
+                  })
+                : undefined;
             if (issueRef && !runtimeTools) {
               logger.warn(
                 {
@@ -27831,6 +27858,26 @@ export function heartbeatService(
             !durableRequest &&
             isAutomaticIssueReadinessWake(source, enrichedContextSnapshot)
           ) {
+            const futureMonitor = await findFutureAssigneeWakeMonitor(tx, {
+              companyId: issue.companyId, issueId: issue.id, agentId,
+            });
+            if (futureMonitor) {
+              await recordExecutionWait(tx as unknown as Db, {
+                issueId: issue.id, coalesce: coalesceExecutionWait,
+                condition: { nextCheckAt: futureMonitor.nextCheckAt?.toISOString() },
+                request: {
+                  ...durableReceiptFields,
+                  companyId: issue.companyId, agentId, source, triggerDetail,
+                  reason: "issue_monitor_pending",
+                  error: "Waiting for the task's scheduled monitor before another automatic readiness wake",
+                  payload: { ...payload, issueId: issue.id, requestedReason: reason },
+                  requestedByActorType: opts.requestedByActorType ?? null,
+                  requestedByActorId: opts.requestedByActorId ?? null,
+                  idempotencyKey: opts.idempotencyKey ?? null,
+                },
+              });
+              return { kind: "skipped" as const };
+            }
             const pendingInteraction = await findPendingAssigneeWakeInteraction(tx, {
               companyId: issue.companyId, issueId: issue.id, agentId,
             });
