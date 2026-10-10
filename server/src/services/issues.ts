@@ -2673,7 +2673,11 @@ async function listUnresolvedBlockerIssueIds(
     .then((rows) => rows.map((row) => row.id));
 }
 
-async function assertHasLiveBlockerIssueIds(
+/**
+ * Locks the given blocker rows and says whether at least one is live (not done, not cancelled).
+ * Throws when an id is empty, unknown or from another company.
+ */
+async function lockAndCheckLiveBlockerIssueIds(
   dbOrTx: Pick<Db, "select">,
   companyId: string,
   blockerIssueIds: string[],
@@ -2688,13 +2692,10 @@ async function assertHasLiveBlockerIssueIds(
     .where(and(eq(issues.companyId, companyId), inArray(issues.id, uniqueBlockerIssueIds)))
     .orderBy(asc(issues.id))
     .for("update");
-  if (
-    rows.length !== uniqueBlockerIssueIds.length
-    || !rows.some((row) => row.status !== "done" && row.status !== "cancelled")
-  ) {
+  if (rows.length !== uniqueBlockerIssueIds.length) {
     throw unprocessable("in_review issues require at least one same-company live unresolved blocker");
   }
-  return true;
+  return rows.some((row) => row.status !== "done" && row.status !== "cancelled");
 }
 async function getProjectDefaultGoalId(
   db: ProjectGoalReader,
@@ -11179,17 +11180,21 @@ export function issueService(db: Db) {
           updated.status === "in_review" &&
           blockedByIssueIds !== undefined
         ) {
-          if (blockedByIssueIds.length > 0) {
-            // syncBlockedByIssueIds locks blocker rows before writing the relation.
-            // Recheck liveness while those locks remain held so a concurrent terminal
-            // transition either wins first and rolls this update back, or observes the
-            // committed edge and emits the normal resolved-dependency wake.
-            await assertHasLiveBlockerIssueIds(
+          // syncBlockedByIssueIds locks blocker rows before writing the relation.
+          // Recheck liveness while those locks remain held so a concurrent terminal
+          // transition either wins first and rolls this update back, or observes the
+          // committed edge and emits the normal resolved-dependency wake.
+          const hasLiveBlocker =
+            blockedByIssueIds.length > 0 &&
+            (await lockAndCheckLiveBlockerIssueIds(
               tx,
               existing.companyId,
               blockedByIssueIds,
-            );
-          } else {
+            ));
+          if (!hasLiveBlocker) {
+            // No live blocker holds the review open: the list is empty or every blocker
+            // in it is already done or cancelled. Another durable review path (human
+            // reviewer, interaction, approval, monitor, ...) still admits the update.
             const reviewAttention = await listIssueReviewAttentionMap(
               tx,
               existing.companyId,
@@ -11204,7 +11209,9 @@ export function issueService(db: Db) {
                 ) === true;
             if (!hasDurableAlternatePath) {
               throw unprocessable(
-                "in_review issues require a maintained review path after clearing blockers",
+                blockedByIssueIds.length > 0
+                  ? "in_review issues require at least one same-company live unresolved blocker"
+                  : "in_review issues require a maintained review path after clearing blockers",
               );
             }
           }
