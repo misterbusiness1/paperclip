@@ -5038,6 +5038,46 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
         await expectResolvedBlockerHandoffStored(seeded.dependentId, seeded.blockerId);
       });
 
+      it("is accepted on a move into review when the current review participant is a paused agent", async () => {
+        const seeded = await seedResolvedBlockerHandoff(blockerStatus);
+        const reviewerAgentId = randomUUID();
+        await db.insert(agents).values({
+          id: reviewerAgentId,
+          companyId: seeded.companyId,
+          name: "PausedReviewer",
+          role: "qa",
+          status: "paused",
+          adapterType: "codex_local",
+          adapterConfig: {},
+          runtimeConfig: {},
+          permissions: {},
+        });
+        await db.update(issues)
+          .set({
+            executionState: {
+              status: "pending",
+              currentStageId: null,
+              currentStageIndex: null,
+              currentStageType: null,
+              currentParticipant: { type: "agent", agentId: reviewerAgentId, userId: null },
+              returnAssignee: null,
+              completedStageIds: [],
+              lastDecisionId: null,
+              lastDecisionOutcome: null,
+            },
+          })
+          .where(eq(issues.id, seeded.dependentId));
+
+        const updated = await svc.update(seeded.dependentId, {
+          status: "in_review",
+          blockedByIssueIds: [seeded.blockerId],
+          actorAgentId: seeded.assigneeAgentId,
+        });
+
+        expect(updated?.status).toBe("in_review");
+        await expectResolvedBlockerHandoffStored(seeded.dependentId, seeded.blockerId);
+      });
+
       it("is accepted on a move into review when the issue is a conversation", async () => {
         const seeded = await seedResolvedBlockerHandoff(blockerStatus);
         await db.update(issues)

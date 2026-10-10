@@ -11208,12 +11208,21 @@ export function issueService(db: Db) {
             // is read from the row locked by this transaction, not from the earlier read.
             const movesIntoReview = receiptExisting.status !== "in_review";
             // The route guard admits a move into review for a conversation (run
-            // finalization owns its waiting state) and for an issue with a monitor
-            // check time, also one that is due. A blocker list must not change that.
+            // finalization owns its waiting state), for an issue with a monitor
+            // check time, also one that is due, and for a pending execution state
+            // with a current participant, also one that is paused. A blocker list
+            // must not change that.
+            const executionParticipant = (() => {
+              const state = parseIssueExecutionState(updated.executionState);
+              if (!state || state.status !== "pending") return null;
+              return state.currentParticipant ?? null;
+            })();
             const hasRouteAdmittedPath =
               movesIntoReview &&
               (Boolean(updated.conversationAgentId && updated.conversationUserId) ||
-                updated.monitorNextCheckAt != null);
+                updated.monitorNextCheckAt != null ||
+                (executionParticipant?.type === "agent" && Boolean(executionParticipant.agentId)) ||
+                (executionParticipant?.type === "user" && Boolean(executionParticipant.userId)));
             const hasDurableAlternatePath =
               hasRouteAdmittedPath ||
               reviewAttention
