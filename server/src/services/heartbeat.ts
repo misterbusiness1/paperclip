@@ -21397,6 +21397,7 @@ export function heartbeatService(
             identifier: issueContext.identifier,
             title: issueContext.title,
             status: issueContext.status,
+            assigneeAgentId: issueContext.assigneeAgentId,
             priority: issueContext.priority,
             workMode: issueContext.workMode,
             conversationAgentId: issueContext.conversationAgentId,
@@ -25037,16 +25038,25 @@ export function heartbeatService(
             };
             const skillAdvisory = advisorySkillContext(skillSuggestionShadow);
             if (skillAdvisory) adapterContext.paperclipSkillRelevanceAdvisory = skillAdvisory;
-            // Connection intents require a live task-bound run. Unbound
-            // diagnostics and timer wakes cannot use this capability.
-            const runtimeTools = issueRef
-              ? createAdapterRuntimeToolAccess({
-                  agentId: agent.id,
-                  companyId: agent.companyId,
-                  runId: run.id,
-                  responsibleUserId: run.responsibleUserId,
-                })
-              : undefined;
+            // Connection intents require a live task-bound run owned by the
+            // running agent. Unbound diagnostics and timer wakes cannot use
+            // this capability, and a run woken on someone else's task (for
+            // example a comment mention) must not receive a token it could
+            // only have rejected at call time.
+            const ownsBoundTask =
+              issueRef !== null &&
+              issueRef.assigneeAgentId === agent.id &&
+              issueRef.status !== "done" &&
+              issueRef.status !== "cancelled";
+            const runtimeTools =
+              issueRef && ownsBoundTask
+                ? createAdapterRuntimeToolAccess({
+                    agentId: agent.id,
+                    companyId: agent.companyId,
+                    runId: run.id,
+                    responsibleUserId: run.responsibleUserId,
+                  })
+                : undefined;
             if (issueRef && !runtimeTools) {
               logger.warn(
                 {
