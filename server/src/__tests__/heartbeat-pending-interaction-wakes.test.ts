@@ -373,6 +373,20 @@ describe("automatic readiness wakes while an interaction is pending", () => {
     expect(execute).toHaveBeenCalledTimes(2);
     expect(adapterState.sideEffects).toBe(2);
 
+    // Re-sending DONE is not a new dependency-ready generation. Exercise the
+    // real service/transaction path and prove both the persisted completion
+    // metadata and downstream execution count remain stable.
+    const consumedGeneration = await svc.getById(f.blockerId);
+    await svc.update(f.blockerId, { status: "done" });
+    const repeatedDoneGeneration = await svc.getById(f.blockerId);
+    expect(repeatedDoneGeneration?.completedAt?.toISOString())
+      .toBe(consumedGeneration?.completedAt?.toISOString());
+    await heartbeat.reconcileResolvedDependencyWakes({ companyId: f.companyId });
+    await heartbeat.reconcileResolvedDependencyWakes({ companyId: f.companyId });
+    await heartbeat.drainActiveRunExecutions();
+    expect(execute).toHaveBeenCalledTimes(2);
+    expect(adapterState.sideEffects).toBe(2);
+
     const successorAgentId = randomUUID();
     await db.insert(agents).values({
       id: successorAgentId,

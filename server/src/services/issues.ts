@@ -307,6 +307,7 @@ function assertTransition(from: string, to: string) {
 function applyStatusSideEffects(
   status: string | undefined,
   patch: Partial<typeof issues.$inferInsert>,
+  existing: Pick<typeof issues.$inferSelect, "status" | "completedAt">,
 ): Partial<typeof issues.$inferInsert> {
   if (!status) return patch;
 
@@ -314,7 +315,9 @@ function applyStatusSideEffects(
     patch.startedAt = new Date();
   }
   if (status === "done") {
-    patch.completedAt = new Date();
+    patch.completedAt = existing.status === "done"
+      ? existing.completedAt
+      : new Date();
   }
   if (status === "cancelled") {
     patch.cancelledAt = new Date();
@@ -10956,7 +10959,6 @@ export function issueService(db: Db) {
         });
       }
 
-      applyStatusSideEffects(issueData.status, patch);
       if (issueData.status && issueData.status !== "done") {
         patch.completedAt = null;
       }
@@ -10992,6 +10994,10 @@ export function issueService(db: Db) {
           .for("update")
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!receiptExisting) return null;
+        // Completion generation is based on the row that is locked for this
+        // write. A repeated DONE patch must retain its generation, while a
+        // real non-DONE -> DONE transition receives a new timestamp.
+        applyStatusSideEffects(issueData.status, patch, receiptExisting);
         if (actorAgentId && patch.status === "done") {
           const [review] = await tx.select({ id: toolActionRequests.id }).from(toolActionRequests).where(and(eq(toolActionRequests.companyId, existing.companyId), eq(toolActionRequests.issueId, id), inArray(toolActionRequests.status, ["pending", "approved", "executing"]))).limit(1);
           if (review) throw conflict("This task is waiting for a connection review. Finish unrelated work, then yield in_review without retrying the governed call.", { code: "tool_review_pending", actionRequestId: review.id });
