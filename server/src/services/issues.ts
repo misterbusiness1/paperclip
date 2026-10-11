@@ -307,6 +307,7 @@ function assertTransition(from: string, to: string) {
 function applyStatusSideEffects(
   status: string | undefined,
   patch: Partial<typeof issues.$inferInsert>,
+  existing: Pick<typeof issues.$inferSelect, "status" | "completedAt">,
 ): Partial<typeof issues.$inferInsert> {
   if (!status) return patch;
 
@@ -314,7 +315,9 @@ function applyStatusSideEffects(
     patch.startedAt = new Date();
   }
   if (status === "done") {
-    patch.completedAt = new Date();
+    patch.completedAt = existing.status === "done"
+      ? existing.completedAt
+      : new Date();
   }
   if (status === "cancelled") {
     patch.cancelledAt = new Date();
@@ -1972,6 +1975,7 @@ type IssueSubtreeDiagnosticsActivityResultRow =
 export type IssueDependencyReadiness = {
   issueId: string;
   blockerIssueIds: string[];
+  blockerGenerations: Array<{ issueId: string; completedAt: Date | null }>;
   unresolvedBlockerIssueIds: string[];
   unresolvedBlockerCount: number;
   /** Blockers whose status is `done` but whose execution workspace has not yet finalized. */
@@ -2272,6 +2276,7 @@ function createIssueDependencyReadiness(
   return {
     issueId,
     blockerIssueIds: [],
+    blockerGenerations: [],
     unresolvedBlockerIssueIds: [],
     unresolvedBlockerCount: 0,
     pendingFinalizeBlockerIssueIds: [],
@@ -2549,6 +2554,7 @@ async function listIssueDependencyReadinessMap(
       issueId: issueRelations.relatedIssueId,
       blockerIssueId: issueRelations.issueId,
       blockerStatus: issues.status,
+      blockerCompletedAt: issues.completedAt,
       blockerExecutionWorkspaceId: issues.executionWorkspaceId,
     })
     .from(issueRelations)
@@ -2588,6 +2594,10 @@ async function listIssueDependencyReadinessMap(
       readinessMap.get(row.issueId) ??
       createIssueDependencyReadiness(row.issueId);
     current.blockerIssueIds.push(row.blockerIssueId);
+    current.blockerGenerations.push({
+      issueId: row.blockerIssueId,
+      completedAt: row.blockerCompletedAt,
+    });
     // Only done blockers resolve dependents; cancelled blockers stay unresolved
     // until an operator removes or replaces the blocker relationship explicitly.
     if (row.blockerStatus !== "done") {
@@ -2673,7 +2683,11 @@ async function listUnresolvedBlockerIssueIds(
     .then((rows) => rows.map((row) => row.id));
 }
 
-async function assertHasLiveBlockerIssueIds(
+/**
+ * Locks the given blocker rows and says whether at least one is live (not done, not cancelled).
+ * Throws when an id is empty, unknown or from another company.
+ */
+async function lockAndCheckLiveBlockerIssueIds(
   dbOrTx: Pick<Db, "select">,
   companyId: string,
   blockerIssueIds: string[],
@@ -2688,13 +2702,10 @@ async function assertHasLiveBlockerIssueIds(
     .where(and(eq(issues.companyId, companyId), inArray(issues.id, uniqueBlockerIssueIds)))
     .orderBy(asc(issues.id))
     .for("update");
-  if (
-    rows.length !== uniqueBlockerIssueIds.length
-    || !rows.some((row) => row.status !== "done" && row.status !== "cancelled")
-  ) {
+  if (rows.length !== uniqueBlockerIssueIds.length) {
     throw unprocessable("in_review issues require at least one same-company live unresolved blocker");
   }
-  return true;
+  return rows.some((row) => row.status !== "done" && row.status !== "cancelled");
 }
 async function getProjectDefaultGoalId(
   db: ProjectGoalReader,
@@ -9160,6 +9171,7 @@ export function issueService(db: Db) {
           id: candidate.id,
           assigneeAgentId: candidate.assigneeAgentId!,
           blockerIssueIds: readiness.blockerIssueIds,
+          blockerGenerations: readiness.blockerGenerations,
           blockedTransitionAt: candidate.blockedTransitionAt,
         }));
     },
@@ -10947,7 +10959,6 @@ export function issueService(db: Db) {
         });
       }
 
-      applyStatusSideEffects(issueData.status, patch);
       if (issueData.status && issueData.status !== "done") {
         patch.completedAt = null;
       }
@@ -10983,6 +10994,10 @@ export function issueService(db: Db) {
           .for("update")
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!receiptExisting) return null;
+        // Completion generation is based on the row that is locked for this
+        // write. A repeated DONE patch must retain its generation, while a
+        // real non-DONE -> DONE transition receives a new timestamp.
+        applyStatusSideEffects(issueData.status, patch, receiptExisting);
         if (actorAgentId && patch.status === "done") {
           const [review] = await tx.select({ id: toolActionRequests.id }).from(toolActionRequests).where(and(eq(toolActionRequests.companyId, existing.companyId), eq(toolActionRequests.issueId, id), inArray(toolActionRequests.status, ["pending", "approved", "executing"]))).limit(1);
           if (review) throw conflict("This task is waiting for a connection review. Finish unrelated work, then yield in_review without retrying the governed call.", { code: "tool_review_pending", actionRequestId: review.id });
@@ -11179,32 +11194,64 @@ export function issueService(db: Db) {
           updated.status === "in_review" &&
           blockedByIssueIds !== undefined
         ) {
-          if (blockedByIssueIds.length > 0) {
-            // syncBlockedByIssueIds locks blocker rows before writing the relation.
-            // Recheck liveness while those locks remain held so a concurrent terminal
-            // transition either wins first and rolls this update back, or observes the
-            // committed edge and emits the normal resolved-dependency wake.
-            await assertHasLiveBlockerIssueIds(
+          // syncBlockedByIssueIds locks blocker rows before writing the relation.
+          // Recheck liveness while those locks remain held so a concurrent terminal
+          // transition either wins first and rolls this update back, or observes the
+          // committed edge and emits the normal resolved-dependency wake.
+          const hasLiveBlocker =
+            blockedByIssueIds.length > 0 &&
+            (await lockAndCheckLiveBlockerIssueIds(
               tx,
               existing.companyId,
               blockedByIssueIds,
-            );
-          } else {
+            ));
+          if (!hasLiveBlocker) {
+            // No live blocker holds the review open: the list is empty or every blocker
+            // in it is already done or cancelled. Another durable review path (human
+            // reviewer, interaction, approval, monitor, ...) still admits the update.
             const reviewAttention = await listIssueReviewAttentionMap(
               tx,
               existing.companyId,
               [updated],
             );
+            // A wake request is the acting run's own trigger while that run is alive
+            // ("claimed"), so it must not admit a move into review: the route guard
+            // never counts it, and otherwise a blocker that completes between the
+            // route guard and this check would leave the issue parked with no path.
+            // An issue that is already in review keeps the earlier, wider rule. The status
+            // is read from the row locked by this transaction, not from the earlier read.
+            const movesIntoReview = receiptExisting.status !== "in_review";
+            // The route guard admits a move into review for a conversation (run
+            // finalization owns its waiting state), for an issue with a monitor
+            // check time, also one that is due, and for a pending execution state
+            // with a current participant, also one that is paused. A blocker list
+            // must not change that.
+            const executionParticipant = (() => {
+              const state = parseIssueExecutionState(updated.executionState);
+              if (!state || state.status !== "pending") return null;
+              return state.currentParticipant ?? null;
+            })();
+            const hasRouteAdmittedPath =
+              movesIntoReview &&
+              (Boolean(updated.conversationAgentId && updated.conversationUserId) ||
+                updated.monitorNextCheckAt != null ||
+                (executionParticipant?.type === "agent" && Boolean(executionParticipant.agentId)) ||
+                (executionParticipant?.type === "user" && Boolean(executionParticipant.userId)));
             const hasDurableAlternatePath =
+              hasRouteAdmittedPath ||
               reviewAttention
                 .get(updated.id)
                 ?.paths.some(
                   (path) =>
-                    path.kind !== "blocker" && path.kind !== "active_run",
+                    path.kind !== "blocker" &&
+                    path.kind !== "active_run" &&
+                    !(movesIntoReview && path.kind === "queued_wake"),
                 ) === true;
             if (!hasDurableAlternatePath) {
               throw unprocessable(
-                "in_review issues require a maintained review path after clearing blockers",
+                blockedByIssueIds.length > 0
+                  ? "in_review issues require at least one same-company live unresolved blocker"
+                  : "in_review issues require a maintained review path after clearing blockers",
               );
             }
           }

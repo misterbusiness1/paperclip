@@ -385,6 +385,7 @@ export type WakeAdmissionHeartbeatHelpers = {
   /** `shouldQueueFollowupForRunningIssueWake` in `heartbeat.ts`. */
   shouldQueueFollowupForRunningIssueWake(input: {
     contextSnapshot: Record<string, unknown> | null | undefined;
+    runningContextSnapshot?: Record<string, unknown> | null | undefined;
     wakeCommentId: string | null;
   }): boolean;
 };

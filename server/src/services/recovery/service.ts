@@ -5899,13 +5899,16 @@ export function recoveryService(
         const idempotencyKey = buildIssueBlockersResolvedWakeStateKey({
           dependentIssueId: candidate.id,
           blockerIssueIds: readiness.blockerIssueIds,
+          blockerGenerations: readiness.blockerGenerations,
           blockedTransitionAt: candidate.blockedTransitionAt,
         });
         const existingWake =
           await findExistingIssueBlockersResolvedWakeForReadyState(db, {
             companyId,
+            agentId,
             dependentIssueId: candidate.id,
             blockerIssueIds: readiness.blockerIssueIds,
+            blockerGenerations: readiness.blockerGenerations,
             blockedTransitionAt: candidate.blockedTransitionAt,
           });
         if (existingWake) {
@@ -5959,6 +5962,7 @@ export function recoveryService(
               source,
               resolvedBlockerIssueId,
               blockerIssueIds: readiness.blockerIssueIds,
+              dependencyReadyStateKey: idempotencyKey,
             },
           });
           if (!wake) {

@@ -413,7 +413,10 @@ import {
 import { createToolGatewayService } from "./tool-gateway.js";
 import { toolAccessService } from "./tool-access.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
-import { ISSUE_BLOCKERS_RESOLVED_WAKE_REASON } from "./issue-dependency-wakeups.js";
+import {
+  buildIssueBlockersResolvedWakeStateKey,
+  ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
+} from "./issue-dependency-wakeups.js";
 import {
   buildIssueMonitorClearedPatch,
   buildIssueMonitorTriggeredPatch,
@@ -6951,6 +6954,7 @@ export function resolvedInteractionCheckoutExpectedStatuses() {
 
 export function shouldQueueFollowupForRunningIssueWake(input: {
   contextSnapshot: Record<string, unknown> | null | undefined;
+  runningContextSnapshot?: Record<string, unknown> | null | undefined;
   wakeCommentId: string | null;
 }) {
   if (input.wakeCommentId) return true;
@@ -6964,6 +6968,30 @@ export function shouldQueueFollowupForRunningIssueWake(input: {
     return true;
   }
   const wakeReason = readNonEmptyString(input.contextSnapshot?.wakeReason);
+  const runningWakeReason = readNonEmptyString(
+    input.runningContextSnapshot?.wakeReason,
+  );
+  // A due monitor is already the issue's scheduled opportunity to handle the
+  // dependency-ready generation. If the final blocker resolves while that turn
+  // is running, merge the readiness context into the monitor turn instead of
+  // starting a second provider execution for the same ready state. Explicit
+  // comments and interaction responses returned above still require a follow-up.
+  if (
+    wakeReason === ISSUE_BLOCKERS_RESOLVED_WAKE_REASON &&
+    runningWakeReason === "issue_monitor_due"
+  ) {
+    const incomingGeneration = readNonEmptyString(
+      input.contextSnapshot?.dependencyReadyStateKey,
+    );
+    const runningGeneration = readNonEmptyString(
+      input.runningContextSnapshot?.dependencyReadyStateKey,
+    );
+    return Boolean(
+      incomingGeneration &&
+      runningGeneration &&
+      incomingGeneration !== runningGeneration,
+    );
+  }
   return Boolean(
     wakeReason && RUNNING_ISSUE_WAKE_REASONS_REQUIRING_FOLLOWUP.has(wakeReason),
   );
@@ -11150,6 +11178,7 @@ export function heartbeatService(
     monitorAttemptCount: issues.monitorAttemptCount,
     monitorNotes: issues.monitorNotes,
     monitorScheduledBy: issues.monitorScheduledBy,
+    blockedTransitionAt: issues.blockedTransitionAt,
   };
 
   interface IssueMonitorDispatchRow {
@@ -11172,6 +11201,7 @@ export function heartbeatService(
     monitorAttemptCount: number | null;
     monitorNotes: string | null;
     monitorScheduledBy: string | null;
+    blockedTransitionAt: Date | null;
   }
 
   function parseMonitorDate(value: string | null | undefined) {
@@ -11593,6 +11623,20 @@ export function heartbeatService(
             "The previous reviewer run reached provider quota. Resume this execution-review stage now that the quota wait has elapsed.",
         }
       : {};
+    const dependencyReadiness = !isProviderQuotaReviewMonitor
+      ? (await issuesSvc.listDependencyReadiness(claimed.companyId, [claimed.id]))
+          .get(claimed.id)
+      : null;
+    const dependencyReadyStateKey =
+      dependencyReadiness?.isDependencyReady === true &&
+      dependencyReadiness.blockerIssueIds.length > 0
+        ? buildIssueBlockersResolvedWakeStateKey({
+            dependentIssueId: claimed.id,
+            blockerIssueIds: dependencyReadiness.blockerIssueIds,
+            blockerGenerations: dependencyReadiness.blockerGenerations,
+            blockedTransitionAt: claimed.blockedTransitionAt,
+          })
+        : null;
 
     if (clearReason) {
       return clearIssueMonitorAndRecover({
@@ -11682,6 +11726,7 @@ export function heartbeatService(
             monitorNotes: claimed.monitorNotes ?? null,
             ...monitorMetadata,
             ...reviewRecoveryContext,
+            ...(dependencyReadyStateKey ? { dependencyReadyStateKey } : {}),
             source: input.activitySource,
           },
           requestedByActorType: input.actorType,
@@ -11697,6 +11742,7 @@ export function heartbeatService(
             monitorNotes: claimed.monitorNotes ?? null,
             ...monitorMetadata,
             ...reviewRecoveryContext,
+            ...(dependencyReadyStateKey ? { dependencyReadyStateKey } : {}),
             manualTrigger: input.activitySource === "manual",
           },
         });
@@ -26985,6 +27031,7 @@ export function heartbeatService(
   }
 
   async function enqueueWakeup(agentId: string, opts: WakeupOptions = {}, executionWaitRequestId?: string) {
+    const wakeRequestedAt = new Date();
     const source = opts.source ?? "on_demand";
     const triggerDetail = opts.triggerDetail ?? null;
     const contextSnapshot: Record<string, unknown> = {
@@ -28270,6 +28317,64 @@ export function heartbeatService(
             activeExecutionRun = null;
           }
 
+          // Issue admission serializes on the issue row. A blockers-resolved
+          // wake can therefore arrive while a due-monitor adapter is running,
+          // wait for that run to release the row, and only then observe that no
+          // execution is active. Treat the overlapping terminal monitor run as
+          // the consumer of this same ready generation instead of starting a
+          // second provider turn after the lock wait.
+          if (
+            !activeExecutionRun &&
+            readNonEmptyString(enrichedContextSnapshot.wakeReason) ===
+              ISSUE_BLOCKERS_RESOLVED_WAKE_REASON &&
+            !wakeCommentId &&
+            !hasInteractionContinuationWakeContext(enrichedContextSnapshot)
+          ) {
+            const overlappingMonitorRun = await tx
+              .select()
+              .from(heartbeatRuns)
+              .where(
+                and(
+                  eq(heartbeatRuns.companyId, agent.companyId),
+                  eq(heartbeatRuns.agentId, agentId),
+                  inArray(heartbeatRuns.status, [
+                    "succeeded",
+                    "failed",
+                    "timed_out",
+                    "cancelled",
+                  ]),
+                  gte(heartbeatRuns.finishedAt, wakeRequestedAt),
+                  sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issue.id}`,
+                  sql`${heartbeatRuns.contextSnapshot} ->> 'wakeReason' = 'issue_monitor_due'`,
+                ),
+              )
+              .orderBy(desc(heartbeatRuns.finishedAt))
+              .limit(1)
+              .then((rows) => rows[0] ?? null);
+            if (overlappingMonitorRun) {
+              await tx.insert(agentWakeupRequests).values({
+                ...durableReceiptFields,
+                companyId: agent.companyId,
+                agentId,
+                source,
+                triggerDetail,
+                reason,
+                payload,
+                status: "coalesced",
+                coalescedCount: 1,
+                requestedByActorType: opts.requestedByActorType ?? null,
+                requestedByActorId: opts.requestedByActorId ?? null,
+                idempotencyKey: opts.idempotencyKey ?? null,
+                runId: overlappingMonitorRun.id,
+                finishedAt: new Date(),
+              });
+              return {
+                kind: "coalesced" as const,
+                run: overlappingMonitorRun,
+              };
+            }
+          }
+
           if (
             activeExecutionRun &&
             (await cancelStaleScheduledRetry(activeExecutionRun))
@@ -29136,6 +29241,7 @@ export function heartbeatService(
       !sameScopeQueuedRun &&
       shouldQueueFollowupForRunningIssueWake({
         contextSnapshot: enrichedContextSnapshot,
+        runningContextSnapshot: sameScopeRunningRun?.contextSnapshot,
         wakeCommentId,
       });
     // Unscoped manual wakes need their own receipt and execution identity too.
